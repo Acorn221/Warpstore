@@ -314,7 +314,7 @@ std::unordered_map<std::string, DictDerived> gDeriv;
 std::unordered_map<const void*, std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<DevVec<double>>>> gMapDev;
 size_t gDerivBytes = 0;
 std::string derivKey(const Dict& d, const std::string& what) {
-  return std::to_string((uintptr_t)&d) + "|" + (ciColl() ? "i" : "b") + "|" + what;
+  return std::to_string(d.uid) + "|" + (ciColl() ? "i" : "b") + "|" + what;
 }
 bool derivGet(const Dict& d, const std::string& key, DictDerived& out) {
   std::lock_guard<std::mutex> g(gDerivMu);
@@ -2983,7 +2983,7 @@ void unifyStrings(ExprP& e, BindCtx& c) {
   std::function<void(const ExprP&)> dicts = [&](const ExprP& x) {
     if (!x) return;
     if (x->kind == Expr::COL && x->ty == LType::VARCHAR) {
-      if (Dict* d = c.dict(*x)) key += "|" + std::to_string((uintptr_t)d) + ":" + std::to_string(d->strs.size());
+      if (Dict* d = c.dict(*x)) key += "|" + std::to_string(d->uid) + ":" + std::to_string(d->strs.size());
       return;
     }
     if (x->kind == Expr::FUNC && x->op.rfind("#", 0) == 0) cacheable = false;  // per-query derived dictionaries
@@ -3065,8 +3065,10 @@ bool simplePred(const ExprP& e, int& bt, int& bc, std::string& op, double& v) {
   return false;
 }
 
-bool segMayMatch(const Segment& s, const std::vector<ExprP>& preds) {
-  if (s.ndel == s.n) return false;
+// skipAllDeleted: a segment whose rows are all deleted holds nothing (callers pass false when another
+// session's open transaction deleted some of them: those rows are still visible to this one).
+bool segMayMatch(const Segment& s, const std::vector<ExprP>& preds, bool skipAllDeleted = true) {
+  if (skipAllDeleted && s.ndel() == s.n) return false;
   for (auto& p : preds) {
     int bt, bc;
     std::string op;
@@ -3082,6 +3084,7 @@ bool segMayMatch(const Segment& s, const std::vector<ExprP>& preds) {
 
 // Point lookup: finds a top-level `pk = literal` conjunct.
 bool findPkEq(const std::vector<ExprP>& conj, const Table& t, int bt, int64_t& key) {
+  if (t.isShadow()) return false;  // (MVCC snapshots carry no index maps: scan them)
   if (t.pk < 0) return false;
   for (auto& p : conj) {
     int pbt, bc;
@@ -3101,6 +3104,7 @@ ColView viewOf(const void* p, PType t) { return ColView{p, (uint8_t)t}; }
 // A `col = literal` conjunct on the first column of a secondary index: returns the index and the
 // raw key (found = false when the literal can't occur, e.g. a string not in the dictionary).
 const IndexMeta* findIndexEq(const std::vector<ExprP>& conj, const Table& t, int bt, int64_t& key, bool& found) {
+  if (t.isShadow()) return nullptr;  // (MVCC snapshots carry no index maps: scan them)
   for (auto& p : conj) {
     if (p->kind != Expr::BIN || p->op != "=") continue;
     const ExprP& a = p->args[0];
@@ -3276,8 +3280,10 @@ inline void bindView(ColView& v, const BatchRef& b, int c) {
 
 // Visits, partition by partition (ascending), every segment that survives min/max elimination and
 // then that partition's write buffer. Stops early when fn returns false.
+thread_local int tScanDelayMs = 0;  // SET gpudb_debug_scan_delay_ms (tests: a slow reader holding its snapshot)
 void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>& preds, ScanStats& st,
                const std::function<bool(const BatchRef&)>& fn, bool dryRun = false) {
+  if (tScanDelayMs > 0 && !dryRun) std::this_thread::sleep_for(std::chrono::milliseconds(tScanDelayMs));
   st.segsTotal += (int)t.segs.size();
   st.partsTotal += t.nparts;
   st.partsScanned += (int)parts.size();
@@ -3300,10 +3306,11 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
     for (auto& l : v.hidden) adjust[l.seg].push_back({l.row, true});
     for (auto& l : v.ghosts) adjust[l.seg].push_back({l.row, false});
   }
-  auto viewDel = [&](int32_t key, const std::vector<uint32_t>& host, const uint32_t* dev) -> const uint32_t* {
+  auto viewDel = [&](int32_t key, DelBits& del, int64_t n) -> const uint32_t* {
     auto it = adjust.find(key);
-    if (it == adjust.end() || dryRun) return dev;
-    std::vector<uint32_t> bits = host;
+    if (dryRun) return nullptr;
+    if (it == adjust.end()) return del.device((n + 31) / 32);
+    std::vector<uint32_t> bits(del.host.begin(), del.host.begin() + std::min<size_t>(del.host.size(), (size_t)(n + 31) / 32));
     for (auto [r, hide] : it->second) {
       if ((size_t)(r >> 5) >= bits.size()) bits.resize((r >> 5) + 1, 0);
       if (hide) bits[r >> 5] |= 1u << (r & 31);
@@ -3317,7 +3324,7 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
   std::vector<void*> adj;
   for (int p : parts) {
     for (auto& sp : t.segs) {
-      if (sp->part != p || !segMayMatch(*sp, preds)) continue;
+      if (sp->part != p || !segMayMatch(*sp, preds, !adjust.count((int32_t)(&sp - t.segs.data())))) continue;
       int64_t lo = 0, hi = sp->n;
       if (!sortPreds.empty() && (int)sp->host.size() > t.sortKey && !sp->host[t.sortKey].empty()) {
         const bool i64 = t.cols[t.sortKey].pt == PType::I64;
@@ -3346,7 +3353,7 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
       st.rowsScanned += hi - lo;
       st.segRows += sp->n;
       if (dryRun) continue;
-      const uint32_t* segDel = viewDel((int32_t)(&sp - t.segs.data()), sp->delHost, sp->delDev);
+      const uint32_t* segDel = viewDel((int32_t)(&sp - t.segs.data()), *sp->del, sp->n);
       if (lo == 0 && hi == sp->n) {
         if (!fn(BatchRef{p, sp->n, &sp->dev, segDel, &sp->enc, 0, sp.get()})) return;
         continue;
@@ -3362,7 +3369,8 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
       st.bufferRows += b.n;
       if (dryRun) continue;
       t.syncBufferToDevice(p);
-      if (!fn(BatchRef{p, b.n, &b.dev, viewDel(-1 - p, b.del, b.delDev)})) return;
+      const uint32_t* bdel = viewDel(-1 - p, *b.del, b.n);
+      if (!fn(BatchRef{p, b.n, &b.dev, bdel})) return;
     }
   }
 }
@@ -3400,26 +3408,27 @@ bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi) {
   double mn = INFINITY, mx = -INFINITY;
   for (auto& sp : t.segs) mn = std::min(mn, sp->mn[bc]), mx = std::max(mx, sp->mx[bc]);
   for (int p = 0; p < t.nparts; ++p) {
-    WriteBuffer& b = *t.bufs[p];
-    std::lock_guard<std::mutex> g(b.devMu);
-    if (b.rangeGen != b.gen || b.rangeN > b.n || b.rmn.size() != t.cols.size()) {
-      b.rangeGen = b.gen;
+    const WriteBuffer& wb = *t.bufs[p];
+    BufData& b = *wb.data;  // (the cache is shared with the buffer's other snapshots)
+    std::lock_guard<std::mutex> g(b.rangeMu);
+    if (b.rangeGen != wb.gen || b.rmn.size() != t.cols.size()) {
+      b.rangeGen = wb.gen;
       b.rangeN = 0;
       b.rmn.assign(t.cols.size(), INFINITY);
       b.rmx.assign(t.cols.size(), -INFINITY);
     }
-    if (b.rangeN < b.n) {  // newly appended rows extend every integer-like column's range
+    if (b.rangeN < wb.n) {  // newly appended rows extend every integer-like column's range
       for (size_t c = 0; c < t.cols.size(); ++c) {
         if (t.cols[c].lt == LType::VARCHAR || t.cols[c].lt == LType::DOUBLE || t.cols[c].lt == LType::DECIMAL ||
             t.cols[c].pt == PType::VEC) continue;
         double lo = b.rmn[c], hi = b.rmx[c];
-        for (int64_t r = b.rangeN; r < b.n; ++r) {
+        for (int64_t r = b.rangeN; r < wb.n; ++r) {
           double v = t.cellNum(bufLoc(p, r), (int)c);
           lo = std::min(lo, v), hi = std::max(hi, v);
         }
         b.rmn[c] = lo, b.rmx[c] = hi;
       }
-      b.rangeN = b.n;
+      b.rangeN = wb.n;
     }
     mn = std::min(mn, b.rmn[bc]), mx = std::max(mx, b.rmx[bc]);
   }
@@ -4056,8 +4065,13 @@ void Engine::vramBalance() {
           else oldDev.push_back({old, m.e->bytes});
         }
       }
-      for (auto& [p, b] : oldDev) vramRelease(p, b);
-      for (void* p : oldHost) hostUnmap(p);
+      // MVCC: queries reading snapshots don't hold the table lock, so a statement that started
+      // before the swap may still read the old copy: free it once those have finished.
+      if (!oldDev.empty() || !oldHost.empty())
+        rcuDefer([oldDev, oldHost] {
+          for (auto& [p, b] : oldDev) vramRelease(p, b);
+          for (void* p : oldHost) hostUnmap(p);
+        });
     }
   };
   apply(moves, false);
@@ -4546,10 +4560,21 @@ void Engine::commitTxn() {
 
 // Replays undo records [mark, end) backwards (ROLLBACK: all of them; ROLLBACK TO SAVEPOINT: the
 // ones after it).
-static void undoRecords(std::vector<UndoRec>& undo, size_t mark) {
+// Replays undo records [mark, end) newest first. Every table involved stays locked for the whole
+// replay (and, with clearKey, while the transaction's change sets are dropped), so no reader sees a
+// half rolled back transaction.
+static void undoRecords(std::vector<UndoRec>& undo, size_t mark, const void* clearKey = nullptr) {
+  // Re-inserted rows join the transaction's hidden rows (and rows it inserted are already hidden),
+  // so other sessions keep seeing the pre-transaction state until the change sets are dropped.
+  struct KeyScope {
+    explicit KeyScope(const void* k) { tTxnKey = k; }
+    ~KeyScope() { tTxnKey = nullptr; }
+  } keyScope{clearKey};
+  std::vector<Table*> tabs;
   for (size_t i = undo.size(); i-- > mark;) {
     UndoRec& u = undo[i];
     Table& t = *u.t;
+    if (std::find(tabs.begin(), tabs.end(), &t) == tabs.end()) tabs.push_back(&t);
     std::unique_lock<FairSharedMutex> lk(t.mu);
     if (!u.inserted) {
       t.appendRow(u.row);
@@ -4569,14 +4594,19 @@ static void undoRecords(std::vector<UndoRec>& undo, size_t mark) {
     }
     for (int p = 0; p < t.nparts && !done; ++p)
       for (int64_t r = t.bufs[p]->n; r-- > 0 && !done;)
-        if (!((t.bufs[p]->del[r >> 5] >> (r & 31)) & 1u) && same(bufLoc(p, r))) { t.deleteAt(bufLoc(p, r)); done = true; }
+        if (!t.bufs[p]->del->test(r) && same(bufLoc(p, r))) { t.deleteAt(bufLoc(p, r)); done = true; }
     for (size_t si = t.segs.size(); si-- > 0 && !done;)
       for (int64_t r = t.segs[si]->n; r-- > 0 && !done;)
-        if (!((t.segs[si]->delHost[r >> 5] >> (r & 31)) & 1u) && same(Loc{(int32_t)si, (int32_t)r})) {
+        if (!t.segs[si]->del->test(r) && same(Loc{(int32_t)si, (int32_t)r})) {
           t.deleteAt(Loc{(int32_t)si, (int32_t)r});
           done = true;
         }
   }
+  if (clearKey)
+    for (Table* t : tabs) {
+      std::unique_lock<FairSharedMutex> lk(t->mu);
+      t->txnPending.erase(clearKey);  // the rollback becomes visible (per table, as a commit)
+    }
 }
 
 void Engine::rollbackTxn() {
@@ -4589,7 +4619,7 @@ void Engine::rollbackTxn() {
       endSnapshot(e->cat_);
     }
   } clearPending{this};
-  undoRecords(tTxn.undo, 0);
+  undoRecords(tTxn.undo, 0, &tTxn.undo);
   tTxn.wal.clear();
   tTxn.undo.clear();
   tTxn.savepoints.clear();
@@ -4643,6 +4673,58 @@ ResultSet Engine::doTxn(const std::string& what) {
   }
   ResultSet r;
   return r;
+}
+
+// ---- MVCC: a SELECT reads per-statement snapshots of its tables (Table::shadow), taken under the
+// table lock for microseconds; the query itself runs without the live tables' locks, so writers
+// never wait for it. Lookups by key (PRIMARY KEY / secondary index equality) and the IVF vector
+// index read the live table under its lock instead (they hold it for microseconds and need the
+// index maps).
+struct SnapScope {
+  std::map<const Table*, std::shared_ptr<Table>> shadows;
+  std::vector<std::shared_ptr<Table>> bases;  // the live tables, kept alive while their snapshots are used
+  uint64_t ticket = rcuEnter();               // memory the VRAM balancer frees waits for this statement
+  ~SnapScope() {
+    shadows.clear();
+    rcuExit(ticket);
+  }
+};
+thread_local SnapScope* tSnapScope = nullptr;
+const bool gMvcc = getenv("GPUDB_NO_MVCC") == nullptr;
+struct SnapGuard {  // a top-level SELECT statement: open a scope (nested queries share it)
+  std::unique_ptr<SnapScope> own;
+  SnapGuard() {
+    if (gMvcc && !tSnapScope) {
+      own = std::make_unique<SnapScope>();
+      tSnapScope = own.get();
+    }
+  }
+  ~SnapGuard() {
+    if (own) tSnapScope = nullptr;
+  }
+};
+
+// Equality between a key column (PRIMARY KEY, or the first column of a secondary index) and a literal.
+static bool keyLookup(const Table& t, const ExprP& w) {
+  if (!w) return false;
+  if (w->kind == Expr::BIN && w->op == "AND") return keyLookup(t, w->args[0]) || keyLookup(t, w->args[1]);
+  ExprP col;
+  if (w->kind == Expr::INLIST && !w->neg && w->args.size() <= 33 && w->args[0]->kind == Expr::COL) {  // k IN (1, 2, ..)
+    for (size_t i = 1; i < w->args.size(); ++i)
+      if (w->args[i]->kind != Expr::LIT) return false;
+    col = w->args[0];
+  } else if (w->kind == Expr::BIN && w->op == "=") {
+    const ExprP& a = w->args[0];
+    const ExprP& b = w->args[1];
+    col = a->kind == Expr::COL && b->kind == Expr::LIT ? a : b->kind == Expr::COL && a->kind == Expr::LIT ? b : nullptr;
+  }
+  if (!col) return false;
+  const int c = t.colIndex(col->name);
+  if (c < 0) return false;
+  if (c == t.pk) return true;
+  for (auto& ix : t.indexes)
+    if (!ix.vec && !ix.cols.empty() && ix.cols[0] == c) return true;
+  return false;
 }
 
 thread_local std::string tLoadLogPath;  // doLoad loaded a copy of the file: the WAL names the copy
@@ -4843,6 +4925,7 @@ ResultSet Engine::execute(const std::string& sql) {
   switch (s.type) {
     case Stmt::TXN: return doTxn(s.setName);
     case Stmt::SELECT: {
+      SnapGuard snap;  // MVCC: the statement reads snapshots of its tables
       if (s.outfile.empty()) return runSelect(this, [&] { return runStatementQuery(s, false); }, sql, false);
       ResultSet q = runStatementQuery(s, false);  // SELECT .. INTO OUTFILE: tab-separated, \N for NULL
       FILE* f = fopen(s.outfile.c_str(), "wx");
@@ -4858,8 +4941,14 @@ ResultSet Engine::execute(const std::string& sql) {
       fclose(f);
       return okResult((int64_t)q.rows.size());
     }
-    case Stmt::EXPLAIN: return runSelect(this, [&] { return runStatementQuery(*s.inner, true); }, sql, false);
-    case Stmt::PROFILE: return runSelect(this, [&] { return runStatementQuery(*s.inner, false); }, sql, true);
+    case Stmt::EXPLAIN: {
+      SnapGuard snap;
+      return runSelect(this, [&] { return runStatementQuery(*s.inner, true); }, sql, false);
+    }
+    case Stmt::PROFILE: {
+      SnapGuard snap;
+      return runSelect(this, [&] { return runStatementQuery(*s.inner, false); }, sql, true);
+    }
     case Stmt::SHOW_PROFILE: {
       r = table({"stage", "time_ms", "rows", "detail"}, {LType::VARCHAR, LType::DOUBLE, LType::BIGINT, LType::VARCHAR});
       for (auto& p : tLastProf)
@@ -4893,6 +4982,7 @@ ResultSet Engine::execute(const std::string& sql) {
       else if (s.setName == "GPUDB_VECTOR_INDEX") tAnn = on();
       else if (s.setName == "GPUDB_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
       else if (s.setName == "GPUDB_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
+      else if (s.setName == "GPUDB_DEBUG_SCAN_DELAY_MS") tScanDelayMs = std::atoi(s.setValue.c_str());
       else if (s.setName == "GPUDB_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
       else if (s.setName == "GPUDB_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
       else if (s.setName == "LONG_QUERY_TIME" || s.setName == "SLOW_QUERY_LOG") {  // server-wide (SET GLOBAL)
@@ -5241,12 +5331,12 @@ void forEachLiveRow(const Table& t, const std::function<void(Loc)>& fn) {
   for (size_t si = 0; si < t.segs.size(); ++si) {
     const Segment& sg = *t.segs[si];
     for (int64_t r = 0; r < sg.n; ++r)
-      if (!((sg.delHost[r >> 5] >> (r & 31)) & 1u)) fn(Loc{(int32_t)si, (int32_t)r});
+      if (!sg.del->test(r)) fn(Loc{(int32_t)si, (int32_t)r});
   }
   for (int p = 0; p < t.nparts; ++p) {
     const WriteBuffer& b = *t.bufs[p];
     for (int64_t r = 0; r < b.n; ++r)
-      if (!((b.del[r >> 5] >> (r & 31)) & 1u)) fn(bufLoc(p, r));
+      if (!b.del->test(r)) fn(bufLoc(p, r));
   }
 }
 
@@ -6242,14 +6332,14 @@ ResultSet Engine::doShowSegments(Stmt& s) {
       if (sg.part != p) continue;
       bool host = std::any_of(sg.mapped.begin(), sg.mapped.end(), [](uint8_t m) { return m != 0; });
       r.rows.push_back({std::to_string(p), std::to_string(i), host ? "host-columnstore (PCIe)" : "gpu-columnstore",
-                        std::to_string(sg.n), std::to_string(sg.ndel),
+                        std::to_string(sg.n), std::to_string(sg.ndel()),
                         std::to_string(sg.n * rowBytes + (sg.n + 31) / 32 * 4),
                         t->sortKey >= 0 ? fmtKey(sg.mn[t->sortKey]) : kNullCell,
                         t->sortKey >= 0 ? fmtKey(sg.mx[t->sortKey]) : kNullCell});
     }
     const WriteBuffer& b = *t->bufs[p];
     if (b.n > 0)
-      r.rows.push_back({std::to_string(p), "-1", "cpu-write-buffer", std::to_string(b.n), std::to_string(b.ndel), "0", kNullCell, kNullCell});
+      r.rows.push_back({std::to_string(p), "-1", "cpu-write-buffer", std::to_string(b.n), std::to_string(b.ndel()), "0", kNullCell, kNullCell});
   }
   return r;
 }
@@ -6424,17 +6514,18 @@ ResultSet Engine::doModify(Stmt& s) {
     for (size_t si = 0; si < t->segs.size(); ++si) {
       Segment& sg = *t->segs[si];
       if (!inParts[sg.part] || !segMayMatch(sg, conj)) continue;
-      const BatchRef br{sg.part, sg.n, &sg.dev, sg.delDev, &sg.enc, 0};
+      const uint32_t* sdel = sg.delDev();
+      const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0};
       for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
       DevVec<int32_t> idx(sg.n);
-      int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sg.delDev, idx.p);
+      int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
       for (int32_t r : idx.download(m)) matched.push_back(Loc{(int32_t)si, r});
     }
     for (int p : parts) {
       const WriteBuffer& b = *t->bufs[p];
       hostCols(bufLoc(p, 0).seg);
       for (int64_t r = 0; r < b.n; ++r) {
-        if ((b.del[r >> 5] >> (r & 31)) & 1u) continue;
+        if (b.del->test(r)) continue;
         if (s.where && evalProg(henv, wp, r) == 0) continue;
         matched.push_back(bufLoc(p, r));
       }
@@ -6495,7 +6586,7 @@ ResultSet Engine::doModify(Stmt& s) {
 // Deletes the matched rows (and inserts their new versions, for UPDATE). Holds the table lock.
 ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const std::vector<std::vector<Value>>& newRows) {
   Table* t = &tt;
-  std::set<int> touched;
+  std::set<int> touched, touchedBufs;
   for (const Loc& l : matched) {
     if (undoLog()) {
       undoLog()->push_back({t, false, t->rowValues(l)});
@@ -6503,31 +6594,52 @@ ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const 
     }
     if (t->pk >= 0) t->pkIndex.erase(t->pkValue(l));
     if (!t->indexes.empty()) t->indexRemove(l);
-    if (l.seg < 0) {
-      WriteBuffer& b = *t->bufs[bufPart(l)];
-      b.del[l.row >> 5] |= 1u << (l.row & 31);
-      ++b.ndel;
-      ++b.version;
-    } else {
-      Segment& sg = *t->segs[l.seg];
-      sg.delHost[l.row >> 5] |= 1u << (l.row & 31);
-      ++sg.ndel;
-      touched.insert(l.seg);
-    }
+    DelBits& d = delForWrite(l.seg < 0 ? t->bufs[bufPart(l)]->del : t->segs[l.seg]->del);  // (a private copy if a snapshot holds it)
+    uint32_t& w = d.host[l.row >> 5];
+    if (!(w & (1u << (l.row & 31)))) w |= 1u << (l.row & 31), ++d.ndel;
+    if (l.seg < 0) ++t->bufs[bufPart(l)]->version, touchedBufs.insert(bufPart(l));
+    else touched.insert(l.seg);
   }
-  for (int si : touched) h2d(t->segs[si]->delDev, t->segs[si]->delHost.data(), t->segs[si]->delHost.size() * 4);
+  for (int si : touched) {  // bits changed: the device copy is re-uploaded on the next scan
+    std::lock_guard<std::mutex> g(t->segs[si]->del->mu);
+    ++t->segs[si]->del->ver;
+  }
+  for (int p : touchedBufs) {
+    std::lock_guard<std::mutex> g(t->bufs[p]->del->mu);
+    ++t->bufs[p]->del->ver;
+  }
   for (auto& row : newRows) t->appendRow(row);
   return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
 }
 
 // ------------------------------------------------------------------ SELECT
 
+std::shared_ptr<Table> Engine::tableForRead(const std::string& name, const Stmt& s) {
+  auto t = cat_.get(name);
+  if (!tSnapScope || t->db == "__tmp" || t->isShadow()) return t;
+  auto it = tSnapScope->shadows.find(t.get());
+  if (it != tSnapScope->shadows.end()) return it->second;
+  if (s.from.size() == 1 && !s.unionNext && keyLookup(*t, s.where)) return t;  // microsecond lock on the live table
+  for (auto& ix : t->indexes)
+    if (ix.vec && ix.algo == 0) return t;  // IVF lists live in the index map
+  std::shared_ptr<Table> sh;
+  {
+    FairSharedMutex::barge = true;  // (never queue behind a waiting writer for this)
+    std::shared_lock<FairSharedMutex> lk(t->mu);
+    FairSharedMutex::barge = false;
+    sh = t->shadow();
+  }
+  tSnapScope->bases.push_back(t);
+  tSnapScope->shadows[t.get()] = sh;
+  return sh;
+}
+
 ResultSet Engine::doSelect(Stmt& s, bool explain) {
   auto t0 = Clock::now();
   std::vector<std::string> notes;
   BindCtx ctx;
   for (auto& f : s.from) {
-    ctx.tabs.push_back(cat_.get(f.name));
+    ctx.tabs.push_back(tableForRead(f.name, s));
     ctx.aliases.push_back(f.alias);
     ctx.usingCols.push_back(f.usingCols);
   }
@@ -6825,7 +6937,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       int built = 0;
       for (size_t si = 0; si < t.segs.size(); ++si) {
         Segment& sg = *t.segs[si];
-        if (sg.n == 0 || sg.ndel == sg.n) continue;
+        if (sg.n == 0 || sg.ndel() == sg.n) continue;
         std::shared_ptr<CagraGraph> g;
         if (sg.n >= 2048 && sg.dev[vc] && !sg.mapped[vc]) {
           std::lock_guard<std::mutex> lk(vix->cagra->mu);
@@ -6846,10 +6958,11 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           continue;
         }
         if (gpuWhere) {  // rows passing WHERE (and not deleted) -> keep-bitset
-          const BatchRef br{sg.part, sg.n, &sg.dev, sg.delDev, &sg.enc, 0};
+          const uint32_t* sdel = sg.delDev();
+          const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0};
           for (size_t kk = 0; kk < wcomp.slotCols.size(); ++kk) bindView(wcomp.env.cols[kk], br, wcomp.slotCols[kk].second);
           DevVec<int32_t> idx(sg.n);
-          const int64_t m = gpuSelect(wcomp.env, true, wprog, sg.n, sg.delDev, idx.p);
+          const int64_t m = gpuSelect(wcomp.env, true, wprog, sg.n, sdel, idx.p);
           if (m == 0) continue;
           std::vector<uint32_t> bits((sg.n + 31) / 32, 0);
           for (int32_t r : idx.download(m)) bits[r >> 5] |= 1u << (r & 31);
@@ -6867,9 +6980,9 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         hold.push_back(g);
         graphs.push_back(g.get());
         graphSeg.push_back((int)si);
-        if (sg.ndel > 0) {  // keep-bitset: the complement of the deleted-row bitmap
-          std::vector<uint32_t> bits(sg.delHost.size());
-          for (size_t w = 0; w < bits.size(); ++w) bits[w] = ~sg.delHost[w];
+        if (sg.ndel() > 0) {  // keep-bitset: the complement of the deleted-row bitmap
+          std::vector<uint32_t> bits(sg.delHost().size());
+          for (size_t w = 0; w < bits.size(); ++w) bits[w] = ~sg.delHost()[w];
           auto b = std::make_shared<DevVec<uint32_t>>((int64_t)bits.size());
           h2d(b->p, bits.data(), bits.size() * 4);
           keepBufs.push_back(b);
@@ -6907,15 +7020,15 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           const Loc l{graphSeg[h.graph], (int32_t)h.row};
           cand.push_back({score((const float*)t.colData(l, vc).data() + (size_t)l.row * d), l});
         }
-        auto exactRows = [&](Loc first, int64_t n, const std::vector<uint32_t>& del) {
+        auto exactRows = [&](Loc first, int64_t n, const DelBits& del) {
           for (int64_t r = 0; r < n; ++r) {
-            if ((del[r >> 5] >> (r & 31)) & 1u) continue;
+            if (del.test(r)) continue;
             const Loc l{first.seg, (int32_t)r};
             cand.push_back({score((const float*)t.colData(l, vc).data() + (size_t)r * d), l});
           }
         };
-        for (int si : exactSegs) exactRows(Loc{si, 0}, t.segs[si]->n, t.segs[si]->delHost);
-        for (int p = 0; p < t.nparts; ++p) exactRows(bufLoc(p, 0), t.bufs[p]->n, t.bufs[p]->del);
+        for (int si : exactSegs) exactRows(Loc{si, 0}, t.segs[si]->n, *t.segs[si]->del);
+        for (int p = 0; p < t.nparts; ++p) exactRows(bufLoc(p, 0), t.bufs[p]->n, *t.bufs[p]->del);
         std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first < b.first; });
         std::vector<std::vector<Value>> rows, keys;
         for (auto& [sc, l] : cand) {
@@ -8535,9 +8648,7 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
       if (cols[c].lt == LType::VARCHAR) *t->dicts[c] = *r.colDicts[c];
       t->hasNull[c] = 1;
     }
-    seg->delHost.assign((size_t)(n + 31) / 32, 0);
-    seg->delDev = (uint32_t*)devAlloc(std::max<size_t>(4, seg->delHost.size() * 4));
-    if (!seg->delHost.empty()) h2d(seg->delDev, seg->delHost.data(), seg->delHost.size() * 4);
+    seg->del->host.assign((size_t)(n + 31) / 32, 0);
     if (n > 0) t->segs.push_back(std::move(seg));
     std::lock_guard<std::mutex> g(cat_.mu);
     cat_.tables["__tmp." + lower(name)] = t;
@@ -8570,7 +8681,8 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
       b.cols[c] = std::move(bytes);
     }
     b.n = (int64_t)n;
-    b.del.assign((n + 31) / 32, 0);
+    b.del = std::make_shared<DelBits>();
+    b.del->host.assign((n + 31) / 32, 0);
     ++b.version;
     ++b.gen;
     t->flush(true);
@@ -8633,7 +8745,8 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
       b.cols[c] = std::move(bytes);
     }
     b.n = (int64_t)n;
-    b.del.assign((n + 31) / 32, 0);
+    b.del = std::make_shared<DelBits>();
+    b.del->host.assign((n + 31) / 32, 0);
     ++b.version;
     ++b.gen;
   } else {
@@ -10966,14 +11079,14 @@ void writeColumnar(FILE* f, const Table& t) {
       if (sg->part != p) continue;
       std::vector<int32_t> live;
       for (int64_t r = 0; r < sg->n; ++r)
-        if (keep((int32_t)si, r, (sg->delHost[r >> 5] >> (r & 31)) & 1u)) live.push_back((int32_t)r);
+        if (keep((int32_t)si, r, sg->del->test(r))) live.push_back((int32_t)r);
       n += (int64_t)live.size();
       parts.push_back({sg.get(), std::move(live)});
     }
     const WriteBuffer& b = *t.bufs[p];
     std::vector<int32_t> blive;
     for (int64_t r = 0; r < b.n; ++r)
-      if (keep(-1 - p, r, (b.del[r >> 5] >> (r & 31)) & 1u)) blive.push_back((int32_t)r);
+      if (keep(-1 - p, r, b.del->test(r))) blive.push_back((int32_t)r);
     n += (int64_t)blive.size();
     putU64(f, (uint64_t)n);
     std::vector<uint8_t> out;
@@ -11028,7 +11141,7 @@ void readColumnar(FILE* f, Table& t) {
           for (int64_t r : *rows) bc.insert(bc.end(), colsIn[c].begin() + r * sz, colsIn[c].begin() + (r + 1) * sz);
       }
       b.n += (int64_t)(rows ? rows->size() : cnt);
-      b.del.resize((b.n + 31) / 32, 0);
+      b.del->host.resize((b.n + 31) / 32, 0);
       ++b.version;
     };
     if ((int)np == t.nparts || t.nparts == 1) {

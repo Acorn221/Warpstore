@@ -260,6 +260,8 @@ def main():
         run_mix("ingest_single_rows", ["insert1"] * 8)
         run_mix("ingest_batches", ["batch"] * 4)
         run_mix("htap", ["insert1"] * 4 + ["update"] * 4 + ["point"] * 4 + ["dash"] * 4)
+    if "htap" in only and "oltp" not in only:
+        run_mix("htap", ["insert1"] * 4 + ["update"] * 4 + ["point"] * 4 + ["dash"] * 4)
     if "vector" in only: vector_tests(vecs)
     if "fts" in only: fulltext_tests()
 

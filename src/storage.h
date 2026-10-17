@@ -54,8 +54,88 @@ struct SvHash {
   size_t operator()(std::string_view s) const { return std::hash<std::string_view>{}(s); }
 };
 
+// Append-only string array that readers may index while a writer appends (MVCC: queries read a
+// table's dictionaries without its lock). Strings live in fixed blocks that never move; the block
+// directory is replaced (old ones kept until destruction) when it fills; size() is published last.
+class StrVec {
+  static constexpr int kShift = 12;
+  static constexpr size_t kBlock = size_t(1) << kShift, kMask = kBlock - 1;
+  std::atomic<std::string**> dir_{nullptr};
+  size_t dirCap_ = 0, nblocks_ = 0;
+  std::atomic<size_t> n_{0};
+  std::vector<std::unique_ptr<std::string*[]>> dirs_;    // every directory ever used (the last is current)
+  std::vector<std::unique_ptr<std::string[]>> blocks_;
+  std::string& slot(size_t i) {
+    if (i >= nblocks_ * kBlock) {
+      if (nblocks_ == dirCap_) {
+        const size_t cap = std::max<size_t>(16, dirCap_ * 2);
+        std::unique_ptr<std::string*[]> d(new std::string*[cap]());
+        for (size_t b = 0; b < nblocks_; ++b) d[b] = blocks_[b].get();
+        dir_.store(d.get(), std::memory_order_release);
+        dirs_.push_back(std::move(d));
+        dirCap_ = cap;
+      }
+      blocks_.emplace_back(new std::string[kBlock]);
+      dirs_.back()[nblocks_++] = blocks_.back().get();
+    }
+    return dir_.load(std::memory_order_relaxed)[i >> kShift][i & kMask];
+  }
+
+ public:
+  StrVec() = default;
+  StrVec(const StrVec& o) { *this = o; }
+  StrVec& operator=(const StrVec& o) {
+    if (this == &o) return *this;
+    clear();
+    const size_t n = o.size();
+    for (size_t i = 0; i < n; ++i) push_back(o[i]);
+    return *this;
+  }
+  size_t size() const { return n_.load(std::memory_order_acquire); }
+  bool empty() const { return size() == 0; }
+  const std::string& operator[](size_t i) const { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
+  std::string& operator[](size_t i) { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
+  const std::string& back() const { return (*this)[size() - 1]; }
+  void push_back(std::string s) {
+    const size_t i = n_.load(std::memory_order_relaxed);
+    slot(i) = std::move(s);
+    n_.store(i + 1, std::memory_order_release);
+  }
+  template <class... A>
+  std::string& emplace_back(A&&... a) {
+    push_back(std::string(std::forward<A>(a)...));
+    return (*this)[size() - 1];
+  }
+  void reserve(size_t) {}
+  void clear() {  // (only on dictionaries nobody else reads)
+    dir_.store(nullptr);
+    dirs_.clear();
+    blocks_.clear();
+    dirCap_ = nblocks_ = 0;
+    n_.store(0);
+  }
+  struct const_iterator {
+    const StrVec* v;
+    size_t i;
+    using iterator_category = std::random_access_iterator_tag;
+    using value_type = std::string;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const std::string*;
+    using reference = const std::string&;
+    reference operator*() const { return (*v)[i]; }
+    pointer operator->() const { return &(*v)[i]; }
+    const_iterator& operator++() { ++i; return *this; }
+    const_iterator operator+(difference_type d) const { return {v, i + d}; }
+    difference_type operator-(const const_iterator& o) const { return (difference_type)i - (difference_type)o.i; }
+    bool operator!=(const const_iterator& o) const { return i != o.i; }
+    bool operator==(const const_iterator& o) const { return i == o.i; }
+  };
+  const_iterator begin() const { return {this, 0}; }
+  const_iterator end() const { return {this, size()}; }
+};
+
 struct Dict {
-  std::vector<std::string> strs;
+  StrVec strs;
   // string -> code. Strings added with appendUnique() are indexed lazily, on the first lookup
   // (derived dictionaries are often only ever read by code).
   mutable std::unordered_map<std::string, int32_t, SvHash, std::equal_to<>> map;
@@ -63,12 +143,14 @@ struct Dict {
   Dict() = default;
   Dict(const Dict& o) : strs(o.strs) {
     o.index();
+    std::shared_lock<std::shared_mutex> lk(o.mapMu);
     map = o.map;
   }
   Dict& operator=(const Dict& o) {
     if (this != &o) {
       o.index();
       strs = o.strs;
+      std::shared_lock<std::shared_mutex> lk(o.mapMu);
       map = o.map;
       lazy = false;
       std::lock_guard<std::mutex> g(cacheMu);
@@ -98,6 +180,7 @@ struct Dict {
   }
   int32_t getOrAdd(std::string_view s) {
     index();
+    std::unique_lock<std::shared_mutex> lk(mapMu);
     auto it = map.find(s);
     if (it != map.end()) return it->second;
     int32_t c = (int32_t)strs.size();
@@ -113,6 +196,7 @@ struct Dict {
   }
   int32_t find(std::string_view s) const {
     index();
+    std::shared_lock<std::shared_mutex> lk(mapMu);
     auto it = map.find(s);
     return it == map.end() ? -1 : it->second;
   }
@@ -120,6 +204,7 @@ struct Dict {
     if (!lazy.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> g(lazyMu);
     if (!lazy.load(std::memory_order_relaxed)) return;
+    std::unique_lock<std::shared_mutex> lk(mapMu);
     map.reserve(strs.size());
     for (size_t i = map.size(); i < strs.size(); ++i) map.emplace(strs[i], (int32_t)i);
     lazy.store(false, std::memory_order_release);
@@ -132,14 +217,45 @@ struct Dict {
   }
   mutable std::atomic<bool> lazy{false};
   mutable std::mutex lazyMu;
+  mutable std::shared_mutex mapMu;  // map: readers look strings up while a writer adds them
   mutable std::mutex cacheMu;
   mutable std::map<std::string, std::shared_ptr<void>> derived;
 };
 
-struct Segment {
-  uint64_t id = 0;  // unique for the process (keys per-segment caches such as vector graphs)
-  int part = 0;  // partition this segment belongs to
-  int64_t n = 0;
+// ---- MVCC. Queries read a per-statement snapshot of each table (Table::shadow) without holding its
+// lock, so writers never wait for readers and readers never wait for writers. What a snapshot
+// shares with the live table is never changed in place where the snapshot can see it:
+//   * deleted-row bitmaps are copy-on-write (DelBits: a writer clones one that a snapshot holds),
+//   * segment column data is immutable (SegData; the VRAM balancer frees memory it moves only after
+//     every query that started earlier has finished, see rcuDefer),
+//   * write buffers only grow at the end; storage that has to be reallocated while a snapshot holds
+//     it is copied first (BufData), VRAM mirrors are reference counted (DevMirror), and a flush
+//     installs a fresh buffer instead of clearing the old one,
+//   * dictionaries only grow, in blocks that never move (StrVec).
+
+// Deleted-row bitmap (bit set = deleted) with a lazily uploaded device copy.
+struct DelBits {
+  std::vector<uint32_t> host;
+  int64_t ndel = 0;
+  std::mutex mu;  // guards the device copy
+  uint32_t* dev = nullptr;
+  int64_t devCap = 0;     // words allocated on the device
+  int64_t devWords = 0;   // words [0, devWords) of dev are current
+  uint64_t ver = 0, devVer = ~0ull;  // ver: bumped when an existing bit changes
+  DelBits() = default;
+  DelBits(const DelBits& o) : host(o.host), ndel(o.ndel) {}
+  ~DelBits();
+  bool test(int64_t r) const { return (size_t)(r >> 5) < host.size() && ((host[r >> 5] >> (r & 31)) & 1u); }
+  // Device bitmap valid for at least `words` words (uploads what changed).
+  const uint32_t* device(int64_t words);
+};
+using DelP = std::shared_ptr<DelBits>;
+// The bitmap to modify: `d` itself, or a private copy when a snapshot shares it.
+DelBits& delForWrite(DelP& d);
+void delSet(DelBits& d, int64_t r);  // marks row r deleted (and patches a current device copy)
+
+// Immutable column data of a segment (shared by the live table's Segment and snapshots of it).
+struct SegData {
   std::vector<std::vector<uint8_t>> host;  // host mirror, per column
   std::vector<void*> dev;                  // VRAM copy (or mapped host mirror), per column
   std::vector<uint8_t> mapped;             // per column: 1 = host tier (read over PCIe)
@@ -152,34 +268,95 @@ struct Segment {
   std::vector<uint8_t> enc;
   std::vector<std::vector<uint8_t>> encHost;
   int64_t devBytes = 0;  // VRAM (or pinned host) bytes of the column copies
-  std::vector<double> mn, mx;              // segment elimination metadata
-  std::vector<uint32_t> delHost;
-  uint32_t* delDev = nullptr;
-  int64_t ndel = 0;
-  ~Segment();
+  std::vector<double> mn, mx;  // segment elimination metadata
+  ~SegData();
 };
 
-struct WriteBuffer {
+struct Segment {
+  uint64_t id = 0;  // unique for the process (keys per-segment caches such as vector graphs)
+  int part = 0;  // partition this segment belongs to
+  int64_t n = 0;
+  std::shared_ptr<SegData> d = std::make_shared<SegData>();
+  // (the column data, by its old names)
+  std::vector<std::vector<uint8_t>>& host = d->host;
+  std::vector<void*>& dev = d->dev;
+  std::vector<uint8_t>& mapped = d->mapped;
+  std::vector<uint32_t>& uses = d->uses;
+  std::vector<float>& heat = d->heat;
+  std::vector<uint8_t>& enc = d->enc;
+  std::vector<std::vector<uint8_t>>& encHost = d->encHost;
+  int64_t& devBytes = d->devBytes;
+  std::vector<double>& mn = d->mn;
+  std::vector<double>& mx = d->mx;
+  DelP del = std::make_shared<DelBits>();
+  Segment() = default;
+  Segment(const Segment& o) : id(o.id), part(o.part), n(o.n), d(o.d), del(o.del) {}  // a snapshot: shares data and bitmap
+  Segment& operator=(const Segment&) = delete;
+  int64_t ndel() const { return del->ndel; }
+  const std::vector<uint32_t>& delHost() const { return del->host; }
+  const uint32_t* delDev() { return del->device((n + 31) / 32); }
+};
+
+// VRAM copy of a write buffer's columns: rows [0, rows) uploaded, room for cap rows. Replaced (not
+// reallocated) when it has to grow, so snapshots keep using the one they got.
+struct DevMirror {
+  std::vector<void*> cols;
+  int64_t cap = 0, rows = 0;
+  uint64_t gen = 0;
+  ~DevMirror();
+};
+
+// Write buffer column storage, shared by the live buffer and its snapshots.
+struct BufData {
   std::vector<std::vector<uint8_t>> cols;
-  std::vector<uint32_t> del;
-  int64_t n = 0, ndel = 0;
-  uint64_t version = 1;
-  // Lazily refreshed VRAM copy used by GPU scans.
-  std::mutex devMu;
-  uint64_t devVersion = 0;
-  // Columns change only by appends, except when replaced or cleared (gen bumps): then the VRAM copy
-  // is re-uploaded whole, otherwise only rows [devN, n).
-  uint64_t gen = 0, devGen = ~0ull;
-  int64_t devN = 0;
-  // Cached per-column value range of rows [0, rangeN) (colRange), extended as rows are appended.
+  std::mutex devMu;  // guards mirror
+  std::shared_ptr<DevMirror> mirror;
+  // Per-column value range of rows [0, rangeN) (colRange), extended as rows are appended. Shared by
+  // the snapshots of the buffer (a snapshot with fewer rows gets a range that may be wider: safe).
+  std::mutex rangeMu;
   uint64_t rangeGen = ~0ull;
   int64_t rangeN = 0;
   std::vector<double> rmn, rmx;
-  std::vector<void*> dev;
-  uint32_t* delDev = nullptr;
-  int64_t devCap = 0;
-  ~WriteBuffer();
 };
+
+struct WriteBuffer {
+  std::shared_ptr<BufData> data = std::make_shared<BufData>();
+  struct ColsView {  // cols[c]: the current storage's column (data can be replaced, see reserveForAppend)
+    WriteBuffer* w;
+    std::vector<uint8_t>& operator[](size_t i) const { return w->data->cols[i]; }
+    size_t size() const { return w->data->cols.size(); }
+    std::vector<std::vector<uint8_t>>::iterator begin() const { return w->data->cols.begin(); }
+    std::vector<std::vector<uint8_t>>::iterator end() const { return w->data->cols.end(); }
+    void resize(size_t n) const { w->data->cols.resize(n); }
+  };
+  ColsView cols{this};
+  DelP del = std::make_shared<DelBits>();
+  int64_t n = 0;
+  uint64_t version = 1;
+  // Columns change only by appends, except when replaced (temp tables) or the buffer is replaced
+  // (flush): gen bumps, and the VRAM copy is re-uploaded whole.
+  uint64_t gen = 0;
+  // What GPU scans read (Table::syncBufferToDevice): device columns and deleted-row bitmap for rows
+  // [0, n), and the mirror they belong to (kept alive).
+  std::vector<void*> dev;
+  const uint32_t* delDev = nullptr;
+  std::shared_ptr<DevMirror> devRef;
+  uint64_t devVersion = 0;
+  WriteBuffer() = default;
+  WriteBuffer(const WriteBuffer& o)  // a snapshot: shares the storage, sees rows [0, o.n)
+      : data(o.data), del(o.del), n(o.n), version(o.version), gen(o.gen) {}
+  WriteBuffer& operator=(const WriteBuffer&) = delete;
+  int64_t ndel() const { return del->ndel; }
+  // Before appending bytes to column storage that a snapshot shares and that would have to grow:
+  // a private copy (with room to grow) takes its place.
+  void reserveForAppend(int64_t rows);
+};
+
+// Deferred frees for memory a running query may still read (MVCC): rcuEnter/rcuExit bracket a
+// snapshot query; rcuDefer runs `fn` once every query that entered before the call has exited.
+uint64_t rcuEnter();
+void rcuExit(uint64_t ticket);
+void rcuDefer(std::function<void()> fn);
 
 
 // Partition hashing. Integer-like values (INT, BIGINT, DATE) hash by value and strings by content,
@@ -269,16 +446,18 @@ class FairSharedMutex {
     cv_.notify_all();
   }
   void lock_shared() {
-    bool nested = !held_.empty() || barge;  // inside another table read: never wait behind writers (no lock-order deadlock)
+    // Inside another table read (or a microsecond read): don't queue behind waiting writers (no
+    // lock-order deadlock: writers hold one table lock), but never run alongside an active writer.
+    bool nested = !held_.empty() || barge;
     std::unique_lock<std::mutex> g(m_);
-    if (!nested) cv_.wait(g, [&] { return !w_ && waitingW_ == 0; });
+    cv_.wait(g, [&] { return !w_ && (nested || waitingW_ == 0); });
     ++readers_;
     ++held();
   }
   bool try_lock_shared() {
-    bool nested = !held_.empty();  // inside another table read: never wait behind writers (no lock-order deadlock)
+    bool nested = !held_.empty();  // inside another table read: don't queue behind waiting writers
     std::lock_guard<std::mutex> g(m_);
-    if (!nested && (w_ || waitingW_)) return false;
+    if (w_ || (!nested && waitingW_)) return false;
     ++readers_;
     ++held();
     return true;
@@ -303,7 +482,7 @@ struct Table {
   std::vector<FkMeta> fks;
   std::vector<int> fulltextCols;  // FULLTEXT columns: inverted index built in the background
   std::vector<ColumnMeta> cols;
-  std::vector<std::unique_ptr<Dict>> dicts;  // per column, VARCHAR only
+  std::vector<std::shared_ptr<Dict>> dicts;  // per column, VARCHAR only
   int pk = -1, sortKey = -1;           // pk: single-column PRIMARY KEY with a hash index
   std::vector<int> pkCols;             // all PRIMARY KEY columns
   std::vector<int> shardKey;           // empty => keyless (round-robin)
@@ -311,8 +490,18 @@ struct Table {
   bool reference = false;
   int vram = 0;  // VRAM hint for columns without their own: 0 AUTO (the cache decides), 1 PIN, 2 NEVER
   int vramHint(int c) const { return cols[c].vram ? cols[c].vram : vram; }
-  std::vector<std::unique_ptr<Segment>> segs;
-  std::vector<std::unique_ptr<WriteBuffer>> bufs;  // one per partition
+  std::vector<std::shared_ptr<Segment>> segs;
+  std::vector<std::shared_ptr<WriteBuffer>> bufs;  // one per partition
+  // MVCC snapshot (shadow()): a read-only copy of the table's state for one statement. It shares
+  // the live table's data (see DelBits / SegData / BufData) but has its own segment / buffer lists,
+  // row counts and bitmaps, so later writes to the live table don't show. Index maps are not
+  // copied: lookups go to `base` (under its lock) and are checked against the snapshot.
+  const Table* base = nullptr;
+  int64_t baseFlushes = 0;  // base->flushes when the snapshot was taken (rows move between batches at a flush)
+  std::shared_ptr<Table> shadow() const;  // caller holds a lock on mu
+  bool isShadow() const { return base != nullptr; }
+  // Is location l (from base's indexes) a live row of this snapshot?
+  bool shadowHas(Loc l) const;
   std::unordered_map<int64_t, Loc> pkIndex;
   FairSharedMutex mu;
   int64_t flushes = 0;
@@ -378,6 +567,11 @@ struct UndoRec {
   std::vector<Value> row;
 };
 std::vector<UndoRec>*& undoLog();
+// The open transaction whose change sets (Table::txnPending) writes are recorded under: undoLog(),
+// or tTxnKey while a ROLLBACK replays the undo log (its re-inserted rows stay hidden until the
+// change sets are dropped, so the rollback shows all at once).
+extern thread_local const void* tTxnKey;
+inline const void* txnKey() { return tTxnKey ? tTxnKey : (const void*)undoLog(); }
 
 // Current database of the calling connection (thread); "gpudb" by default.
 std::string& currentDb();

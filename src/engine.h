@@ -237,6 +237,7 @@ class Engine {
   ResultSet doRename(Stmt& s);
   ResultSet doShowMisc(Stmt& s);
   ResultSet infoSchema(const std::string& table);
+  std::shared_ptr<Table> tableForRead(const std::string& name, const Stmt& s);  // MVCC snapshot (see SnapScope)
   std::vector<std::vector<std::string>> processRows(bool truncateInfo);
   std::string showCreate(const Table& t);
   std::shared_ptr<Table> rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from);

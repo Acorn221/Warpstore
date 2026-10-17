@@ -15,6 +15,8 @@ std::string lower(std::string s) {
   return s;
 }
 
+thread_local const void* tTxnKey = nullptr;
+
 std::vector<UndoRec>*& undoLog() {
   thread_local std::vector<UndoRec>* log = nullptr;
   return log;
@@ -79,18 +81,131 @@ std::shared_ptr<Table> Catalog::get(const std::string& name) {
   return t;
 }
 
-Segment::~Segment() {
+SegData::~SegData() {
   for (size_t c = 0; c < dev.size(); ++c) {
     const bool e = c < enc.size() && enc[c];
     const std::vector<uint8_t>* src = e ? &encHost[c] : c < host.size() ? &host[c] : nullptr;
     releaseColumn(dev[c], src ? (void*)src->data() : nullptr, src ? src->size() : 0, c < mapped.size() && mapped[c]);
   }
-  devFree(delDev);
 }
 
-WriteBuffer::~WriteBuffer() {
-  for (void* p : dev) devFree(p);
-  devFree(delDev);
+// (Mirrors and bitmaps come and go with snapshots: from the stream-ordered pool, as cudaMalloc /
+// cudaFree synchronize the whole device.)
+DevMirror::~DevMirror() {
+  for (void* p : cols) tmpFree(p);
+}
+
+DelBits::~DelBits() { tmpFree(dev); }
+
+const uint32_t* DelBits::device(int64_t words) {
+  std::lock_guard<std::mutex> g(mu);
+  words = std::max<int64_t>(words, 1);
+  if (!dev || devCap < words) {  // room for what the host bitmap can grow to without reallocating
+    const int64_t cap = std::max<int64_t>({words, (int64_t)host.capacity(), 1});
+    uint32_t* nd = (uint32_t*)tmpAlloc((size_t)cap * 4);
+    if (dev) {
+      uint32_t* old = dev;
+      rcuDefer([old] { tmpFree(old); });  // a query may still be reading it
+    }
+    dev = nd;
+    devCap = cap;
+    devWords = 0;
+    devVer = ~0ull;
+  }
+  const bool fresh = devVer == ver;  // no bit changed since the last upload: only new words are missing
+  const int64_t have = std::min<int64_t>(words, (int64_t)host.size());
+  const int64_t from = fresh ? devWords : 0;
+  if (have > from) h2d(dev + from, host.data() + from, (size_t)(have - from) * 4);
+  if (words > have) {  // (rows the host bitmap has no word for: not deleted)
+    std::vector<uint32_t> z((size_t)(words - have), 0);
+    h2d(dev + have, z.data(), z.size() * 4);
+  }
+  devWords = std::max(fresh ? devWords : 0, have);
+  devVer = ver;
+  return dev;
+}
+
+DelBits& delForWrite(DelP& d) {
+  if (d.use_count() > 1) {  // a snapshot holds this version: change a private copy
+    auto nd = std::make_shared<DelBits>();
+    nd->host.reserve(d->host.capacity());
+    nd->host.assign(d->host.begin(), d->host.end());
+    nd->ndel = d->ndel;
+    d = nd;
+  }
+  return *d;
+}
+
+void WriteBuffer::reserveForAppend(int64_t rows) {
+  if (data.use_count() > 1) {  // shared with a snapshot: never reallocate under it
+    bool grow = false;
+    for (auto& c : data->cols) {
+      const size_t per = n ? c.size() / (size_t)n : 0;
+      if (per && c.size() + per * (size_t)rows > c.capacity()) grow = true;
+    }
+    if (grow) {
+      auto nd = std::make_shared<BufData>();
+      nd->cols.resize(data->cols.size());
+      for (size_t i = 0; i < nd->cols.size(); ++i) {
+        const auto& src = data->cols[i];
+        const size_t per = n ? src.size() / (size_t)n : 0;
+        nd->cols[i].reserve(std::max(src.size() * 2, src.size() + per * (size_t)rows + 4096));
+        nd->cols[i].assign(src.begin(), src.end());
+      }
+      data = nd;  // (no VRAM mirror yet: the next scan uploads it)
+      ++gen;
+    }
+  }
+  if (del.use_count() > 1 && del->host.size() + (size_t)(rows + 31) / 32 + 1 > del->host.capacity()) {
+    auto nd = std::make_shared<DelBits>();
+    nd->host.reserve(std::max(del->host.size() * 2, del->host.size() + (size_t)(rows + 31) / 32 + 1024));
+    nd->host.assign(del->host.begin(), del->host.end());
+    nd->ndel = del->ndel;
+    del = nd;
+  }
+}
+
+// ---- RCU: a ticket per snapshot query; deferred frees wait for the queries older than them.
+namespace {
+std::mutex rcuMu;
+uint64_t rcuNext = 1;
+std::multiset<uint64_t> rcuActive;
+std::vector<std::pair<uint64_t, std::function<void()>>> rcuPending;  // (ticket at deferral, free)
+void rcuReclaim(std::unique_lock<std::mutex>& lk) {
+  const uint64_t oldest = rcuActive.empty() ? UINT64_MAX : *rcuActive.begin();
+  std::vector<std::function<void()>> run;
+  for (size_t i = 0; i < rcuPending.size();)
+    if (rcuPending[i].first <= oldest) {
+      run.push_back(std::move(rcuPending[i].second));
+      rcuPending[i] = std::move(rcuPending.back());
+      rcuPending.pop_back();
+    } else {
+      ++i;
+    }
+  lk.unlock();
+  for (auto& f : run) f();
+  lk.lock();
+}
+}  // namespace
+
+uint64_t rcuEnter() {
+  std::lock_guard<std::mutex> g(rcuMu);
+  const uint64_t t = rcuNext++;
+  rcuActive.insert(t);
+  return t;
+}
+
+void rcuExit(uint64_t ticket) {
+  std::unique_lock<std::mutex> lk(rcuMu);
+  rcuActive.erase(rcuActive.find(ticket));
+  if (!rcuPending.empty()) rcuReclaim(lk);
+}
+
+void rcuDefer(std::function<void()> fn) {
+  std::unique_lock<std::mutex> lk(rcuMu);
+  // queries that entered before now hold tickets < rcuNext: run once all of those have exited
+  rcuPending.push_back({rcuNext++, std::move(fn)});
+  rcuReclaim(lk);
 }
 
 bool parseVector(const std::string& s, std::vector<float>& out) {
@@ -219,7 +334,7 @@ int Table::colIndex(const std::string& n) const {
 
 int64_t Table::bufferRows() const {
   int64_t r = 0;
-  for (auto& b : bufs) r += b->n - b->ndel;
+  for (auto& b : bufs) r += b->n - b->ndel();
   return r;
 }
 int64_t Table::bufferTotal() const {
@@ -239,7 +354,7 @@ void Table::fillHostMirror(Segment& sg, int c) const {
 
 int64_t Table::liveRows() const {
   int64_t r = bufferRows();
-  for (auto& s : segs) r += s->n - s->ndel;
+  for (auto& s : segs) r += s->n - s->ndel();
   return r;
 }
 
@@ -249,8 +364,11 @@ int64_t Table::vramBytes() const {
     b += s->devBytes;
     b += (s->n + 31) / 32 * 4;
   }
-  for (auto& bp : bufs)
-    for (size_t c = 0; c < cols.size(); ++c) b += bp->devCap * colBytes((int)c);
+  for (auto& bp : bufs) {
+    std::lock_guard<std::mutex> g(bp->data->devMu);
+    if (bp->data->mirror)
+      for (size_t c = 0; c < cols.size(); ++c) b += bp->data->mirror->cap * colBytes((int)c);
+  }
   return b;
 }
 
@@ -322,10 +440,10 @@ void Table::trainVectorIndex(IndexMeta& ix) {
   std::vector<Loc> locs;
   for (size_t si = 0; si < segs.size(); ++si)
     for (int64_t r = 0; r < segs[si]->n; ++r)
-      if (!((segs[si]->delHost[r >> 5] >> (r & 31)) & 1u)) locs.push_back(Loc{(int32_t)si, (int32_t)r});
+      if (!segs[si]->del->test(r)) locs.push_back(Loc{(int32_t)si, (int32_t)r});
   for (int p = 0; p < nparts; ++p)
     for (int64_t r = 0; r < bufs[p]->n; ++r)
-      if (!((bufs[p]->del[r >> 5] >> (r & 31)) & 1u)) locs.push_back(bufLoc(p, r));
+      if (!bufs[p]->del->test(r)) locs.push_back(bufLoc(p, r));
   const int64_t n = (int64_t)locs.size();
   ix.trainedRows = n;
   ix.cent.clear();
@@ -419,10 +537,10 @@ void Table::buildIndex(IndexMeta& ix) {
   if (ix.vec && ix.nlist > 0) {
     for (size_t si = 0; si < segs.size(); ++si)
       for (int64_t r = 0; r < segs[si]->n; ++r)
-        if (!((segs[si]->delHost[r >> 5] >> (r & 31)) & 1u)) all.push_back(Loc{(int32_t)si, (int32_t)r});
+        if (!segs[si]->del->test(r)) all.push_back(Loc{(int32_t)si, (int32_t)r});
     for (int p = 0; p < nparts; ++p)
       for (int64_t r = 0; r < bufs[p]->n; ++r)
-        if (!((bufs[p]->del[r >> 5] >> (r & 31)) & 1u)) all.push_back(bufLoc(p, r));
+        if (!bufs[p]->del->test(r)) all.push_back(bufLoc(p, r));
     std::vector<int64_t> keys(all.size());
     const int nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
     std::vector<std::thread> th;
@@ -440,10 +558,10 @@ void Table::buildIndex(IndexMeta& ix) {
   };
   for (size_t si = 0; si < segs.size(); ++si)
     for (int64_t r = 0; r < segs[si]->n; ++r)
-      if (!((segs[si]->delHost[r >> 5] >> (r & 31)) & 1u)) add(Loc{(int32_t)si, (int32_t)r});
+      if (!segs[si]->del->test(r)) add(Loc{(int32_t)si, (int32_t)r});
   for (int p = 0; p < nparts; ++p)
     for (int64_t r = 0; r < bufs[p]->n; ++r)
-      if (!((bufs[p]->del[r >> 5] >> (r & 31)) & 1u)) add(bufLoc(p, r));
+      if (!bufs[p]->del->test(r)) add(bufLoc(p, r));
 }
 
 void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double>& dbls) {
@@ -485,6 +603,7 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
   }
   const int part = partOf(ints, dbls);
   WriteBuffer& buf = *bufs[part];
+  buf.reserveForAppend(1);  // (copies storage a snapshot shares before it would reallocate)
   if (pk >= 0) {
     if (ints[pk] == kNullI32 && cols[pk].pt == PType::I32) throw SqlError("Column '" + cols[pk].name + "' cannot be null", 1048);
     if (ints[pk] == kNullI64 && cols[pk].pt == PType::I64) throw SqlError("Column '" + cols[pk].name + "' cannot be null", 1048);
@@ -506,11 +625,11 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
       }
     }
   }
-  if ((buf.n & 31) == 0) buf.del.push_back(0);
+  if ((buf.n & 31) == 0) buf.del->host.push_back(0);
   const Loc nl = bufLoc(part, buf.n);
   ++buf.n;
   ++buf.version;
-  if (undoLog() && db != "__tmp") txnPending[undoLog()].hidden.push_back(nl);  // invisible to others until COMMIT
+  if (txnKey() && db != "__tmp") txnPending[txnKey()].hidden.push_back(nl);  // invisible to others until COMMIT
   if (!indexes.empty()) indexAdd(nl);
   if (buf.n >= kSegRows) flushPart(part);
 }
@@ -614,16 +733,21 @@ void Table::deleteAt(Loc l) {
   if (!indexes.empty()) indexRemove(l);
   if (l.seg < 0) {
     WriteBuffer& buf = *bufs[bufPart(l)];
-    buf.del[l.row >> 5] |= 1u << (l.row & 31);
-    ++buf.ndel;
+    delSet(delForWrite(buf.del), l.row);
     ++buf.version;
   } else {
-    Segment& s = *segs[l.seg];
-    uint32_t& w = s.delHost[l.row >> 5];
-    w |= 1u << (l.row & 31);
-    ++s.ndel;
-    h2d(&s.delDev[l.row >> 5], &w, 4);
+    delSet(delForWrite(segs[l.seg]->del), l.row);
   }
+}
+
+void delSet(DelBits& d, int64_t r) {
+  uint32_t& w = d.host[r >> 5];
+  const uint32_t bit = 1u << (r & 31);
+  if (w & bit) return;
+  w |= bit;
+  ++d.ndel;
+  std::lock_guard<std::mutex> g(d.mu);  // keep a current device copy current
+  if (d.dev && d.devVer == d.ver && (r >> 5) < d.devWords) h2d(&d.dev[r >> 5], &w, 4);
 }
 
 void Table::flush(bool force) {
@@ -732,14 +856,15 @@ uint8_t Table::encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std
 }
 
 void Table::flushPart(int part) {
-  WriteBuffer& buf = *bufs[part];
+  const std::shared_ptr<WriteBuffer> hold = bufs[part];  // (replaced at the end; snapshots keep it)
+  WriteBuffer& buf = *hold;
   if (buf.n == 0) return;
   if (!txnPending.empty()) return;  // open transactions refer to buffer rows by location: flush later
   // Live rows in buffer order, then sorted by the SORT KEY (on the GPU).
   std::vector<int32_t> live;
-  live.reserve(buf.n - buf.ndel);
+  live.reserve(buf.n - buf.ndel());
   for (int64_t r = 0; r < buf.n; ++r)
-    if (!((buf.del[r >> 5] >> (r & 31)) & 1u)) live.push_back((int32_t)r);
+    if (!buf.del->test(r)) live.push_back((int32_t)r);
   if (sortKey >= 0 && live.size() > 1) {
     const auto& kc = buf.cols[sortKey];
     int sz = psize(cols[sortKey].pt);
@@ -790,9 +915,7 @@ void Table::flushPart(int part) {
       seg->mapped[c] = m;
       seg->devBytes += (int64_t)placed.size();
     }
-    seg->delHost.assign((n + 31) / 32, 0);
-    seg->delDev = (uint32_t*)devAlloc(seg->delHost.size() * 4);
-    h2d(seg->delDev, seg->delHost.data(), seg->delHost.size() * 4);
+    seg->del->host.assign((n + 31) / 32, 0);
     int32_t segId = (int32_t)segs.size();
     if (pk >= 0)
       for (size_t i = 0; i < n; ++i) pkIndex[readInt(seg->host[pk], cols[pk].pt, (int64_t)i)] = Loc{segId, (int32_t)i};
@@ -808,11 +931,11 @@ void Table::flushPart(int part) {
           if (l == old) { l = nl; break; }
       }
   }
-  for (auto& c : buf.cols) c.clear();
-  buf.del.clear();
-  buf.n = buf.ndel = 0;
-  ++buf.version;
-  ++buf.gen;
+  // A fresh buffer replaces the flushed one (snapshots still reading the old one keep it).
+  auto fresh = std::make_shared<WriteBuffer>();
+  fresh->cols.resize(cols.size());
+  fresh->gen = buf.gen + 1;
+  bufs[part] = fresh;
   ++flushes;
   for (auto& ix : indexes)  // vector indexes train once there is data, and retrain as it grows 4x
     if (ix.vec) {
@@ -823,28 +946,89 @@ void Table::flushPart(int part) {
 
 void Table::syncBufferToDevice(int part) {
   WriteBuffer& buf = *bufs[part];
-  std::lock_guard<std::mutex> g(buf.devMu);
-  if (buf.devVersion == buf.version) return;
-  bool full = buf.gen != buf.devGen || buf.n < buf.devN;
-  if (buf.n > buf.devCap) {
-    full = true;
-    int64_t cap = std::max<int64_t>(buf.n, std::min<int64_t>(kSegRows, std::max<int64_t>(4096, buf.devCap * 2)));
-    for (void* p : buf.dev) devFree(p);
-    devFree(buf.delDev);
-    buf.dev.assign(cols.size(), nullptr);
-    for (size_t c = 0; c < cols.size(); ++c) buf.dev[c] = devAlloc(cap * colBytes((int)c));
-    buf.delDev = (uint32_t*)devAlloc((cap + 31) / 32 * 4);
-    buf.devCap = cap;
+  if (buf.devRef && buf.devVersion == buf.version) return;
+  BufData& bd = *buf.data;
+  std::shared_ptr<DevMirror> m;
+  {
+    std::lock_guard<std::mutex> g(bd.devMu);
+    m = bd.mirror;
+    if (!m || m->gen != buf.gen || m->cap < buf.n) {  // (re)build: a new mirror, so snapshots keep theirs
+      auto nm = std::make_shared<DevMirror>();
+      nm->gen = buf.gen;
+      nm->cap = std::max<int64_t>(buf.n, std::min<int64_t>(kSegRows, std::max<int64_t>(4096, (m ? m->cap : 0) * 2)));
+      nm->cols.resize(cols.size());
+      for (size_t c = 0; c < cols.size(); ++c) nm->cols[c] = tmpAlloc((size_t)nm->cap * colBytes((int)c));
+      if (m && m->gen == buf.gen && m->rows > 0) {
+        nm->rows = std::min(m->rows, buf.n);
+        for (size_t c = 0; c < cols.size(); ++c) d2d(nm->cols[c], m->cols[c], (size_t)nm->rows * colBytes((int)c));
+      }
+      bd.mirror = m = nm;
+    }
+    if (m->rows < buf.n) {  // only appended rows are new
+      for (size_t c = 0; c < cols.size(); ++c) {
+        const int64_t w = colBytes((int)c);
+        h2d((char*)m->cols[c] + m->rows * w, bd.cols[c].data() + m->rows * w, (size_t)(buf.n - m->rows) * w);
+      }
+      m->rows = buf.n;
+    }
   }
-  const int64_t from = full ? 0 : buf.devN;
-  for (size_t c = 0; c < cols.size(); ++c) {
-    const int64_t w = colBytes((int)c);
-    if (buf.n > from) h2d((char*)buf.dev[c] + from * w, buf.cols[c].data() + from * w, (buf.n - from) * w);
-  }
-  h2d(buf.delDev, buf.del.data(), buf.del.size() * 4);
+  buf.dev = m->cols;
+  buf.devRef = m;
+  buf.delDev = buf.del->device((buf.n + 31) / 32);
   buf.devVersion = buf.version;
-  buf.devGen = buf.gen;
-  buf.devN = buf.n;
+}
+
+std::shared_ptr<Table> Table::shadow() const {
+  auto s = std::make_shared<Table>(name, cols, pk, sortKey, pkCols, shardKey, nparts, reference);
+  s->base = this;
+  s->baseFlushes = flushes;
+  s->db = db;
+  s->txnPending = txnPending;
+  s->fks = fks;
+  s->fulltextCols = fulltextCols;
+  s->dicts = dicts;
+  s->vram = vram;
+  s->hasNull = hasNull;
+  s->autoIncCol = autoIncCol;
+  s->autoNext = autoNext;
+  s->flushes = flushes;
+  s->indexes.reserve(indexes.size());
+  for (auto& ix : indexes) {  // metadata (and the shared CAGRA graphs), not the lookup maps
+    IndexMeta m;
+    m.name = ix.name;
+    m.cols = ix.cols;
+    m.unique = ix.unique;
+    m.vec = ix.vec;
+    m.metric = ix.metric;
+    m.nlist = ix.nlist;
+    m.nprobe = ix.nprobe;
+    m.dim = ix.dim;
+    m.algo = ix.algo;
+    m.graphDegree = ix.graphDegree;
+    m.itopk = ix.itopk;
+    m.cagra = ix.cagra;
+    m.trainedRows = ix.trainedRows;
+    m.cent = ix.cent;
+    m.options = ix.options;
+    s->indexes.push_back(std::move(m));
+  }
+  s->segs.clear();
+  s->segs.reserve(segs.size());
+  for (auto& sg : segs) s->segs.push_back(std::make_shared<Segment>(*sg));
+  s->bufs.clear();
+  for (auto& b : bufs) s->bufs.push_back(std::make_shared<WriteBuffer>(*b));
+  return s;
+}
+
+bool Table::shadowHas(Loc l) const {
+  if (!base) return true;
+  if (l.seg >= 0) {
+    if ((size_t)l.seg >= segs.size() || (size_t)l.seg >= base->segs.size() || segs[l.seg]->d != base->segs[l.seg]->d) return false;
+    return l.row < segs[l.seg]->n && !segs[l.seg]->del->test(l.row);
+  }
+  const int p = bufPart(l);
+  if (p >= (int)bufs.size() || bufs[p]->data != base->bufs[p]->data) return false;
+  return l.row < bufs[p]->n && !bufs[p]->del->test(l.row);
 }
 
 // ---------------------------------------------------------------- LOAD DATA
@@ -907,7 +1091,8 @@ int64_t Table::loadFile(const std::string& path, char delim, int64_t skip, std::
   std::vector<double> dbls(cols.size());
   std::vector<std::pair<const char*, const char*>> fields(std::max<size_t>(cols.size(), needFields) + 1);
   for (auto& b : bufs)
-    for (auto& c : b->cols) c.reserve(std::min<int64_t>(kSegRows, (kSegRows * 4) / nparts) * 8);
+    if (b->data.use_count() == 1)  // (never under a snapshot)
+      for (auto& c : b->cols) c.reserve(std::min<int64_t>(kSegRows, (kSegRows * 4) / nparts) * 8);
   bool eof = false;
   while (!eof) {
     size_t got = fread(data.data() + have, 1, CH - have, f);
