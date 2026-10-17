@@ -220,7 +220,7 @@ struct Translator {
         }
         case OP_ISNULL: {
           Sym a = pop();
-          st.push_back({a.isInt ? "0ll" : "((long long)(" + a.e + "!=" + a.e + "))", true});
+          st.push_back({a.isInt ? "0ll" : "((long long)gdb::isNullD(" + a.e + "))", true});  // once: two copies may round differently (FMA)
           break;
         }
         case OP_COALESCE: {

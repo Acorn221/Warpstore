@@ -431,7 +431,7 @@ HD double evalProgC(const ExprEnv& env, const ColView* cols, Prog pg, int64_t ro
   if (pg.len == 1) {
     const Instr in = env.code[pg.start];
     if (in.op == OP_COL) return loadCol(cols[in.arg], row);
-    if (in.op == OP_CONST) return env.consts[in.arg];
+    if (in.op == OP_CONST) return in.isInt ? (double)bitsOf(env.consts[in.arg]) : env.consts[in.arg];
   }
   double st[kMaxStack];
   int sp = 0;

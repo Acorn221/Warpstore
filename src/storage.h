@@ -59,6 +59,7 @@ struct Dict {
   // string -> code. Strings added with appendUnique() are indexed lazily, on the first lookup
   // (derived dictionaries are often only ever read by code).
   mutable std::unordered_map<std::string, int32_t, SvHash, std::equal_to<>> map;
+  const uint64_t uid = nextUid();  // unique for the process (never reused, unlike the address)
   Dict() = default;
   Dict(const Dict& o) : strs(o.strs) {
     o.index();
@@ -70,8 +71,30 @@ struct Dict {
       strs = o.strs;
       map = o.map;
       lazy = false;
+      std::lock_guard<std::mutex> g(cacheMu);
+      derived.clear();
     }
     return *this;
+  }
+  // Data derived from the strings (sort order, ranks, text index ...), cached with the dictionary so it
+  // dies with it. Entries record the size they were built for: dictionaries only grow.
+  template <class T>
+  std::shared_ptr<T> getDerived(const std::string& k) const {
+    std::lock_guard<std::mutex> g(cacheMu);
+    auto it = derived.find(k);
+    return it == derived.end() ? nullptr : std::static_pointer_cast<T>(it->second);
+  }
+  void setDerived(const std::string& k, std::shared_ptr<void> v) const {
+    std::lock_guard<std::mutex> g(cacheMu);
+    derived[k] = std::move(v);
+  }
+  void dropDerived(const std::string& prefix) const {  // e.g. per-partner entries, to bound the cache
+    std::lock_guard<std::mutex> g(cacheMu);
+    for (auto it = derived.lower_bound(prefix); it != derived.end() && it->first.compare(0, prefix.size(), prefix) == 0;) it = derived.erase(it);
+  }
+  size_t derivedCount() const {
+    std::lock_guard<std::mutex> g(cacheMu);
+    return derived.size();
   }
   int32_t getOrAdd(std::string_view s) {
     index();
@@ -103,8 +126,14 @@ struct Dict {
   }
 
  private:
+  static uint64_t nextUid() {
+    static std::atomic<uint64_t> n{0};
+    return ++n;
+  }
   mutable std::atomic<bool> lazy{false};
   mutable std::mutex lazyMu;
+  mutable std::mutex cacheMu;
+  mutable std::map<std::string, std::shared_ptr<void>> derived;
 };
 
 struct Segment {

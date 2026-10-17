@@ -1,0 +1,21 @@
+{
+  "name": "drizzle",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "drizzle-orm": "^0.45.4",
+    "mysql2": "^3.24.6"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.11",
+    "tsx": "^4.23.15"
+  }
+}

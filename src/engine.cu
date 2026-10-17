@@ -120,21 +120,18 @@ void derivShareMap(const std::shared_ptr<std::vector<double>>& m);
 // Sorted order of a dictionary (collation-aware): (rank -> code, code -> rank). Dictionaries only
 // grow, so (dictionary, size, collation) identifies a version: cached, built with a parallel sort.
 std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vector<double>>> sortedDict(const Dict& d) {
-  static std::mutex mu;
   struct E {
     size_t n;
     std::shared_ptr<const std::vector<int32_t>> order;
     std::shared_ptr<std::vector<double>> rank;
   };
-  static std::map<std::pair<const Dict*, bool>, E> cache;
   const bool ci = ciColl();
+  const std::string ckey = ci ? "sorted/ci" : "sorted";
   const size_t n = d.strs.size();
   std::shared_ptr<const std::vector<int32_t>> prev;  // order of an older (smaller) version
-  {
-    std::lock_guard<std::mutex> g(mu);
-    auto it = cache.find({&d, ci});
-    if (it != cache.end() && it->second.n == n) return {it->second.order, it->second.rank};
-    if (it != cache.end() && it->second.n < n && n - it->second.n <= n / 8) prev = it->second.order;
+  if (auto c = d.getDerived<E>(ckey)) {
+    if (c->n == n) return {c->order, c->rank};
+    if (c->n < n && n - c->n <= n / 8) prev = c->order;
   }
   const auto tStart = std::chrono::steady_clock::now();
   if (prev) {  // the dictionary grew a little: binary-search the new strings into the old order
@@ -164,8 +161,7 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
     if (getenv("GPUDB_TRACE"))
       fprintf(stderr, "[trace] sorted dictionary of %zu strings incrementally (+%zu) in %.1f ms\n", n, n - n0,
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
-    std::lock_guard<std::mutex> g(mu);
-    cache[{&d, ci}] = E{n, order, rank};
+    d.setDerived(ckey, std::make_shared<E>(E{n, order, rank}));
     derivShareMap(rank);
     return {order, rank};
   }
@@ -262,8 +258,7 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
   if (getenv("GPUDB_TRACE"))
     fprintf(stderr, "[trace] sorted dictionary of %zu strings in %.1f ms\n", n,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
-  std::lock_guard<std::mutex> g(mu);
-  cache[{&d, ci}] = E{n, order, rank};
+  d.setDerived(ckey, std::make_shared<E>(E{n, order, rank}));
   derivShareMap(rank);
   return {order, rank};
 }
@@ -380,11 +375,9 @@ int collCmp(const std::string& a, const std::string& b) {
 // code -> canonical code (first entry with the same case-folded text), or null when the
 // dictionary has no case variants (then nothing needs mapping). Cached per dictionary size.
 std::shared_ptr<std::vector<double>> ciCanon(const Dict& d) {
-  static std::mutex mu;
-  static std::map<const Dict*, std::pair<size_t, std::shared_ptr<std::vector<double>>>> cache;
-  std::lock_guard<std::mutex> g(mu);
-  auto& slot = cache[&d];
-  if (slot.first == d.strs.size() && (slot.second || slot.first)) return slot.second;
+  using Slot = std::pair<size_t, std::shared_ptr<std::vector<double>>>;
+  if (auto c = d.getDerived<Slot>("cicanon"); c && c->first == d.strs.size()) return c->second;
+  Slot slot;
   std::unordered_map<std::string, int32_t> first;
   auto m = std::make_shared<std::vector<double>>(d.strs.size());
   bool any = false;
@@ -394,6 +387,7 @@ std::shared_ptr<std::vector<double>> ciCanon(const Dict& d) {
     any |= !fresh;
   }
   slot = {d.strs.size(), any ? m : nullptr};
+  d.setDerived("cicanon", std::make_shared<Slot>(slot));
   return slot.second;
 }
 
@@ -401,14 +395,10 @@ std::shared_ptr<std::vector<double>> ciCanon(const Dict& d) {
 // collation get equal ranks), so columns of different tables compare on the GPU. Cached per pair
 // and sizes.
 std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<double>>> crossRank(const Dict& a, const Dict& b) {
-  static std::mutex mu;
-  static std::map<std::tuple<const Dict*, const Dict*, size_t, size_t, bool>, std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<double>>>> cache;
-  const auto key = std::make_tuple(&a, &b, a.strs.size(), b.strs.size(), ciColl());
-  {
-    std::lock_guard<std::mutex> g(mu);
-    auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
-  }
+  using Maps = std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<double>>>;
+  // cached on a, keyed by b's identity and both sizes
+  const std::string key = "cross/" + std::to_string(b.uid) + "/" + std::to_string(a.strs.size()) + "/" + std::to_string(b.strs.size()) + (ciColl() ? "/ci" : "");
+  if (auto c = a.getDerived<Maps>(key)) return *c;
   std::vector<std::pair<const std::string*, int64_t>> all;  // (string, code; b's codes offset by |a|)
   all.reserve(a.strs.size() + b.strs.size());
   for (size_t i = 0; i < a.strs.size(); ++i) all.push_back({&a.strs[i], (int64_t)i});
@@ -422,9 +412,9 @@ std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<doub
     if (c < (int64_t)a.strs.size()) (*ma)[c] = rk;
     else (*mb)[c - a.strs.size()] = rk;
   }
-  std::lock_guard<std::mutex> g(mu);
-  if (cache.size() > 256) cache.clear();
-  return cache[key] = {ma, mb};
+  if (a.derivedCount() > 64) a.dropDerived("cross/");
+  a.setDerived(key, std::make_shared<Maps>(ma, mb));
+  return {ma, mb};
 }
 
 namespace {
@@ -629,9 +619,15 @@ void bindFunc(ExprP& e, BindCtx& c) {
     LType t = LType::BIGINT;
     for (auto& x : xs) {
       if (x->ty == LType::DOUBLE) t = LType::DOUBLE;
-      else if ((x->ty == LType::DATE || x->ty == LType::DATETIME) && t != LType::DOUBLE) t = x->ty;
+      else if (x->ty == LType::DECIMAL && t != LType::DOUBLE) t = LType::DECIMAL;
+      else if ((x->ty == LType::DATE || x->ty == LType::DATETIME) && t != LType::DOUBLE && t != LType::DECIMAL) t = x->ty;
     }
     return t;
+  };
+  auto maxScale = [](const std::vector<ExprP>& xs) {  // DECIMAL result scale: the widest argument's
+    int sc = 0;
+    for (auto& x : xs) if (x->ty == LType::DECIMAL) sc = std::max(sc, (int)x->scale);
+    return sc;
   };
   auto finish = [&](ExprP r) {
     e = r;
@@ -650,7 +646,10 @@ void bindFunc(ExprP& e, BindCtx& c) {
     LType t = A[0]->ty;
     for (auto& x : A) if (!isNullLit(x) && x->ty != t) t = numTy(A);
     ExprP r = A[n - 1];
-    for (size_t i = n - 1; i-- > 0;) r = boundNode(Expr::FUNC, "COALESCE2", {A[i], r}, t);
+    for (size_t i = n - 1; i-- > 0;) {
+      r = boundNode(Expr::FUNC, "COALESCE2", {A[i], r}, t);
+      if (t == LType::DECIMAL) r->scale = maxScale(A);
+    }
     finish(r);
     if (e->ty == LType::VARCHAR && e->kind != Expr::LIT) unifyStrings(e, c);
     return;
@@ -680,7 +679,9 @@ void bindFunc(ExprP& e, BindCtx& c) {
     bool keepInt = (id == FN_ABS || id == FN_SIGN) && A[0]->ty != LType::DOUBLE;
     LType ty = keepInt || id == FN_CEIL || id == FN_FLOOR || (id == FN_ROUND && A[0]->ty != LType::DOUBLE) ? LType::BIGINT : LType::DOUBLE;
     if (id == FN_ROUND && A[0]->ty == LType::DOUBLE) ty = LType::DOUBLE;
-    finish(mkCall(id, {A[0]}, ty));
+    ExprP r = mkCall(id, {A[0]}, ty);
+    if (id == FN_ABS && A[0]->ty == LType::DECIMAL) r->ty = LType::DECIMAL, r->scale = A[0]->scale;
+    finish(r);
     return;
   }
   static const std::map<std::string, uint16_t> math2 = {{"ROUND", FN_ROUND2}, {"TRUNCATE", FN_TRUNCATE2}, {"POW", FN_POW},
@@ -691,12 +692,15 @@ void bindFunc(ExprP& e, BindCtx& c) {
     finish(mkCall(math2.at(f), {A[0], A[1]}, LType::DOUBLE));
     return;
   }
-  if (f == "MOD") { argc(2, 2); ExprP r = boundNode(Expr::BIN, "%", {A[0], A[1]}, numTy(A)); finish(r); return; }
+  if (f == "MOD") { argc(2, 2); ExprP r = boundNode(Expr::BIN, "%", {A[0], A[1]}, numTy(A)); r->scale = maxScale(A); finish(r); return; }
   if (f == "GREATEST" || f == "LEAST") {
     argc(2, 64);
     LType t = numTy(A);
     ExprP r = A[0];
-    for (size_t i = 1; i < n; ++i) r = mkCall(f == "LEAST" ? FN_LEAST : FN_GREATEST, {r, A[i]}, t);
+    for (size_t i = 1; i < n; ++i) {
+      r = mkCall(f == "LEAST" ? FN_LEAST : FN_GREATEST, {r, A[i]}, t);
+      if (t == LType::DECIMAL) r->scale = maxScale(A);
+    }
     finish(r);
     return;
   }
@@ -1041,6 +1045,7 @@ void bind(ExprP& e, BindCtx& c) {
     case Expr::UNARY:
       bindChildren(e, c);
       e->ty = e->op == "NOT" ? LType::INT : e->args[0]->ty;
+      if (e->ty == LType::DECIMAL) e->scale = e->args[0]->scale;
       break;
     case Expr::BETWEEN: {
       ExprP r = mkBin("AND", mkBin(">=", e->args[0], e->args[1]), mkBin("<=", e->args[0], e->args[2]));
@@ -1124,13 +1129,19 @@ void bind(ExprP& e, BindCtx& c) {
     case Expr::CASE: {
       bindChildren(e, c);
       e->ty = LType::BIGINT;
-      for (size_t i = 1; i < e->args.size(); i += (i + 1 < e->args.size() ? 2 : 1)) {
-        if (isNullLit(e->args[i])) continue;
-        LType t = e->args[i]->ty;
+      int sc = 0;
+      auto result = [&](const ExprP& x) {
+        if (isNullLit(x)) return;
+        LType t = x->ty;
         if (t == LType::DOUBLE) e->ty = LType::DOUBLE;
-        else if (t == LType::VARCHAR || t == LType::DATE || t == LType::DATETIME) e->ty = t;
-      }
-      if (e->args.size() % 2 && !isNullLit(e->args.back()) && e->args.back()->ty == LType::DOUBLE) e->ty = LType::DOUBLE;
+        else if (t == LType::DECIMAL) {
+          sc = std::max(sc, (int)x->scale);
+          if (e->ty == LType::BIGINT || e->ty == LType::INT) e->ty = LType::DECIMAL;
+        } else if (t == LType::VARCHAR || t == LType::DATE || t == LType::DATETIME) e->ty = t;
+      };
+      for (size_t i = 1; i < e->args.size(); i += (i + 1 < e->args.size() ? 2 : 1)) result(e->args[i]);
+      if (e->args.size() % 2) result(e->args.back());
+      if (e->ty == LType::DECIMAL) e->scale = sc;
       if (e->ty == LType::VARCHAR) {
         e->bound = true;
         unifyStrings(e, c);
@@ -2109,11 +2120,10 @@ struct FtsIndex {
 };
 static FtsIndex& ftsIndexFor(const Dict& d) {
   static std::mutex mu;
-  static std::map<const Dict*, std::unique_ptr<FtsIndex>> all;
   std::lock_guard<std::mutex> g(mu);
-  auto& p = all[&d];
-  if (!p) p = std::make_unique<FtsIndex>();
-  return *p;
+  auto p = d.getDerived<FtsIndex>("fts");
+  if (!p) d.setDerived("fts", p = std::make_shared<FtsIndex>());
+  return *p;  // lives as long as the dictionary
 }
 // Brings ix up to date with d (caller holds ix.mu; the table is locked, so d does not change).
 static void ftsIndexUpdate(FtsIndex& ix, const Dict& d) {
@@ -2211,7 +2221,7 @@ void ftsStats(const ExprP& e, const Dict& d) {
   // Cached per dictionary size and query (dictionaries only grow).
   static std::mutex cmu;
   static std::unordered_map<std::string, std::shared_ptr<std::vector<double>>> cache;
-  const std::string key = std::to_string((uintptr_t)&d) + "|" + std::to_string(N) + "|" + e->castType + "|" + e->args.back()->lit.toString();
+  const std::string key = std::to_string(d.uid) + "|" + std::to_string(N) + "|" + e->castType + "|" + e->args.back()->lit.toString();
   {
     std::lock_guard<std::mutex> g(cmu);
     auto it = cache.find(key);
@@ -3131,15 +3141,11 @@ const IndexMeta* findIndexEq(const std::vector<ExprP>& conj, const Table& t, int
 // grow, so (dictionary, size, collation) identifies a version: ranks are cached per version and
 // built with a parallel sort.
 std::shared_ptr<DevVec<int32_t>> dictRankDev(const Dict& d) {
-  static std::mutex mu;
-  static std::map<std::pair<const Dict*, bool>, std::pair<size_t, std::shared_ptr<DevVec<int32_t>>>> cache;
+  using Slot = std::pair<size_t, std::shared_ptr<DevVec<int32_t>>>;
   const bool ci = ciColl();
+  const std::string ckey = ci ? "rankdev/ci" : "rankdev";
   const size_t n = d.strs.size();
-  {
-    std::lock_guard<std::mutex> g(mu);
-    auto it = cache.find({&d, ci});
-    if (it != cache.end() && it->second.first == n) return it->second.second;
-  }
+  if (auto c = d.getDerived<Slot>(ckey); c && c->first == n) return c->second;
   auto sorted = sortedDict(d);  // cached (and pre-built in the background after loads)
   const std::vector<int32_t>& order = *sorted.first;
   std::vector<int32_t> rank(n + 1);
@@ -3147,8 +3153,7 @@ std::shared_ptr<DevVec<int32_t>> dictRankDev(const Dict& d) {
     rank[order[i]] = i > 0 && ci && collCmp(d.strs[order[i]], d.strs[order[i - 1]]) == 0 ? rank[order[i - 1]] : (int32_t)i;
   auto r = std::make_shared<DevVec<int32_t>>((int64_t)rank.size());
   h2d(r->p, rank.data(), rank.size() * 4);
-  std::lock_guard<std::mutex> g(mu);
-  cache[{&d, ci}] = {n, r};
+  d.setDerived(ckey, std::make_shared<Slot>(n, r));
   return r;
 }
 
@@ -7249,7 +7254,14 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     plan.hasWhere = (bool)filter;
     if (filter) plan.where = comp.compile(filter);
     for (int k = 0; k < plan.nkeys; ++k) {
-      plan.keys[k] = comp.compile(groupBy[k]);
+      // DECIMAL arithmetic runs in doubles: round the key to its scale so equal decimals group together
+      // (-30.76 can come out as -30.759999.. for one row and -30.760000..1 for another).
+      ExprP kx = groupBy[k];
+      if (kx->ty == LType::DECIMAL && kx->kind != Expr::COL && kx->scale >= 0) {
+        kx = mkCall(FN_ROUND2, {kx, boundLit(Value::I(kx->scale))}, LType::DECIMAL);
+        kx->scale = groupBy[k]->scale;
+      }
+      plan.keys[k] = comp.compile(kx);
       plan.keyInt[k] = groupBy[k]->ty != LType::DOUBLE && groupBy[k]->ty != LType::DECIMAL && progIsInt(comp.env, plan.keys[k]);
     }
     for (int a = 1; a < plan.naggs; ++a) plan.aggs[a] = comp.compile(aggArgs[a]);
