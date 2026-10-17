@@ -26,6 +26,7 @@
 #include <thread>
 
 #include "engine.h"
+#include "monitor.h"
 #include "storage.h"
 #include "jit.h"
 #include "gpu.h"
@@ -709,6 +710,10 @@ void serveHttp(int fd, Engine* engine) {
     size_t ps = head.find(' ') + 1;
     std::string path = head.substr(ps, head.find(' ', ps) - ps);
     if (path == "/ping") { if (!reply(200, "pong\n", "text/plain")) break; continue; }
+    if (path == "/metrics") {  // Prometheus (no auth: the HTTP port binds to --bind, loopback by default)
+      if (!reply(200, engine->metrics(), "text/plain; version=0.0.4")) break;
+      continue;
+    }
     // Basic auth (SingleStore Data API style). Without credentials: root, if root has no password.
     std::string authUser = "root", authPw;
     {
@@ -985,7 +990,8 @@ void serve(int fd, Engine* engine) {
   h += (char)0x0a;
   h += "8.0.32-gpudb";
   h += '\0';
-  putInt(h, g_connId++, 4);
+  const uint32_t connId = g_connId++;
+  putInt(h, connId, 4);
   std::string scramble(20, '\0');  // per-connection random challenge (mysql_native_password)
   {  // unpredictable challenge (printable, no NULs)
     unsigned char rb[20];
@@ -1139,9 +1145,18 @@ void serve(int fd, Engine* engine) {
   }
   c.ok();
   c.flush();
+  auto session = monitor::open(connId, engine->sessionUserName(), peer.empty() ? "localhost" : peer, fd);
+  tSession = session.get();
+  struct SessionEnd {
+    uint32_t id;
+    ~SessionEnd() {
+      monitor::close(id);
+      tSession = nullptr;
+    }
+  } sessionEnd{connId};
 
   for (;;) {
-    if (!c.readPacket(pkt) || pkt.empty()) break;
+    if (session->killConn || !c.readPacket(pkt) || pkt.empty()) break;
     uint8_t cmd = (uint8_t)pkt[0];
     c.seq = 1;
     if (cmd == 0x01) break;  // COM_QUIT
@@ -1310,7 +1325,25 @@ void serve(int fd, Engine* engine) {
           explicit LocalFlag(bool on) { tLocalInfile = on; }
           ~LocalFlag() { tLocalInfile = false; }
         } localFlag{!tmpPath.empty()};
+        const std::string stmtDb = engine->currentDbName();
+        monitor::begin(session.get(), sqls[qi], stmtDb);
+        const auto ts = std::chrono::steady_clock::now();
+        struct StmtEnd {  // accounting, also when the statement throws
+          Session* s;
+          const std::string& sql;
+          const std::string& db;
+          std::chrono::steady_clock::time_point t0;
+          int64_t rows = 0;
+          bool ok = false;
+          std::string plan;
+          ~StmtEnd() {
+            monitor::end(s, sql, db, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), rows, !ok, plan);
+          }
+        } stmtEnd{session.get(), sqls[qi], stmtDb, ts};
         ResultSet r = engine->execute(sqls[qi]);
+        stmtEnd.ok = true;
+        stmtEnd.plan = r.info;
+        stmtEnd.rows = r.isResult ? (int64_t)(r.rows.size() + r.vals.size() + (r.numCol ? r.numCol->size() : 0)) : r.affected;
         if (r.isResult) {
           const uint16_t outer = c.more;  // several result sets (CALL): all but the last say more follow
           if (!r.extra.empty()) c.more = 0x0008;
@@ -1354,6 +1387,7 @@ int main(int argc, char** argv) {
   std::string dataDir = "./gpudb-data";
   bool sync = false;  // async durability by default (SingleStore's default); --sync-durability: every commit waits for the disk
   int partitions = 8;
+  double slowMsArg = 1000;
   int httpPort = 0;
   std::string replicaOf;
   std::vector<std::string> leaves;
@@ -1370,6 +1404,8 @@ int main(int argc, char** argv) {
     else if (a == "--no-compress") g_compress = 0;
     else if (a == "--sync" || a == "--sync-durability") sync = true;
     else if (a == "--wal-archive" && i + 1 < argc) gWalArchive = argv[++i];
+    else if (a == "--slow-query-ms" && i + 1 < argc) slowMsArg = atof(argv[++i]);
+    else if (a == "--slow-log" && i + 1 < argc) monitor::slowPath = argv[++i];
     else if (a == "--sync-replicas" && i + 1 < argc) gSyncReplicas = atoi(argv[++i]);
     else if (a == "--sync-replica-timeout-ms" && i + 1 < argc) gSyncReplicaTimeoutMs = atoi(argv[++i]);
     else if (a == "--failover-timeout" && i + 1 < argc) gFailoverTimeoutS = atof(argv[++i]);
@@ -1404,7 +1440,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-connections" && i + 1 < argc) g_maxConns = atoi(argv[++i]);
     else if (a == "--insecure-no-root-password") insecure = true;
     else {
-      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [-v]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [-v]\n", argv[0]);
       return 2;
     }
   }
@@ -1425,6 +1461,9 @@ int main(int argc, char** argv) {
   }
   jitSetCacheDir(planCacheDir);
   if (!planCacheDir.empty()) fprintf(stderr, "[gpu-db] persistent plan cache: %s\n", planCacheDir.c_str());
+  // Slow query log: <data dir>/slow.log, statements over 1 s (--slow-query-ms, SET GLOBAL long_query_time).
+  if (monitor::slowPath.empty() && !dataDir.empty()) monitor::slowPath = dataDir + "/slow.log";
+  monitor::slowMs = monitor::slowPath.empty() ? -1 : slowMsArg;
   Engine engine(dataDir, sync, partitions);
   fprintf(stderr, "[gpu-db] %d partitions per sharded table\n", partitions);
   engine.recover();

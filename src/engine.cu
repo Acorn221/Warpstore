@@ -24,6 +24,7 @@
 #include "jit.h"
 #include "cagra.h"
 #include "embed.h"
+#include "monitor.h"
 #include "sources.h"
 
 namespace gdb {
@@ -3214,7 +3215,7 @@ thread_local bool tDense = true;  // SET gpudb_dense_groupby
 struct ProfStage {
   std::string stage;
   Clock::time_point t0 = Clock::now();
-  explicit ProfStage(std::string s) : stage(std::move(s)) {}
+  explicit ProfStage(std::string s) : stage(std::move(s)) { checkKilled(); }  // (KILL QUERY lands between stages)
   void done(int64_t rows = -1, std::string detail = "") {
     if (!tProfOn) return;
     gpuSync();
@@ -3808,6 +3809,99 @@ struct Pipeline {
 };
 
 
+// WAL fsync counters (/metrics).
+static std::atomic<uint64_t> gWalSyncs{0}, gWalSyncUs{0}, gWalSyncMaxUs{0};
+static const int64_t gStartUs = nowUs();
+static void timedSync(int fd) {
+  const auto t0 = Clock::now();
+  fdatasync(fd);
+  const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
+  ++gWalSyncs;
+  gWalSyncUs += us;
+  for (uint64_t m = gWalSyncMaxUs; us > m && !gWalSyncMaxUs.compare_exchange_weak(m, us);) {}
+}
+
+// Prometheus metrics (GET /metrics on the HTTP port): the session / statement counters from the
+// monitor plus storage, WAL, VRAM, replication and plan cache gauges.
+std::string Engine::sessionUserName() const { return tUserName(); }
+
+std::string Engine::metrics() {
+  std::string o = monitor::prometheus();
+  char b[512];
+  auto metric = [&](const char* name, const char* type, const char* help, double v, const std::string& labels = "") {
+    if (o.find(std::string("# TYPE ") + name + " ") == std::string::npos) {
+      snprintf(b, sizeof b, "# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
+      o += b;
+    }
+    snprintf(b, sizeof b, "%s%s %.17g\n", name, labels.empty() ? "" : ("{" + labels + "}").c_str(), v);
+    o += b;
+  };
+  metric("gpudb_up", "gauge", "1 while the server runs.", 1);
+  metric("gpudb_uptime_seconds", "gauge", "Seconds since start.", (nowUs() - gStartUs) / 1e6);
+  std::vector<std::shared_ptr<Table>> tabs;
+  size_t dbs;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (t->db != "__tmp") tabs.push_back(t);
+    dbs = cat_.dbs.size();
+  }
+  int64_t rows = 0, segs = 0, bufRows = 0;
+  for (auto& t : tabs) {
+    std::shared_lock<FairSharedMutex> lk(t->mu, std::try_to_lock);  // (skip tables a writer holds)
+    if (!lk.owns_lock()) continue;
+    rows += t->liveRows();
+    segs += (int64_t)t->segs.size();
+    for (auto& wb : t->bufs) bufRows += (int64_t)wb->n;
+  }
+  metric("gpudb_databases", "gauge", "Databases.", (double)dbs);
+  metric("gpudb_tables", "gauge", "Tables.", (double)tabs.size());
+  metric("gpudb_rows", "gauge", "Live rows in all tables.", (double)rows);
+  metric("gpudb_segments", "gauge", "Columnar segments.", (double)segs);
+  metric("gpudb_write_buffer_rows", "gauge", "Rows not yet flushed to segments.", (double)bufRows);
+  const int64_t lim = gpuVramLimit(), freeB = gpuVramFree();
+  metric("gpudb_vram_free_bytes", "gauge", "Free device memory.", (double)freeB);
+  if (lim != INT64_MAX) metric("gpudb_vram_limit_bytes", "gauge", "--vram-limit.", (double)lim);
+  {
+    std::lock_guard<std::mutex> g(walMu_);
+    metric("gpudb_wal_generation", "gauge", "Current WAL generation (goes up at each SNAPSHOT).", (double)walGen_);
+    metric("gpudb_wal_bytes", "gauge", "Bytes in the current WAL.", (double)walOff_);
+    metric("gpudb_wal_records_total", "counter", "WAL records written since start.", (double)walWritten_);
+    metric("gpudb_replication_lsn", "gauge", "Replication log position (primary).", (double)lsn_);
+  }
+  metric("gpudb_wal_syncs_total", "counter", "WAL fdatasync calls.", (double)gWalSyncs.load());
+  metric("gpudb_wal_sync_seconds_total", "counter", "Time spent in WAL fdatasync.", gWalSyncUs.load() / 1e6);
+  metric("gpudb_wal_sync_max_seconds", "gauge", "Slowest WAL fdatasync since start.", gWalSyncMaxUs.load() / 1e6);
+  metric("gpudb_replica", "gauge", "1 on a replica, 0 on a primary.", isReplica_ ? 1 : 0);
+  if (isReplica_) {
+    metric("gpudb_replica_applied_lsn", "gauge", "Last applied primary log position.", (double)appliedLsn_.load());
+    const int64_t cu = replCaughtUpUs_;
+    if (cu) metric("gpudb_replica_lag_seconds", "gauge", "Time since the replica was last caught up.", std::max<int64_t>(0, nowUs() - cu - 1000000) / 1e6);
+  } else {
+    std::lock_guard<std::mutex> g(replMu_);
+    int live = 0;
+    for (auto& [id, a] : replAcks_) live += nowUs() - a.second < 10000000;
+    metric("gpudb_replicas_connected", "gauge", "Replicas seen in the last 10 s.", live);
+  }
+  {
+    auto pc = jitPlanCache();
+    double compileMs = 0;
+    for (auto& p : pc) compileMs += p.compileMs;
+    metric("gpudb_plan_cache_plans", "gauge", "Compiled query plans cached.", (double)pc.size());
+    metric("gpudb_plan_compile_seconds_total", "counter", "Time spent compiling the cached plans.", compileMs / 1000);
+  }
+  {
+    std::lock_guard<std::mutex> g(pipesMu_);
+    metric("gpudb_pipelines", "gauge", "Pipelines defined.", (double)pipes_.size());
+  }
+  if (FILE* f = fopen("/proc/self/statm", "r")) {
+    long pages = 0, res = 0;
+    if (fscanf(f, "%ld %ld", &pages, &res) == 2) metric("gpudb_resident_memory_bytes", "gauge", "Resident host memory.", (double)res * sysconf(_SC_PAGESIZE));
+    fclose(f);
+  }
+  return o;
+}
+
 Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
     : dir_(dataDir), sync_(syncWal), nparts_(std::max(partitions, 1)) {
   vramTh_ = std::thread([this] {
@@ -3988,7 +4082,10 @@ Engine::~Engine() {
   vramStop_ = true;
   if (vramTh_.joinable()) vramTh_.join();
   if (flushTh_.joinable()) flushTh_.join();
-  if (wal_) { fflush(wal_); fdatasync(fileno(wal_)); }
+  if (wal_) {
+    fflush(wal_);
+    timedSync(fileno(wal_));
+  }
   std::vector<std::shared_ptr<Pipeline>> ps;
   {
     std::lock_guard<std::mutex> g(pipesMu_);
@@ -4210,7 +4307,7 @@ void Engine::walDurable(bool wait) {
       target = walWritten_;
       fd = wal_ ? fileno(wal_) : -1;
     }
-    if (fd >= 0) fdatasync(fd);
+    if (fd >= 0) timedSync(fd);
     lk.lock();
     walSynced_ = std::max(walSynced_, target);
     syncing_ = false;
@@ -4637,6 +4734,38 @@ ResultSet Engine::execute(const std::string& sql) {
     static const std::regex replStatusRe(R"(^\s*SHOW\s+(REPLICATION|REPLICA|SLAVE)\s+STATUS\s*;?\s*$)", std::regex::icase);
     static const std::regex promoteRe(R"(^\s*PROMOTE(\s+\w+)?\s*;?\s*$)", std::regex::icase);
     if (std::regex_match(sql, replStatusRe)) return replicationStatus();
+    static const std::regex killRe(R"(^\s*KILL\s+(QUERY\s+|CONNECTION\s+)?(\d+)\s*;?\s*$)", std::regex::icase);
+    std::smatch km;
+    if (firstWord(sql) == "KILL" && std::regex_match(sql, km, killRe)) {
+      const uint32_t id = (uint32_t)std::stoul(km[2].str());
+      bool mine = false;
+      for (auto& se : monitor::sessions()) mine = mine || (se->id == id && se->user == tUserName());
+      if (!mine && !isSuper(tUserName())) throw SqlError("You are not owner of thread " + std::to_string(id), 1095);
+      if (!monitor::kill(id, upper(km[1].str()).rfind("QUERY", 0) == 0)) throw SqlError("Unknown thread id: " + std::to_string(id), 1094);
+      return okResult(0);
+    }
+    static const std::regex sleepRe(R"(^\s*SELECT\s+SLEEP\s*\(\s*([0-9]*\.?[0-9]+)\s*\)\s*(?:AS\s+`?(\w+)`?)?\s*;?\s*$)", std::regex::icase);
+    if (firstWord(sql) == "SELECT" && std::regex_match(sql, km, sleepRe)) {  // SELECT SLEEP(n): 1 if KILL QUERY cut it short (MySQL)
+      const auto until = Clock::now() + std::chrono::microseconds((int64_t)(std::atof(km[1].str().c_str()) * 1e6));
+      int interrupted = 0;
+      while (Clock::now() < until) {
+        if (tSession && tSession->killQuery) {
+          tSession->killQuery = false;
+          interrupted = 1;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(std::min<int64_t>(10, std::chrono::duration_cast<std::chrono::milliseconds>(until - Clock::now()).count() + 1)));
+      }
+      ResultSet sr = table({km[2].matched ? km[2].str() : "SLEEP(" + km[1].str() + ")"}, {LType::BIGINT});
+      sr.rows.push_back({std::to_string(interrupted)});
+      return sr;
+    }
+    static const std::regex flushStatsRe(R"(^\s*FLUSH\s+QUERY_STATS\s*;?\s*$)", std::regex::icase);
+    if (firstWord(sql) == "FLUSH" && std::regex_match(sql, flushStatsRe)) {
+      if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
+      monitor::resetQueryStats();
+      return okResult(0);
+    }
     if (std::regex_match(sql, promoteRe)) {
       if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
       promote();
@@ -4766,6 +4895,16 @@ ResultSet Engine::execute(const std::string& sql) {
       else if (s.setName == "GPUDB_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
       else if (s.setName == "GPUDB_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
       else if (s.setName == "GPUDB_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
+      else if (s.setName == "LONG_QUERY_TIME" || s.setName == "SLOW_QUERY_LOG") {  // server-wide (SET GLOBAL)
+        if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
+        static double lastMs = 1000;
+        if (s.setName == "LONG_QUERY_TIME") {
+          lastMs = std::atof(s.setValue.c_str()) * 1000;
+          if (monitor::slowMs.load() >= 0) monitor::slowMs = lastMs;
+        } else {
+          monitor::slowMs = on() ? lastMs : -1;
+        }
+      }
       else if (s.setName == "COLLATION_CONNECTION" || s.setName == "COLLATION_SERVER" || s.setName == "GPUDB_COLLATION")
         tCi = s.setValue.find("_BIN") != std::string::npos || s.setValue == "BINARY" ? 0 : 1;
       else if (s.setName == "NAMES" && s.setValue.find("BIN") != std::string::npos) tCi = 0;
@@ -5399,6 +5538,23 @@ std::string Engine::showCreate(const Table& t) {
 }
 
 // information_schema tables, generated from the catalog.
+// SHOW PROCESSLIST rows: every session for SUPER (PROCESS) users, else the user's own.
+std::vector<std::vector<std::string>> Engine::processRows(bool truncateInfo) {
+  std::vector<std::vector<std::string>> out;
+  const bool all = isSuper(tUserName());
+  const int64_t now = nowUs();
+  for (auto& se : monitor::sessions()) {
+    if (!all && se->user != tUserName()) continue;
+    std::lock_guard<std::mutex> g(se->mu);
+    std::string info = se->info;
+    if (truncateInfo && info.size() > 100) info.resize(100);
+    out.push_back({std::to_string(se->id), se->user, se->host, se->db.empty() ? kNullCell : se->db, se->command,
+                   std::to_string((now - se->sinceUs) / 1000000), se->command == "Sleep" ? "" : "executing", info.empty() ? kNullCell : info});
+  }
+  std::sort(out.begin(), out.end(), [](auto& a, auto& b) { return std::atoll(a[0].c_str()) < std::atoll(b[0].c_str()); });
+  return out;
+}
+
 ResultSet Engine::infoSchema(const std::string& table) {
   ResultSet r;
   r.isResult = true;
@@ -5586,6 +5742,25 @@ ResultSet Engine::infoSchema(const std::string& table) {
         {"st_geometry_columns", {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SRS_NAME", "SRS_ID", "GEOMETRY_TYPE_NAME"}},
         {"resource_groups", {"RESOURCE_GROUP_NAME", "RESOURCE_GROUP_TYPE", "RESOURCE_GROUP_ENABLED", "VCPU_IDS", "THREAD_PRIORITY"}},
     };
+    if (tn == "query_stats") {  // per statement shape (literals replaced by ?), heaviest first
+      cols({"DIGEST_TEXT", "COUNT_STAR", "ERRORS", "TOTAL_MS", "AVG_MS", "MAX_MS", "ROWS", "LAST_SEEN"},
+           {V, LType::BIGINT, LType::BIGINT, LType::DOUBLE, LType::DOUBLE, LType::DOUBLE, LType::BIGINT, LType::DATETIME});
+      if (!isSuper(tUserName())) return r;
+      for (auto& q : monitor::queryStats())
+        r.vals.push_back({S(q.digest), I((int64_t)q.count), I((int64_t)q.errors), Value::D(q.totalMs), Value::D(q.count ? q.totalMs / q.count : 0),
+                          Value::D(q.maxMs), I(q.rows), Value::Ts(q.lastUs)});
+      return r;
+    }
+    if (tn == "processlist") {
+      cols({"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"}, {LType::BIGINT, V, V, V, V, LType::BIGINT, V, V});
+      for (auto& row : processRows(false)) {
+        std::vector<Value> out;
+        for (size_t i = 0; i < row.size(); ++i)
+          out.push_back(row[i] == kNullCell ? Value::Null() : i == 0 || i == 5 ? I(std::atoll(row[i].c_str())) : S(row[i]));
+        r.vals.push_back(out);
+      }
+      return r;
+    }
     auto it = layouts.find(tn);
     if (it == layouts.end()) throw SqlError("Unknown table '" + table + "' in information_schema", 1109);
     cols(it->second, std::vector<LType>(it->second.size(), V));
@@ -5790,8 +5965,9 @@ ResultSet Engine::doShowMisc(Stmt& s) {
     return r;
   }
   if (k == "PROCESSLIST") {
-    r = table({"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}, std::vector<LType>(8, LType::VARCHAR));
-    r.rows.push_back({"1", "root", "localhost", currentDb(), "Query", "0", "executing", "SHOW PROCESSLIST"});
+    r = table({"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}, {LType::BIGINT, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR,
+                                                                              LType::VARCHAR, LType::BIGINT, LType::VARCHAR, LType::VARCHAR});
+    for (auto& row : processRows(s.setValue != "FULL")) r.rows.push_back(row);
     return r;
   }
   if (k == "GRANTS") {
@@ -5980,6 +6156,7 @@ ResultSet Engine::doLoad(Stmt& s) {
   // The exclusive lock is released briefly every 256K rows so queries are not stalled by a long load
   // (they see the rows loaded so far, like other uncommitted writes).
   int64_t n = t->loadFile(path, s.delim, s.skipLines, srcOf, [&] {
+    checkKilled();
     lk.unlock();
     std::this_thread::yield();
     lk.lock();

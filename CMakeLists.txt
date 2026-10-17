@@ -32,6 +32,7 @@ add_executable(gpudb
   src/jit.cu
   src/proc.cpp
   src/sources.cpp
+  src/monitor.cpp
   src/parquet.cpp
   src/avro.cpp
   src/orc.cpp

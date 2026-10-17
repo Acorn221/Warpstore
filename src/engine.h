@@ -82,6 +82,8 @@ class Engine {
   // caching_sha2_password fast auth: token = SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + scramble); -1: no SHA256 hash stored (switch to native)
   int checkAuthSha2(const std::string& user, const std::string& scramble, const std::string& token);
   void setUser(const std::string& user);
+  std::string sessionUserName() const;  // this thread's session user
+  std::string currentDbName() const { return currentDb(); }
   void connectionClosed();  // rolls back an open transaction, drops TEMPORARY tables
   void recover();
   // Stored procedures / functions (proc.cpp).
@@ -106,6 +108,7 @@ class Engine {
   void startReplica(const std::string& url);
   bool isReplica() const;
   ResultSet replicationStatus();
+  std::string metrics();  // Prometheus text format (GET /metrics)
   void promote();
   // Passwords for HTTP Basic auth; SUPER = ALL ON *.*.
   bool checkPassword(const std::string& user, const std::string& pw);
@@ -234,6 +237,7 @@ class Engine {
   ResultSet doRename(Stmt& s);
   ResultSet doShowMisc(Stmt& s);
   ResultSet infoSchema(const std::string& table);
+  std::vector<std::vector<std::string>> processRows(bool truncateInfo);
   std::string showCreate(const Table& t);
   std::shared_ptr<Table> rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from);
   ResultSet doDescribe(Stmt& s);

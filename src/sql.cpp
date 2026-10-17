@@ -1,6 +1,8 @@
 #include <charconv>
 #include "sql.h"
 
+#include "monitor.h"
+
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -670,7 +672,7 @@ struct Parser {
         if (e->op == "VERSION") return mkLit(Value::S("8.0.32-gpudb"));
         if (e->op == "USER" || e->op == "SESSION_USER" || e->op == "SYSTEM_USER") return mkLit(Value::S(sessionUser() + "@localhost"));
         if (e->op == "CURRENT_USER") return mkLit(Value::S(sessionUser()));
-        if (e->op == "CONNECTION_ID") return mkLit(Value::I(1));
+        if (e->op == "CONNECTION_ID") return mkLit(Value::I(tSession ? tSession->id : 1));
         if (udfHook && !e->window)
           if (ExprP u = udfHook(e)) return u;
         return e;
@@ -1766,6 +1768,7 @@ struct Parser {
       } else if (cur().k == Tok::ID) {
         s.type = Stmt::SHOW_MISC;  // WARNINGS, ERRORS, ENGINES, COLLATION, CHARACTER SET, PROCESSLIST, GRANTS, ..
         s.setName = upper(ident());
+        if (full) s.setValue = "FULL";
         if (s.setName == "CHARACTER") { acceptKw("SET"); s.setName = "CHARSET"; }
         likeOrFrom();
       } else {
