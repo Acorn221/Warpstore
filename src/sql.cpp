@@ -1125,8 +1125,9 @@ struct Parser {
           std::string path = s.insertCols.back();
           if (acceptSym("<-") || (isSym("<") && t[p + 1].v == "-" && (p += 2))) {  // col <- key::sub
             path.clear();
-            for (;;) {
-              path += ident();
+            for (;;) {  // (JSON keys: any word, keywords too, or a quoted name)
+              if (cur().k == Tok::ID || cur().k == Tok::QID || cur().k == Tok::STR) path += t[p++].v;
+              else fail("JSON key");
               if (acceptSym("::")) { path += "::"; continue; }
               if (isSym(":") && t[p + 1].v == ":") { p += 2; path += "::"; continue; }
               break;

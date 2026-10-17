@@ -10620,8 +10620,8 @@ void Engine::runRemotePipeline(const std::shared_ptr<Pipeline>& p) {
       if (sscanf(b.c_str() + kpre.size(), "%d-%lld-%lld", &part, &from, &nx) == 3) next[part] = std::max<int64_t>(next[part], nx);
     }
   }
-  auto stagedPath = [&](const std::string& name) {
-    return (dir_.empty() ? std::string("/tmp/gpudb-") : dir_ + "/pipeline-loads/") + name;
+  auto stagedPath = [&](const std::string& name) {  // the file ingest() stages (and the WAL names)
+    return (dir_.empty() ? std::string("/tmp/gpudb-") : dir_ + "/pipeline-loads/") + name + ".tsv";
   };
   auto fail = [&](const std::string& what) {
     std::lock_guard<std::mutex> lk(p->mu);
@@ -10646,7 +10646,8 @@ void Engine::runRemotePipeline(const std::shared_ptr<Pipeline>& p) {
           const std::string name = lower(sp.src) + "-" + sanitizeName(lower(p->name)) + "-" + sanitizeName(k);
           {
             std::lock_guard<std::mutex> lk(p->mu);
-            if (p->done.count(stagedPath(name))) continue;
+            const std::string sp2 = stagedPath(name);
+            if (p->done.count(sp2) || p->done.count(sp2.substr(0, sp2.size() - 4))) continue;  // (older snapshots: no .tsv)
           }
           try {
             std::string data;
