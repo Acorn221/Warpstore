@@ -629,7 +629,11 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
   const Loc nl = bufLoc(part, buf.n);
   ++buf.n;
   ++buf.version;
-  if (txnKey() && db != "__tmp") txnPending[txnKey()].hidden.push_back(nl);  // invisible to others until COMMIT
+  if (txnKey() && db != "__tmp") {  // invisible to others until COMMIT
+    TxnPending& tp = txnPending[txnKey()];
+    tp.hidden.push_back(nl);
+    tp.hiddenIx.insert(TxnPending::key(nl));
+  }
   if (!indexes.empty()) indexAdd(nl);
   if (buf.n >= kSegRows) flushPart(part);
 }
@@ -719,9 +723,12 @@ void Table::appendRow(const std::vector<Value>& rowIn) {
 
 void Table::txnNoteDelete(Loc l) {
   auto& tp = txnPending[undoLog()];
-  auto h = std::find(tp.hidden.begin(), tp.hidden.end(), l);
-  if (h != tp.hidden.end()) tp.hidden.erase(h);  // a row this transaction inserted: just gone
-  else tp.ghosts.push_back(l);                   // a committed row: others still see it until COMMIT
+  if (tp.hiddenIx.erase(TxnPending::key(l))) {  // a row this transaction inserted: just gone
+    auto h = std::find(tp.hidden.begin(), tp.hidden.end(), l);
+    if (h != tp.hidden.end()) tp.hidden.erase(h);
+  } else {
+    tp.ghosts.push_back(l);  // a committed row: others still see it until COMMIT
+  }
 }
 
 void Table::deleteAt(Loc l) {

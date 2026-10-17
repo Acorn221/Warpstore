@@ -1065,7 +1065,7 @@ struct Parser {
     if (acceptKw("LOCAL")) s.setName = "LOCAL";
     if (acceptKw("INFILE")) s.setValue = "FS";
     else if (acceptKw("FS")) s.setValue = "FS";
-    else if (acceptKw("S3") || acceptKw("KAFKA") || acceptKw("GCS") || acceptKw("AZURE") || acceptKw("HDFS") || acceptKw("LINK"))
+    else if (acceptKw("S3") || acceptKw("KAFKA") || acceptKw("GCS") || acceptKw("AZURE") || acceptKw("HDFS") || acceptKw("LINK") || acceptKw("MYSQL"))
       s.setValue = upper(t[p - 1].v);
     else fail("INFILE / FS");
     if (cur().k != Tok::STR) fail("file path");
@@ -1084,6 +1084,12 @@ struct Parser {
       }
     }
     expectKw("INTO");
+    if (s.setValue == "MYSQL" && (acceptKw("DATABASE") || acceptKw("SCHEMA"))) {  // LOAD DATA MYSQL 'url' INTO DATABASE db
+      s.table = ident();
+      s.format = "DATABASE";
+      while (cur().k != Tok::END && !isSym(";")) ++p;
+      return s;
+    }
     expectKw("TABLE");
     s.table = tableName();
     for (;;) {

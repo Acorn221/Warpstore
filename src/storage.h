@@ -21,6 +21,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "common.h"
 #include "expr.h"
@@ -406,6 +407,8 @@ struct IndexMeta {
 // COMMIT) and committed rows it deleted (still shown to other sessions until COMMIT).
 struct TxnPending {
   std::vector<Loc> hidden, ghosts;
+  std::unordered_set<uint64_t> hiddenIx;  // hidden, for lookups (big transactions)
+  static uint64_t key(Loc l) { return (uint64_t)(uint32_t)l.seg << 32 | (uint32_t)l.row; }
   uint64_t commitSeq = 0;  // 0: open; else committed, kept for older snapshots (REPEATABLE READ)
 };
 

@@ -25,6 +25,7 @@
 #include "cagra.h"
 #include "embed.h"
 #include "monitor.h"
+#include "mysqlcdc.h"
 #include "sources.h"
 
 namespace gdb {
@@ -10360,6 +10361,26 @@ void Engine::startPipeline(const std::shared_ptr<Pipeline>& p) {
     p->state = "Running";
   }
   p->running = true;
+  if (p->glob.rfind("MYSQL\x1e", 0) == 0) {  // MySQL CDC: snapshot, then follow the binlog
+    p->th = std::thread([this, p] {
+      currentDb() = p->db;
+      const std::string url = p->glob.substr(6, p->glob.find('\x1e', 6) - 6);  // MYSQL \x1e url \x1e ..
+      try {
+        mysqlCdcRun(*this, url, p->table, p->name, p->running, true, [&](const CdcStatus& st) {
+          std::lock_guard<std::mutex> lk(p->mu);
+          p->state = st.state;
+          p->lastError = st.error;
+          p->rows = st.rows;
+          p->files = st.txns;
+        });
+      } catch (std::exception& e) {
+        std::lock_guard<std::mutex> lk(p->mu);
+        p->state = "Error";
+        p->lastError = e.what();
+      }
+    });
+    return;
+  }
   if (p->glob.find('\x1e') != std::string::npos) {
     p->th = std::thread([this, p] {
       currentDb() = p->db;
@@ -10407,13 +10428,14 @@ ResultSet Engine::doPipeline(Stmt& s) {
   const std::string key = lower(s.table);
   if (s.setName == "CREATE") {
     const Stmt& l = *s.inner;
-    if (l.setValue != "FS" && l.setValue != "S3" && l.setValue != "KAFKA" && l.setValue != "LINK")
-      throw SqlError("pipelines from " + l.setValue + " are not supported (use FS, S3 or KAFKA)", 1235);
-    cat_.get(l.table);  // the target table must exist
+    if (l.setValue != "FS" && l.setValue != "S3" && l.setValue != "KAFKA" && l.setValue != "LINK" && l.setValue != "MYSQL")
+      throw SqlError("pipelines from " + l.setValue + " are not supported (use FS, S3, KAFKA or MYSQL)", 1235);
+    if (l.setValue == "MYSQL" && l.format != "DATABASE") throw SqlError("LOAD DATA MYSQL loads INTO DATABASE <name>", 1064);
+    if (l.setValue != "MYSQL") cat_.get(l.table);  // the target table must exist
     auto p = std::make_shared<Pipeline>();
     p->name = s.table;
     p->db = currentDb();
-    p->table = l.table.find('.') == std::string::npos ? currentDb() + "." + l.table : l.table;
+    p->table = l.setValue == "MYSQL" ? lower(l.table) : l.table.find('.') == std::string::npos ? currentDb() + "." + l.table : l.table;
     p->glob = l.path;
     if (l.setValue != "FS" || l.format == "JSON") {  // remote source: packed spec (see unpackSource)
       std::string paths;
@@ -10544,9 +10566,15 @@ ResultSet Engine::loadRemote(Stmt& s) {
   auto t0 = Clock::now();
   const bool json = s.format == "JSON";
   const std::string table = s.table.find('.') == std::string::npos ? currentDb() + "." + s.table : s.table;
-  cat_.get(table);
+  if (s.setValue != "MYSQL") cat_.get(table);
   int64_t total = 0, objects = 0;
   const std::string tag = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+  if (s.setValue == "MYSQL") {  // one-off copy of a MySQL database (a pipeline keeps following it)
+    std::atomic<bool> run{true};
+    CdcStatus last;
+    mysqlCdcRun(*this, s.path, s.table, "load-" + std::to_string(nowUs()), run, false, [&](const CdcStatus& st) { last = st; });
+    return okResult(last.rows, "copied " + std::to_string(last.rows) + " rows from MySQL (binlog position " + last.position + ")");
+  }
   if (s.setValue == "S3") {
     const std::string bucket = s3Bucket(s.path);
     for (auto& o : s3List(s.path, s.config, s.credentials)) {
@@ -10717,6 +10745,9 @@ ResultSet Engine::showPipelines() {
     std::lock_guard<std::mutex> lk(p->mu);
     std::string src = p->glob.find('\x1e') == std::string::npos ? "FS " + p->glob
                       : p->glob.substr(0, p->glob.find('\x1e')) + " " + p->glob.substr(p->glob.find('\x1e') + 1, p->glob.find('\x1e', p->glob.find('\x1e') + 1) - p->glob.find('\x1e') - 1);
+    if (size_t sch = src.find("://"); sch != std::string::npos)  // never show a password in the source URL
+      if (size_t at = src.find('@', sch); at != std::string::npos)
+        if (size_t colon = src.find(':', sch + 3); colon != std::string::npos && colon < at) src.replace(colon + 1, at - colon - 1, "***");
     r.rows.push_back({p->name, p->state, p->table, src, std::to_string(p->files), std::to_string(p->rows),
                       p->lastError.empty() ? kNullCell : p->lastError});
   }

@@ -33,6 +33,7 @@ add_executable(gpudb
   src/proc.cpp
   src/sources.cpp
   src/monitor.cpp
+  src/mysqlcdc.cpp
   src/parquet.cpp
   src/avro.cpp
   src/orc.cpp

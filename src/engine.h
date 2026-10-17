@@ -84,6 +84,7 @@ class Engine {
   void setUser(const std::string& user);
   std::string sessionUserName() const;  // this thread's session user
   std::string currentDbName() const { return currentDb(); }
+  const std::string& dataDir() const { return dir_; }  // "" with --no-wal
   void connectionClosed();  // rolls back an open transaction, drops TEMPORARY tables
   void recover();
   // Stored procedures / functions (proc.cpp).
