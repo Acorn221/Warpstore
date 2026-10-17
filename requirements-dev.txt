@@ -1,0 +1,8 @@
+# Tests (tests/run.py) and benchmarks (bench/). python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+PyMySQL>=1.1
+duckdb>=1.1
+SQLAlchemy>=2.0
+mysql-connector-python>=8.0
+pyarrow>=15
+numpy>=1.26
+fastavro>=1.9

@@ -431,7 +431,7 @@ std::string bindParams(Prepared& ps, const std::string& pkt) {
   return out;
 }
 
-// ---------------------------------------------------------------- HTTP Data API (SingleStore-style)
+// ---------------------------------------------------------------- HTTP Data API (SingleStore Data API compatible endpoints)
 // POST /api/v2/query/rows   {"sql": "...", "args": [..], "database": "db"} -> {"results":[{"rows":[{col: val}]}]}
 // POST /api/v2/query/tuples                                              -> {"results":[{"columns":[..],"rows":[[..]]}]}
 // POST /api/v2/exec                                                      -> {"lastInsertId":N,"rowsAffected":N}
@@ -985,7 +985,7 @@ void serve(int fd, Engine* engine) {
   Conn c{fd};
   std::map<uint32_t, Prepared> stmts;
   uint32_t nextStmt = 1;
-  // ---- Handshake v10 (mysql_native_password advertised; this PoC accepts any credentials).
+  // ---- Handshake v10 (mysql_native_password advertised; caching_sha2_password via auth switch).
   std::string h;
   h += (char)0x0a;
   h += "8.0.32-gpudb";
@@ -1440,7 +1440,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-connections" && i + 1 < argc) g_maxConns = atoi(argv[++i]);
     else if (a == "--insecure-no-root-password") insecure = true;
     else {
-      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [-v]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [--insecure-no-root-password] [--sync-replica-timeout-ms N] [-v]\n", argv[0]);
       return 2;
     }
   }

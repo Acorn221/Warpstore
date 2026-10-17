@@ -1,8 +1,55 @@
 # gpu-db
 
-A minimal proof-of-concept of a **GPU-accelerated, SingleStore-style HTAP database**: MySQL wire
-protocol, a CPU write buffer for transactional writes, immutable column segments resident in GPU
-memory for analytics, and CUDA kernels for scans, filters, aggregations, joins and sorts.
+**A GPU-accelerated, MySQL-compatible HTAP database.** Speak the MySQL protocol to it from any
+driver or ORM; transactional writes land in a CPU write buffer, analytics run as CUDA kernels over
+column segments kept in GPU memory. Built in: vector search (GPU graph index), embeddings in SQL,
+full-text search, S3 / Kafka / MySQL change-data-capture ingest, replication with failover, backups
+with point-in-time restore, MVCC.
+
+> **Status: alpha.** It passes TPC-H, ClickBench, a differential fuzzer and ORM suites (see
+> [Tests](#tests)), but it is young software: NVIDIA GPUs only, one main developer, no production
+> deployments yet. Keep your data in a system of record (for instance as a live copy of MySQL, see
+> [MySQL change data capture](#mysql-change-data-capture-gpu-db-as-a-live-copy-of-mysql)).
+
+## Quick start
+
+**Docker** (needs an NVIDIA GPU and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)):
+
+```bash
+docker build -t gpudb .                      # ~10-20 min the first time (--build-arg JOBS=2 on small machines)
+docker run --gpus all -p 3307:3307 -v gpudb-data:/data -e GPUDB_ROOT_PASSWORD=change-me gpudb
+mysql -h 127.0.0.1 -P 3307 -u root -p        # or any MySQL driver / ORM
+```
+
+**From source** (Linux):
+
+| Requirement | Version |
+|---|---|
+| NVIDIA GPU | Turing (RTX 20xx / T4) or newer; developed on an RTX 3080 |
+| NVIDIA driver + CUDA toolkit | CUDA 12.x (nvcc, NVRTC, cuBLAS), tested with 12.6 |
+| CMake, C++20 compiler | CMake 3.24+, GCC 11+ |
+| Libraries | OpenSSL, libcurl, zstd, lz4, snappy, zlib, RE2 (PCRE2 optional): `sudo scripts/install-deps.sh` on Debian / Ubuntu |
+
+```bash
+sudo scripts/install-deps.sh                 # Debian / Ubuntu; CUDA from https://developer.nvidia.com/cuda-downloads
+cmake -S . -B build && cmake --build build -j
+./build/gpudb --port 3307 --data-dir ./gpudb-data
+mysql -h 127.0.0.1 -P 3307 -u root
+```
+
+Optional extras: `scripts/install-cuvs.sh` (NVIDIA cuVS, ~3 GB: the GPU graph vector index; rerun
+cmake afterwards) and `scripts/fetch-embed-model.sh` (the ~90 MB model behind `EMBED()`). Without
+them vector indexes fall back to IVF and `EMBED()` reports that the model is missing.
+
+By default the server listens on 127.0.0.1 only and root has no password; it refuses to listen on
+other addresses until root has one (`--root-password` / `GPUDB_ROOT_PASSWORD`). TLS is on with a
+generated certificate. `./build/gpudb --help` lists the options.
+
+SingleStore is a trademark of SingleStore, Inc. gpu-db is an independent project, not affiliated
+with or endorsed by SingleStore; it supports much of SingleStore's SQL dialect (SHARD KEY, SORT KEY,
+REFERENCE tables, pipelines, vector and JSON syntax) and is benchmarked against it below.
+
+## Architecture
 
 ```
  MySQL clients ──► MySQL protocol server (thread per connection)
@@ -25,7 +72,7 @@ memory for analytics, and CUDA kernels for scans, filters, aggregations, joins a
             or hash), join-filtered scans, hash join, sort
 ```
 
-## How it maps to SingleStore
+## Compared with SingleStore's architecture
 
 | SingleStore | gpu-db |
 |---|---|
@@ -44,15 +91,11 @@ memory for analytics, and CUDA kernels for scans, filters, aggregations, joins a
 | `PROFILE`, `SHOW PROFILE`, `EXPLAIN` | Same statements; per-stage time, rows and strategy (see "Measuring query speed") |
 | Write-ahead log, recovery | Logical WAL, replayed on startup (`--sync` for fdatasync per commit) |
 
-## Build & run
-
-Requires CUDA 12.x and a Volta-or-newer GPU (developed on an RTX 3080, sm_86).
+## Usage
 
 ```bash
-cmake -S . -B build && cmake --build build -j
 ./build/gpudb --port 3307 --data-dir ./gpudb-data     # or --no-wal; --partitions N; --codegen on|sync|off;
                                                       # --plancache-dir DIR (default <data-dir>/plancache); -v
-mysql -h 127.0.0.1 -P 3307 -u root                    # or any MySQL driver (pymysql etc.)
 ```
 
 ```sql
@@ -87,7 +130,7 @@ DuckDB, on-disk database, 4 GB memory limit). **All results are checked against 
 | X2 filtered top-N projection | 3.6 ms | 30 ms | 8.3x |
 | PK point lookup (incl. network round trip) | 0.07 ms | 0.55 ms | 8x |
 
-### SingleStore feature checklist
+### SingleStore SQL compatibility checklist
 
 A 73-item probe of SingleStore SQL features (one representative statement each; script in the
 session scratchpad, `features.py`) passes 69. Covered:
@@ -245,7 +288,9 @@ processes running. Treat these as indicative numbers, not a rigorous benchmark.
 ## Tests
 
 ```bash
-.venv/bin/python tests/run.py              # everything that can run on this machine (~2 min)
+python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+scripts/test-containers.sh                 # optional: S3 / Kafka / MySQL containers for the ingest and CDC tests
+.venv/bin/python tests/run.py              # everything that can run on this machine (~2-3 min)
 .venv/bin/python tests/run.py fuzz tpch    # by name
 GPUDB_FUZZ_N=5000 GPUDB_FUZZ_SEED=7 .venv/bin/python tests/run.py fuzz
 ```
@@ -290,7 +335,7 @@ profile, the plan, and with `--compare` the query timed with each optimization s
 
 ## SQL and feature coverage
 
-Close to MySQL / SingleStore for everyday use (any MySQL driver; prepared statements, multi-statement
+Close to MySQL (and SingleStore's dialect) for everyday use (any MySQL driver; prepared statements, multi-statement
 queries and `LOAD DATA LOCAL INFILE` are supported on the wire):
 
 | Area | Supported |
@@ -408,7 +453,7 @@ PIN`, `ALTER TABLE t ALTER COLUMN c SET VRAM = NEVER`. PIN columns go to VRAM fi
 in host RAM (read over PCIe), AUTO ones are placed by the VRAM cache by heat. `SHOW VRAM` lists every
 column's VRAM / host MB, hint and heat. Hints are part of SHOW CREATE TABLE, so they persist.
 
-## Lessons from the PoC
+## Design notes
 
 - **FP64 is the trap on consumer GPUs.** The RTX 3080 runs FP64 at 1/64 of its FP32 rate. The first
   warp-reduction design spent about 2 ms per aggregate on FP64 adds. Replacing it with an
@@ -448,14 +493,23 @@ column's VRAM / host MB, hint and heat. Hints are part of SHOW CREATE TABLE, so 
 ## Layout
 
 ```
-src/server.cpp   MySQL protocol + main
-src/sql.*        lexer / parser / AST
-src/engine.*     binder, bytecode compiler, planner, executor, DML, WAL
-src/storage.*    tables, write buffer, GPU segments, flush, LOAD DATA
-src/gpu.*        kernel launches, aggregation state, select, join, sort, gather
-src/kernels.cuh  kernel bodies shared by the ahead-of-time build and runtime-compiled plans
-src/jit.*        bytecode -> typed CUDA C++, NVRTC compilation, plan cache
-src/devtypes.h   expression VM and plan structs shared by CPU, GPU and NVRTC
-bench/           TPC-H + HTAP benchmarks against DuckDB, SingleStore's trades query, qtime.py
-tests/           smoke.py, postagg.py (GROUP BY top-N vs DuckDB), sharding.py (partitioning vs DuckDB)
+src/server.cpp     MySQL protocol, HTTP Data API, main
+src/sql.*          lexer / parser / AST
+src/engine.*       binder, bytecode compiler, planner, executor, DML, transactions, WAL, backups
+src/storage.*      tables, write buffers, GPU segments, MVCC snapshots, flush, LOAD DATA
+src/gpu.*          kernel launches, aggregation state, select, join, sort, gather
+src/kernels.cuh    kernel bodies shared by the ahead-of-time build and runtime-compiled plans
+src/jit.*          bytecode -> typed CUDA C++, NVRTC compilation, plan cache
+src/devtypes.h     expression VM and plan structs shared by CPU, GPU and NVRTC
+src/repl.cpp       WAL-tailing replicas, semi-sync, failover
+src/cluster.cpp    aggregator / leaf clustering
+src/monitor.*      sessions, KILL, query stats, slow log, Prometheus metrics
+src/mysqlcdc.*     MySQL client + binlog decoder (change data capture)
+src/sources.*      S3, HTTP, Kafka; parquet.cpp / orc.cpp / avro.cpp readers
+src/cagra.*        cuVS GPU graph vector index (loaded at run time)
+src/embed.*        BERT-style sentence embeddings on cuBLAS (EMBED())
+src/proc.cpp       stored procedures, UDFs
+tests/             run.py (the suite), lib.py, fuzz.py, ORM projects in tests/orm
+bench/             TPC-H, ClickBench, use-case and HTAP benchmarks (DuckDB / SingleStore comparisons)
+scripts/           install-deps.sh, test-containers.sh, install-cuvs.sh, fetch-embed-model.sh
 ```

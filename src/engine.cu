@@ -835,7 +835,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
   }
   if (f == "TIMESTAMPADD") {
     argc(2, 2);
-    if (A[0]->kind != Expr::LIT) throw SqlError("TIMESTAMPADD needs a constant amount in this PoC", 1235);
+    if (A[0]->kind != Expr::LIT) throw SqlError("TIMESTAMPADD needs a constant amount", 1235);
     e = intervalArith(A[1], (int64_t)A[0]->lit.num(), e->castType);
     return;
   }
@@ -6236,7 +6236,7 @@ int64_t Engine::insertRows(Table& t, const std::vector<int>& map, std::vector<st
 
 ResultSet Engine::doLoad(Stmt& s) {
   if (s.setValue != "FS" && !s.setValue.empty())
-    throw SqlError("LOAD DATA " + s.setValue + " is not supported in this PoC (use a local path / FS)", 1235);
+    throw SqlError("LOAD DATA " + s.setValue + " is not supported (use a local path / FS, S3, KAFKA or MYSQL)", 1235);
   auto t = cat_.get(s.table);
   std::unique_lock<FairSharedMutex> lk(t->mu);
   waitTxnFree(*t, lk);  // another session's open transaction changed this table
@@ -8528,7 +8528,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   DevVec<int32_t> finalIdx;
   int64_t start = std::min<int64_t>(s.offset, m);
   int64_t cnt = s.limit < 0 ? m - start : std::min<int64_t>(m - start, s.limit);
-  if (cnt > 20'000'000) throw SqlError("result set too large for this PoC (" + std::to_string(cnt) + " rows); add a LIMIT", 1105);
+  if (cnt > 20'000'000) throw SqlError("result set too large (" + std::to_string(cnt) + " rows); add a LIMIT", 1105);
   ProfStage psort(orderBy.empty() ? "limit" : "GPU sort");
   if (!orderBy.empty() && m > 0) {
     std::vector<DevVec<double>> keyBufs;

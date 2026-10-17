@@ -50,7 +50,7 @@ std::string formatDate(int64_t days);
 bool parseDateTime(const std::string& s, int64_t& us);  // 'YYYY-MM-DD[ HH:MM[:SS[.ffffff]]]' -> microseconds
 std::string formatDateTime(int64_t us);
 
-// A host-side scalar value (literals and result cells). No NULL support in this PoC.
+// A host-side scalar value (literals and result cells).
 struct Value {
   enum Kind : uint8_t { INT, DBL, STR, DATE, DATETIME } kind = INT;
   int64_t i = 0;

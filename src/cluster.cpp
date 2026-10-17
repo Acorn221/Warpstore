@@ -1,4 +1,4 @@
-// Clustering, SingleStore-style: one aggregator + leaf nodes. Leaves are ordinary gpu-db servers;
+// Clustering: one aggregator + leaf nodes. Leaves are ordinary gpu-db servers;
 // the aggregator (--leaves http://leaf1:port,http://leaf2:port[|http://leaf2-replica:port], their
 // HTTP API ports) keeps the catalog and talks to them over the HTTP Data API.
 //

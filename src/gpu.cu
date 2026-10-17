@@ -977,7 +977,7 @@ int64_t gpuHashJoinParts(ColView buildKey, const std::vector<int64_t>& bOff, Col
   d2h(&lastOff, offs.p + np - 1, 8);
   d2h(&lastCnt, counts.p + np - 1, 8);
   int64_t m = lastOff + lastCnt;
-  if (m > INT32_MAX) throw SqlError("join result too large for this PoC (>2^31 rows)", 1105);
+  if (m > INT32_MAX) throw SqlError("join result too large (>2^31 rows)", 1105);
   // Output is in probe order, so it stays grouped by the probe side's partitions.
   if (outOff)
     for (int p = 0; p <= pp; ++p) {
@@ -1067,7 +1067,7 @@ int64_t gpuHashJoinOuter(ColView buildKey, int64_t nb, ColView probeKey, int64_t
   if (full && nb) {
     // matched flags are only known after the write pass; run it into temporaries first.
   }
-  if (m > INT32_MAX) throw SqlError("join result too large for this PoC (>2^31 rows)", 1105);
+  if (m > INT32_MAX) throw SqlError("join result too large (>2^31 rows)", 1105);
   DevVec<int32_t> b0(std::max<int64_t>(m, 1)), p0(std::max<int64_t>(m, 1));
   if (np)
     joinProbeOuter<true><<<gridFor(np), 256>>>(probeKey, np, tk.p, tr.p, (unsigned long long)(cap - 1), nullptr, offs.p, b0.p,

@@ -1403,7 +1403,7 @@ struct Parser {
         s.path = "\x03role";
       } else if (acceptKw("GROUP") ||
                  acceptKw("PROCEDURE") || acceptKw("FUNCTION") || acceptKw("TRIGGER") || acceptKw("RESOURCE")) {
-        s.type = Stmt::SET;  // accepted and ignored in this PoC
+        s.type = Stmt::SET;  // accepted and ignored
         while (cur().k != Tok::END) ++p;
       } else {
         bool ref = acceptKw("REFERENCE");
@@ -1837,7 +1837,7 @@ struct Parser {
       while (cur().k != Tok::END && !isSym(";")) ++p;
     } else if (acceptKw("FLUSH") || acceptKw("KILL") || acceptKw("LOCK") ||
                acceptKw("UNLOCK") || acceptKw("START") || acceptKw("STOP") || acceptKw("RESET")) {
-      s.type = Stmt::SET;  // accepted and ignored in this PoC
+      s.type = Stmt::SET;  // accepted and ignored
       while (cur().k != Tok::END) ++p;
     } else if (acceptKw("SET")) {
       s.type = Stmt::SET;

@@ -1,4 +1,4 @@
-// Unified table storage, modelled on SingleStore's design:
+// Unified table storage (LSM-style):
 //   * an in-memory write buffer (the "rowstore" top of the LSM) on the CPU takes OLTP writes,
 //   * full buffers are flushed (sorted by SORT KEY on the GPU) into immutable column segments
 //     that live in VRAM, with a host mirror acting as the durable/cold tier,

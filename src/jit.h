@@ -1,4 +1,4 @@
-// Query compilation, SingleStore-style: each query's expressions are translated from bytecode into
+// Query compilation: each query's expressions are translated from bytecode into
 // typed CUDA C++, compiled at runtime with NVRTC and cached in a plan cache keyed by the generated
 // source. Literal values are not part of the source (they are read from ExprEnv::consts), so the
 // same query shape with different constants reuses the compiled plan.
