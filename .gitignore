@@ -1,0 +1,5 @@
+build/
+data/
+.venv/
+gpudb-data/
+__pycache__/

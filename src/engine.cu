@@ -1,0 +1,10834 @@
+#include "engine.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <functional>
+#include <map>
+#include <set>
+#include <glob.h>
+#include <openssl/md5.h>
+#include <openssl/sha.h>
+#include <random>
+#include <zlib.h>
+#include <sys/stat.h>
+#include <regex>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <unistd.h>
+#include <fcntl.h>
+#include <zstd.h>
+#include "gpu.h"
+#include "jit.h"
+#include "sources.h"
+
+namespace gdb {
+const std::string& tUserName();  // the session user (defined with the user code below)
+extern thread_local bool tApplying;  // applying replicated records (repl.cpp)
+// Read committed (see commitTxn): another session's open transaction has changes in this table.
+bool foreignPending(const Table& t) {
+  for (auto& [k, v] : t.txnPending)
+    if (k != (const void*)undoLog() && !v.commitSeq && (!v.hidden.empty() || !v.ghosts.empty())) return true;
+  return false;
+}
+// Snapshot isolation (REPEATABLE READ): a snapshot transaction sees the commits up to tSnapSeq; the
+// changes of later commits stay in Table::txnPending (retired, with their commitSeq) while it runs.
+thread_local uint64_t tSnapSeq = 0;
+std::atomic<uint64_t> gCommitSeq{1};
+std::mutex gSnapMu;
+std::multiset<uint64_t> gSnaps;  // active snapshots
+bool snapshotsActive() {
+  std::lock_guard<std::mutex> g(gSnapMu);
+  return !gSnaps.empty();
+}
+thread_local std::vector<std::shared_ptr<DevVec<uint32_t>>> tTxnViews;  // visibility bitmaps of the current statement
+bool regexLike(const std::string& s, const std::string& pat, bool ci);  // regex.cpp (RE2)
+std::string regexReplace(const std::string& s, const std::string& pat, const std::string& rep);
+bool tzOffset(const std::string& zone, int64_t secs, bool local, int64_t& offsetSecs);  // regex.cpp
+bool regexSubstr(const std::string& s, const std::string& pat, bool ci, std::string& out, int64_t& pos);  // regex.cpp
+Value geoFunction(const std::string& f, const std::vector<Value>& a);                   // regex.cpp
+
+ExprP cloneExpr(const ExprP& e);  // query layer
+
+const std::string kNullCell("\0NULL", 5);
+ExprP cloneExpr(const ExprP& e);  // defined with the query layer
+
+// ---- Collation. Default utf8mb4_general_ci (case-insensitive, like SingleStore); per session
+// SET collation_connection = utf8mb4_bin for binary. Strings are dictionary encoded, so case
+// folding happens once per dictionary entry, not per row.
+std::atomic<bool> gCiDefault{true};
+thread_local int tCi = -1;
+bool ciColl() { return tCi >= 0 ? tCi != 0 : gCiDefault.load(); }
+std::string foldCase(const std::string& x) {
+  std::string r = x;
+  for (auto& ch : r) ch = (char)tolower((unsigned char)ch);
+  return r;
+}
+// Runs f(begin, end) over [0, n) on all cores in chunks (multiples of 32, so bitmap words are never
+// shared). Workers inherit the session's collation.
+void parallelFor(size_t n, const std::function<void(size_t, size_t)>& f, size_t minChunk = 32768) {
+  const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+  const size_t nth = std::min<size_t>(hw, (n + minChunk - 1) / minChunk);
+  if (nth <= 1) {
+    f(0, n);
+    return;
+  }
+  size_t chunk = (n + nth - 1) / nth;
+  if (minChunk >= 32) chunk = (chunk + 31) & ~(size_t)31;  // bitmap words never shared
+  const int ci = tCi;
+  std::vector<std::thread> th;
+  std::exception_ptr err;
+  std::mutex errMu;
+  for (size_t b = 0; b < n; b += chunk)
+    th.emplace_back([&, b] {
+      tCi = ci;
+      try {
+        f(b, std::min(n, b + chunk));
+      } catch (...) {
+        std::lock_guard<std::mutex> g(errMu);
+        err = std::current_exception();
+      }
+    });
+  for (auto& t : th) t.join();
+  if (err) std::rethrow_exception(err);
+}
+
+// A LIKE matcher specialized on the pattern: '%x%' / 'x%' / '%x' / 'x' use substring search
+// (memmem) instead of the general wildcard matcher.
+std::function<bool(std::string_view)> likeMatcher(const std::string& pat) {
+  bool special = pat.find('_') != std::string::npos || pat.find('\\') != std::string::npos;
+  const size_t inner = pat.size() >= 2 ? pat.find('%', 1) : std::string::npos;
+  if (!special) {
+    const bool lead = !pat.empty() && pat[0] == '%', trail = pat.size() > (size_t)lead && pat.back() == '%';
+    const std::string lit = pat.substr(lead, pat.size() - lead - (trail ? 1 : 0));
+    if (lit.find('%') == std::string::npos && (inner == std::string::npos || inner == pat.size() - 1)) {
+      if (lead && trail) return [lit](std::string_view s) { return memmem(s.data(), s.size(), lit.data(), lit.size()) != nullptr; };
+      if (trail) return [lit](std::string_view s) { return s.size() >= lit.size() && memcmp(s.data(), lit.data(), lit.size()) == 0; };
+      if (lead)
+        return [lit](std::string_view s) { return s.size() >= lit.size() && memcmp(s.data() + s.size() - lit.size(), lit.data(), lit.size()) == 0; };
+      return [lit](std::string_view s) { return s == lit; };
+    }
+  }
+  return [pat](std::string_view s) { return likeMatch(std::string(s), pat); };
+}
+
+int collCmp(const std::string& a, const std::string& b);
+void derivShareMap(const std::shared_ptr<std::vector<double>>& m);
+// Sorted order of a dictionary (collation-aware): (rank -> code, code -> rank). Dictionaries only
+// grow, so (dictionary, size, collation) identifies a version: cached, built with a parallel sort.
+std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vector<double>>> sortedDict(const Dict& d) {
+  static std::mutex mu;
+  struct E {
+    size_t n;
+    std::shared_ptr<const std::vector<int32_t>> order;
+    std::shared_ptr<std::vector<double>> rank;
+  };
+  static std::map<std::pair<const Dict*, bool>, E> cache;
+  const bool ci = ciColl();
+  const size_t n = d.strs.size();
+  std::shared_ptr<const std::vector<int32_t>> prev;  // order of an older (smaller) version
+  {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = cache.find({&d, ci});
+    if (it != cache.end() && it->second.n == n) return {it->second.order, it->second.rank};
+    if (it != cache.end() && it->second.n < n && n - it->second.n <= n / 8) prev = it->second.order;
+  }
+  const auto tStart = std::chrono::steady_clock::now();
+  if (prev) {  // the dictionary grew a little: binary-search the new strings into the old order
+    const size_t n0 = prev->size();
+    auto less = [&](int32_t a, int32_t b) {
+      const int c = collCmp(d.strs[a], d.strs[b]);
+      return c ? c < 0 : a < b;
+    };
+    std::vector<int32_t> fresh;
+    for (size_t i = n0; i < n; ++i) fresh.push_back((int32_t)i);
+    std::sort(fresh.begin(), fresh.end(), less);
+    std::vector<size_t> at(fresh.size());
+    parallelFor(fresh.size(), [&](size_t b, size_t e) {
+      for (size_t k = b; k < e; ++k) at[k] = std::lower_bound(prev->begin(), prev->end(), fresh[k], less) - prev->begin();
+    }, 64);
+    auto order = std::make_shared<std::vector<int32_t>>();
+    order->reserve(n);
+    size_t from = 0;
+    for (size_t k = 0; k < fresh.size(); ++k) {
+      order->insert(order->end(), prev->begin() + from, prev->begin() + at[k]);
+      order->push_back(fresh[k]);
+      from = at[k];
+    }
+    order->insert(order->end(), prev->begin() + from, prev->end());
+    auto rank = std::make_shared<std::vector<double>>(n);
+    for (size_t r = 0; r < n; ++r) (*rank)[(*order)[r]] = (double)r;
+    if (getenv("GPUDB_TRACE"))
+      fprintf(stderr, "[trace] sorted dictionary of %zu strings incrementally (+%zu) in %.1f ms\n", n, n - n0,
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
+    std::lock_guard<std::mutex> g(mu);
+    cache[{&d, ci}] = E{n, order, rank};
+    derivShareMap(rank);
+    return {order, rank};
+  }
+  auto order = std::make_shared<std::vector<int32_t>>(n);
+  for (size_t i = 0; i < n; ++i) (*order)[i] = (int32_t)i;
+  // MSD sort on 8-byte big-endian chunks (lower-cased under _ci, which is strcasecmp's order): sort
+  // by the first chunk, then re-sort each run of equal chunks by the next one. Plain comparison
+  // sorts crawl on URL-like data, where most strings share their first 8+ bytes.
+  const bool fold = ci;
+  std::vector<uint64_t> key(n);
+  auto chunk = [&](int32_t i, size_t off) {
+    const std::string& s = d.strs[i];
+    uint64_t p = 0;
+    for (size_t k = off; k < off + 8; ++k) {
+      unsigned char ch = k < s.size() ? (unsigned char)s[k] : 0;
+      if (fold) ch = (unsigned char)tolower(ch);
+      p = (p << 8) | ch;
+    }
+    return p;
+  };
+  auto byKey = [&](int32_t a, int32_t b) { return key[a] != key[b] ? key[a] < key[b] : a < b; };
+  struct Run {
+    size_t lo, hi, off;
+  };
+  // Runs of equal keys (that still have bytes left to compare) within [lo, hi).
+  auto runsOf = [&](size_t lo, size_t hi, size_t off, std::vector<Run>& out) {
+    for (size_t i = lo; i < hi;) {
+      size_t j = i + 1;
+      size_t maxLen = d.strs[(*order)[i]].size();
+      while (j < hi && key[(*order)[j]] == key[(*order)[i]]) maxLen = std::max(maxLen, d.strs[(*order)[j++]].size());
+      if (j - i > 1 && maxLen > off + 8) out.push_back({i, j, off + 8});
+      i = j;
+    }
+  };
+  // Sort [lo, hi) by key: on all cores (chunks, then pairwise merges) when the range is large.
+  auto sortRange = [&](size_t lo, size_t hi) {
+    const size_t nth = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), (hi - lo) / 65536));
+    std::vector<size_t> bounds;
+    for (size_t t = 0; t <= nth; ++t) bounds.push_back(lo + (hi - lo) * t / nth);
+    parallelFor(nth, [&](size_t b, size_t e) {
+      for (size_t t = b; t < e; ++t) std::sort(order->begin() + bounds[t], order->begin() + bounds[t + 1], byKey);
+    }, 1);
+    for (size_t w = 1; w < nth; w *= 2)
+      for (size_t t = 0; t + w < nth; t += 2 * w)
+        std::inplace_merge(order->begin() + bounds[t], order->begin() + bounds[t + w], order->begin() + bounds[std::min(nth, t + 2 * w)], byKey);
+  };
+  // Small runs: one thread each, recursively. Large runs (shared URL prefixes): on all cores.
+  std::function<void(size_t, size_t, size_t)> refineSmall = [&](size_t lo, size_t hi, size_t off) {
+    for (size_t i = lo; i < hi; ++i) key[(*order)[i]] = chunk((*order)[i], off);
+    std::sort(order->begin() + lo, order->begin() + hi, byKey);
+    std::vector<Run> sub;
+    runsOf(lo, hi, off, sub);
+    for (auto& r : sub) refineSmall(r.lo, r.hi, r.off);
+  };
+  std::function<void(std::vector<Run>&)> refineAll = [&](std::vector<Run>& runs) {
+    std::vector<Run> small;
+    for (auto& r : runs) {
+      if (r.hi - r.lo < 131072) {
+        small.push_back(r);
+        continue;
+      }
+      parallelFor(r.hi - r.lo, [&](size_t b, size_t e) {
+        for (size_t i = r.lo + b; i < r.lo + e; ++i) key[(*order)[i]] = chunk((*order)[i], r.off);
+      });
+      sortRange(r.lo, r.hi);
+      std::vector<Run> sub;
+      runsOf(r.lo, r.hi, r.off, sub);
+      refineAll(sub);
+    }
+    std::sort(small.begin(), small.end(), [](const Run& a, const Run& b) { return a.hi - a.lo > b.hi - b.lo; });
+    std::atomic<size_t> next{0};
+    parallelFor(std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), small.size())), [&](size_t, size_t) {
+      for (size_t i; (i = next++) < small.size();) refineSmall(small[i].lo, small[i].hi, small[i].off);
+    }, 1);
+  };
+  parallelFor(n, [&](size_t b, size_t e) {
+    for (size_t i = b; i < e; ++i) key[i] = chunk((int32_t)i, 0);
+  });
+  const auto tK = std::chrono::steady_clock::now();
+  sortRange(0, n);
+  const auto tS = std::chrono::steady_clock::now();
+  std::vector<Run> runs;
+  runsOf(0, n, 0, runs);
+  size_t inRuns = 0, big = 0;
+  for (auto& r : runs) inRuns += r.hi - r.lo, big = std::max(big, r.hi - r.lo);
+  refineAll(runs);
+  if (getenv("GPUDB_TRACE")) {
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    fprintf(stderr, "[trace]   keys %.1f ms, first sort %.1f ms, %zu runs (%zu strings, largest %zu), refine %.1f ms\n", ms(tStart, tK),
+            ms(tK, tS), runs.size(), inRuns, big, ms(tS, std::chrono::steady_clock::now()));
+  }
+  auto rank = std::make_shared<std::vector<double>>(n);
+  for (size_t r = 0; r < n; ++r) (*rank)[(*order)[r]] = (double)r;
+  if (getenv("GPUDB_TRACE"))
+    fprintf(stderr, "[trace] sorted dictionary of %zu strings in %.1f ms\n", n,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
+  std::lock_guard<std::mutex> g(mu);
+  cache[{&d, ci}] = E{n, order, rank};
+  derivShareMap(rank);
+  return {order, rank};
+}
+
+// After a bulk load: sort the table's large dictionaries in the background (one pass per table at
+// a time, under the read lock), so the first ORDER BY / MIN / MAX / comparison on a string column
+// does not pay for the sort.
+void warmDicts(const std::shared_ptr<Table>& t) {
+  static std::mutex mu;
+  static std::set<const Table*> busy;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    if (!busy.insert(t.get()).second) return;
+  }
+  std::thread([t] {
+    try {
+      for (int ci : {0, 1}) {  // binary collation first (no per-table collation is stored)
+        tCi = ci;
+        std::shared_lock<FairSharedMutex> lk(t->mu);
+        for (auto& d : t->dicts)
+          if (d && d->strs.size() >= 50000) sortedDict(*d);
+      }
+    } catch (...) {
+    }
+    std::lock_guard<std::mutex> g(mu);
+    busy.erase(t.get());
+  }).detach();
+}
+
+// ---- Cache of dictionary-derived data: bitmaps of string predicates (LIKE, comparisons), code ->
+// value maps of encoded expressions, derived dictionaries. Dictionaries only grow, so an entry is
+// valid while its dictionary has the same size. Device copies are made once and shared (holders
+// keep them alive, so eviction never frees memory a running query uses).
+struct DictDerived {
+  const Dict* d = nullptr;
+  size_t n = 0;
+  std::shared_ptr<std::vector<uint32_t>> bits;
+  std::shared_ptr<std::vector<double>> map;
+  std::shared_ptr<Dict> out;
+  std::shared_ptr<DevVec<uint32_t>> bitsDev;
+  std::shared_ptr<DevVec<double>> mapDev;
+  size_t bytes = 0;
+};
+std::mutex gDerivMu;
+std::unordered_map<std::string, DictDerived> gDeriv;
+// Host map -> (the map, kept alive so its address is never reused; its device copy, made lazily).
+std::unordered_map<const void*, std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<DevVec<double>>>> gMapDev;
+size_t gDerivBytes = 0;
+std::string derivKey(const Dict& d, const std::string& what) {
+  return std::to_string((uintptr_t)&d) + "|" + (ciColl() ? "i" : "b") + "|" + what;
+}
+bool derivGet(const Dict& d, const std::string& key, DictDerived& out) {
+  std::lock_guard<std::mutex> g(gDerivMu);
+  auto it = gDeriv.find(key);
+  if (it == gDeriv.end() || it->second.d != &d || it->second.n != d.strs.size()) return false;
+  out = it->second;
+  return true;
+}
+// An entry for an older (smaller) version of the dictionary: it can be extended with the new entries.
+bool derivGetStale(const Dict& d, const std::string& key, DictDerived& out) {
+  std::lock_guard<std::mutex> g(gDerivMu);
+  auto it = gDeriv.find(key);
+  if (it == gDeriv.end() || it->second.d != &d || it->second.n >= d.strs.size() || !(it->second.map || it->second.bits)) return false;
+  out = it->second;
+  return true;
+}
+void derivPut(const std::string& key, DictDerived e) {
+  e.bytes = (e.bits ? e.bits->size() * 4 : 0) + (e.map ? e.map->size() * 8 : 0);
+  std::lock_guard<std::mutex> g(gDerivMu);
+  if (gDerivBytes + e.bytes > ((size_t)1 << 30)) {  // simple bound: start over
+    gDeriv.clear();
+    gMapDev.clear();
+    gDerivBytes = 0;
+  }
+  if (auto old = gDeriv.find(key); old != gDeriv.end() && old->second.map) gMapDev.erase(old->second.map.get());
+  if (e.map) gMapDev[e.map.get()] = {e.map, nullptr};  // eligible for a shared device copy
+  gDerivBytes += e.bytes;
+  gDeriv[key] = std::move(e);
+}
+// Device copy of a cached map (made once), or null when the map is not a cached one.
+std::shared_ptr<DevVec<double>> derivMapDev(const std::vector<double>* m) {
+  std::lock_guard<std::mutex> g(gDerivMu);
+  auto it = gMapDev.find(m);
+  if (it == gMapDev.end()) return nullptr;
+  auto& dev = it->second.second;
+  if (!dev) {
+    dev = std::make_shared<DevVec<double>>(std::max<int64_t>((int64_t)m->size(), 1));
+    if (!m->empty()) h2d(dev->p, m->data(), m->size() * 8);
+  }
+  return dev;
+}
+// A long-lived map (e.g. sorted-dictionary ranks) whose device copy should be shared too.
+void derivShareMap(const std::shared_ptr<std::vector<double>>& m) {
+  std::lock_guard<std::mutex> g(gDerivMu);
+  if (!gMapDev.count(m.get())) {
+    gMapDev[m.get()] = {m, nullptr};
+    gDerivBytes += m->size() * 8;
+  }
+}
+
+int collCmp(const std::string& a, const std::string& b) {
+  if (ciColl()) {
+    int c = strcasecmp(a.c_str(), b.c_str());
+    if (c) return c < 0 ? -1 : 1;
+    return 0;
+  }
+  int c = a.compare(b);
+  return c < 0 ? -1 : c > 0 ? 1 : 0;
+}
+// code -> canonical code (first entry with the same case-folded text), or null when the
+// dictionary has no case variants (then nothing needs mapping). Cached per dictionary size.
+std::shared_ptr<std::vector<double>> ciCanon(const Dict& d) {
+  static std::mutex mu;
+  static std::map<const Dict*, std::pair<size_t, std::shared_ptr<std::vector<double>>>> cache;
+  std::lock_guard<std::mutex> g(mu);
+  auto& slot = cache[&d];
+  if (slot.first == d.strs.size() && (slot.second || slot.first)) return slot.second;
+  std::unordered_map<std::string, int32_t> first;
+  auto m = std::make_shared<std::vector<double>>(d.strs.size());
+  bool any = false;
+  for (size_t i = 0; i < d.strs.size(); ++i) {
+    auto [it, fresh] = first.emplace(foldCase(d.strs[i]), (int32_t)i);
+    (*m)[i] = it->second;
+    any |= !fresh;
+  }
+  slot = {d.strs.size(), any ? m : nullptr};
+  return slot.second;
+}
+
+// Two dictionaries' codes -> ranks in the collation order of their union (equal strings under the
+// collation get equal ranks), so columns of different tables compare on the GPU. Cached per pair
+// and sizes.
+std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<double>>> crossRank(const Dict& a, const Dict& b) {
+  static std::mutex mu;
+  static std::map<std::tuple<const Dict*, const Dict*, size_t, size_t, bool>, std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<double>>>> cache;
+  const auto key = std::make_tuple(&a, &b, a.strs.size(), b.strs.size(), ciColl());
+  {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+  }
+  std::vector<std::pair<const std::string*, int64_t>> all;  // (string, code; b's codes offset by |a|)
+  all.reserve(a.strs.size() + b.strs.size());
+  for (size_t i = 0; i < a.strs.size(); ++i) all.push_back({&a.strs[i], (int64_t)i});
+  for (size_t i = 0; i < b.strs.size(); ++i) all.push_back({&b.strs[i], (int64_t)(a.strs.size() + i)});
+  std::sort(all.begin(), all.end(), [](auto& x, auto& y) { return collCmp(*x.first, *y.first) < 0; });
+  auto ma = std::make_shared<std::vector<double>>(a.strs.size()), mb = std::make_shared<std::vector<double>>(b.strs.size());
+  double rk = 0;
+  for (size_t j = 0; j < all.size(); ++j) {
+    if (j && collCmp(*all[j - 1].first, *all[j].first) != 0) ++rk;
+    const int64_t c = all[j].second;
+    if (c < (int64_t)a.strs.size()) (*ma)[c] = rk;
+    else (*mb)[c - a.strs.size()] = rk;
+  }
+  std::lock_guard<std::mutex> g(mu);
+  if (cache.size() > 256) cache.clear();
+  return cache[key] = {ma, mb};
+}
+
+namespace {
+
+// ================================================================== binding
+
+struct BindCtx {
+  std::vector<std::shared_ptr<Table>> tabs;
+  std::vector<std::string> aliases;
+  std::vector<std::vector<std::string>> usingCols;  // per FROM entry: JOIN .. USING columns
+  bool inAgg = false;
+  // Binding the select list of an unordered, LIMIT-ed plain projection: string functions are
+  // evaluated per output row on the host instead of over the whole (large) dictionary.
+  bool lazyStr = false;
+  // Encoded string expressions: derived dictionaries (for VARCHAR-valued "#ENC" nodes) and the
+  // code -> value maps their GPU form applies with OP_DICTMAP.
+  std::vector<std::unique_ptr<Dict>> ownDicts;
+  std::vector<std::shared_ptr<Dict>> sharedDicts;  // derived dictionaries from the dictionary cache
+  std::unordered_map<const Expr*, Dict*> exprDict;
+  // MIN/MAX over strings aggregate ranks; rank -> code of the source dictionary (exprDict[e]).
+  std::unordered_map<const Expr*, std::shared_ptr<const std::vector<int32_t>>> unrank;
+  std::set<int> outerTabs;  // tables on the NULL-extended side of an outer join
+  Dict* dict(const Expr& e) const {
+    if (e.kind == Expr::COL) return e.bt >= 0 ? tabs[e.bt]->dicts[e.bc].get() : nullptr;
+    auto it = exprDict.find(&e);
+    return it == exprDict.end() ? nullptr : it->second;
+  }
+};
+bool isJsonExpr(const ExprP& x, const BindCtx* c);  // defined with the host functions
+std::string jsonOfValue(const Value& v, bool raw);
+
+bool isAggName(const std::string& n) { return n == "SUM" || n == "COUNT" || n == "AVG" || n == "MIN" || n == "MAX"; }
+// Aggregates computed by the host aggregation path of the query layer.
+bool isHostAggName(const std::string& n) {
+  return n == "GROUP_CONCAT" || n == "JSON_ARRAYAGG" || n == "JSON_AGG" || n == "JSON_OBJECTAGG" || n == "STRING_AGG" ||
+         n == "STDDEV" || n == "STD" || n == "STDDEV_POP" || n == "STDDEV_SAMP" || n == "VARIANCE" || n == "VAR_POP" ||
+         n == "VAR_SAMP" || n == "ANY_VALUE" || n == "MEDIAN" || n == "BIT_AND" || n == "BIT_OR" || n == "BIT_XOR" ||
+         n == "FIRST" || n == "LAST" || n == "PERCENTILE_CONT" || n == "PERCENTILE_DISC" || n == "APPROX_PERCENTILE";
+}
+bool isAgg(const ExprP& e) { return e->kind == Expr::FUNC && isAggName(e->op); }
+bool isCmp(const std::string& o) { return o == "=" || o == "<>" || o == "<" || o == "<=" || o == ">" || o == ">="; }
+
+bool hasAgg(const ExprP& e) {
+  if (!e) return false;
+  if (isAgg(e)) return true;
+  for (auto& a : e->args)
+    if (hasAgg(a)) return true;
+  return false;
+}
+
+// Canonical form after binding: columns are identified by (table, column) index.
+std::string canon(const ExprP& e) {
+  switch (e->kind) {
+    case Expr::COL: return "#" + std::to_string(e->bt) + "." + std::to_string(e->bc);
+    case Expr::LIT: return (e->lit.kind == Value::STR ? "'" + e->lit.s + "'" : e->lit.toString()) + ":" + std::to_string((int)e->lit.kind);
+    default: break;
+  }
+  // Encoded string expressions (#ENC:<n>, a fresh number per occurrence): the original expression.
+  if (e->kind == Expr::FUNC && e->op.rfind("#ENC:", 0) == 0 && e->args.size() == 2) return "ENC(" + canon(e->args[1]) + ")";
+  std::string r = std::to_string((int)e->kind) + e->op + (e->neg ? "!" : "") + (e->distinct ? "D" : "") + "(";
+  for (auto& a : e->args) r += canon(a) + ",";
+  return r + ")";
+}
+
+void bind(ExprP& e, BindCtx& c);
+
+void bindChildren(ExprP& e, BindCtx& c) {
+  for (auto& a : e->args) bind(a, c);
+}
+
+int64_t addInterval(int64_t days, int64_t n, const std::string& unit) {
+  if (unit == "DAY") return days + n;
+  int64_t y;
+  unsigned m, d;
+  civilFromDays(days, y, m, d);
+  int64_t months = (int64_t)y * 12 + (m - 1) + (unit == "MONTH" ? n : n * 12);
+  y = months >= 0 ? months / 12 : (months - 11) / 12;
+  m = (unsigned)(months - y * 12) + 1;
+  static const unsigned mdays[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+  unsigned lim = mdays[m - 1] + (m == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0));
+  return daysFromCivil(y, m, std::min(d, lim));
+}
+
+thread_local int64_t tLastInsertId = 0;  // per connection, like MySQL
+thread_local std::vector<std::string> tTempTables;  // CREATE TEMPORARY TABLE: dropped when the connection ends
+std::string dbOf(const std::string& name) {
+  size_t d = name.find('.');
+  return d == std::string::npos ? currentDb() : name.substr(0, d);
+}
+std::string plainName(const std::string& name) {
+  size_t d = name.find('.');
+  return d == std::string::npos ? name : name.substr(d + 1);
+}
+thread_local bool tWantVals = false;     // doSelect returns typed rows (for nested queries)
+
+int64_t nowUs() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+ExprP boundNode(Expr::Kind k, const std::string& op, std::vector<ExprP> args, LType ty) {
+  auto e = std::make_shared<Expr>();
+  e->kind = k;
+  e->op = op;
+  e->args = std::move(args);
+  e->ty = ty;
+  e->bound = true;
+  return e;
+}
+ExprP mkCall(uint16_t id, std::vector<ExprP> args, LType ty) {
+  ExprP e = boundNode(Expr::FUNC, (args.size() == 1 ? "#CALL1:" : "#CALL2:") + std::to_string(id), std::move(args), ty);
+  e->fnId = id;
+  return e;
+}
+ExprP boundLit(Value v) {
+  ExprP e = mkLit(std::move(v));
+  e->ty = e->lit.isNull() ? LType::DOUBLE
+        : e->lit.kind == Value::INT ? LType::BIGINT : e->lit.kind == Value::DBL ? LType::DOUBLE
+        : e->lit.kind == Value::DATE ? LType::DATE : e->lit.kind == Value::DATETIME ? LType::DATETIME : LType::VARCHAR;
+  e->bound = true;
+  return e;
+}
+bool isNullLit(const ExprP& e) { return e->kind == Expr::LIT && e->lit.isNull(); }
+bool allLits(const ExprP& e) {
+  if (e->kind == Expr::COL || e->kind == Expr::STAR) return false;
+  if (e->kind == Expr::FUNC && isAggName(e->op)) return false;
+  for (auto& a : e->args)
+    if (!allLits(a)) return false;
+  return true;
+}
+Value evalConst(const ExprP& e);  // constant folding (evalPost without context)
+
+// A string literal used where a date / datetime is expected.
+ExprP coerceTemporal(const ExprP& x, LType want) {
+  if (x->kind != Expr::LIT || x->lit.kind != Value::STR) return x;
+  if (want == LType::DATE) {
+    int32_t d;
+    if (parseDate(x->lit.s, d)) return boundLit(Value::Dt(d));
+  }
+  int64_t us;
+  if (parseDateTime(x->lit.s, us)) return want == LType::DATE ? boundLit(Value::Dt(floorDiv(us, kUsPerDay))) : boundLit(Value::Ts(us));
+  throw SqlError("Incorrect " + std::string(want == LType::DATE ? "DATE" : "DATETIME") + " value: '" + x->lit.s + "'", 1292);
+}
+ExprP asDate(const ExprP& x) {
+  ExprP y = coerceTemporal(x, LType::DATE);
+  return y->ty == LType::DATETIME ? mkCall(FN_DT_DATE, {y}, LType::DATE) : y;
+}
+ExprP asDateTime(const ExprP& x) {
+  ExprP y = coerceTemporal(x, LType::DATETIME);
+  return y->ty == LType::DATE ? mkCall(FN_DATE_TO_DT, {y}, LType::DATETIME) : y;
+}
+
+// date/datetime +/- INTERVAL n unit
+ExprP intervalArith(ExprP dt, int64_t n, const std::string& unit) {
+  static const std::map<std::string, int64_t> us = {{"MICROSECOND", 1}, {"SECOND", 1000000ll}, {"MINUTE", 60000000ll},
+                                                     {"HOUR", 3600000000ll}, {"DAY", kUsPerDay}, {"WEEK", 7 * kUsPerDay}};
+  const int64_t months = unit == "MONTH" ? n : unit == "QUARTER" ? 3 * n : unit == "YEAR" ? 12 * n : 0;
+  dt = coerceTemporal(dt, LType::DATETIME);
+  if (dt->kind == Expr::LIT && dt->lit.kind == Value::DATETIME && dt->lit.i % kUsPerDay == 0 && !us.count(unit))
+    dt = boundLit(Value::Dt(dt->lit.i / kUsPerDay));  // '1995-01-01' + INTERVAL 1 MONTH stays a DATE
+  if (dt->kind == Expr::LIT && dt->lit.kind == Value::DATETIME && dt->lit.i % kUsPerDay == 0 && (unit == "DAY" || unit == "WEEK"))
+    dt = boundLit(Value::Dt(dt->lit.i / kUsPerDay));
+  ExprP r;
+  const bool sub = unit != "DAY" && unit != "WEEK" && us.count(unit);
+  if (dt->ty == LType::DATETIME || sub) {
+    dt = asDateTime(dt);
+    r = months ? mkCall(FN_DT_ADD_MONTHS, {dt, boundLit(Value::I(months))}, LType::DATETIME)
+               : boundNode(Expr::BIN, "+", {dt, boundLit(Value::I(n * us.at(unit)))}, LType::DATETIME);
+  } else {
+    r = months ? mkCall(FN_ADD_MONTHS, {dt, boundLit(Value::I(months))}, LType::DATE)
+               : boundNode(Expr::BIN, "+", {dt, boundLit(Value::I(unit == "WEEK" ? 7 * n : n))}, LType::DATE);
+  }
+  if (allLits(r)) return boundLit(evalConst(r));
+  return r;
+}
+
+void bind(ExprP& e, BindCtx& c);
+void encodeStrings(ExprP& e, BindCtx& c);  // defined after evalPost
+ExprP strToNum(const ExprP& x, BindCtx& c, bool integer = false);  // string -> number (defined with bind)
+void unifyStrings(ExprP& e, BindCtx& c);
+
+// Scalar (non-aggregate) functions: lowered to VM-level calls, CASE, or other expressions.
+void bindFunc(ExprP& e, BindCtx& c) {
+  const std::string f = e->op;
+  // Constants evaluated at bind time.
+  if (f == "NOW" || f == "CURRENT_TIMESTAMP" || f == "SYSDATE" || f == "LOCALTIME" || f == "LOCALTIMESTAMP" ||
+      f == "UTC_TIMESTAMP") {
+    e = boundLit(Value::Ts(nowUs() / 1000000 * 1000000));
+    return;
+  }
+  if (f == "CURDATE" || f == "CURRENT_DATE" || f == "UTC_DATE") { e = boundLit(Value::Dt(floorDiv(nowUs(), kUsPerDay))); return; }
+  if (f == "PI") { e = boundLit(Value::D(3.141592653589793)); return; }
+  if (f == "LAST_INSERT_ID") { e = boundLit(Value::I(tLastInsertId)); return; }
+  if (f == "UNIX_TIMESTAMP" && e->args.empty()) { e = boundLit(Value::I(nowUs() / 1000000)); return; }
+  for (auto& a : e->args) bind(a, c);
+  auto& A = e->args;
+  const size_t n = A.size();
+  auto argc = [&](size_t lo, size_t hi) {
+    if (n < lo || n > hi) throw SqlError("Incorrect parameter count in the call to native function '" + f + "'", 1582);
+  };
+  auto numTy = [](const std::vector<ExprP>& xs) {
+    LType t = LType::BIGINT;
+    for (auto& x : xs) {
+      if (x->ty == LType::DOUBLE) t = LType::DOUBLE;
+      else if ((x->ty == LType::DATE || x->ty == LType::DATETIME) && t != LType::DOUBLE) t = x->ty;
+    }
+    return t;
+  };
+  auto finish = [&](ExprP r) {
+    e = r;
+    if (allLits(e) && !isNullLit(e) && e->kind != Expr::LIT) e = boundLit(evalConst(e));
+  };
+  if (f == "ISNULL" || f == "ISNOTNULL" || f == "#INSORTED") { argc(1, 1); e->ty = LType::INT; e->bound = true; return; }
+  if (f == "ISTRUE" || f == "ISFALSE") {
+    argc(1, 1);
+    ExprP one = boundLit(Value::I(1)), zero = boundLit(Value::I(0));
+    if (f == "ISTRUE") finish(boundNode(Expr::CASE, "", {A[0], one, zero}, LType::INT));
+    else finish(boundNode(Expr::CASE, "", {boundNode(Expr::FUNC, "ISNULL", {A[0]}, LType::INT), zero, A[0], zero, one}, LType::INT));
+    return;
+  }
+  if (f == "COALESCE" || f == "IFNULL" || f == "NVL") {
+    argc(2, 64);
+    LType t = A[0]->ty;
+    for (auto& x : A) if (!isNullLit(x) && x->ty != t) t = numTy(A);
+    ExprP r = A[n - 1];
+    for (size_t i = n - 1; i-- > 0;) r = boundNode(Expr::FUNC, "COALESCE2", {A[i], r}, t);
+    finish(r);
+    if (e->ty == LType::VARCHAR && e->kind != Expr::LIT) unifyStrings(e, c);
+    return;
+  }
+  if (f == "NULLIF") {
+    argc(2, 2);
+    e->ty = A[0]->ty;
+    e->bound = true;
+    if (e->ty == LType::VARCHAR) unifyStrings(e, c);
+    return;
+  }
+  if (f == "IF" || f == "IIF") {
+    argc(3, 3);
+    ExprP r = boundNode(Expr::CASE, "", {A[0], A[1], A[2]}, LType::BIGINT);
+    r->bound = false;  // let CASE binding compute the result type
+    bind(r, c);
+    e = r;
+    return;
+  }
+  static const std::map<std::string, uint16_t> math1 = {
+      {"ABS", FN_ABS}, {"CEIL", FN_CEIL}, {"CEILING", FN_CEIL}, {"FLOOR", FN_FLOOR}, {"SQRT", FN_SQRT}, {"EXP", FN_EXP},
+      {"LN", FN_LN}, {"LOG10", FN_LOG10}, {"LOG2", FN_LOG2}, {"SIN", FN_SIN}, {"COS", FN_COS}, {"TAN", FN_TAN},
+      {"ASIN", FN_ASIN}, {"ACOS", FN_ACOS}, {"SIGN", FN_SIGN}, {"DEGREES", FN_DEGREES}, {"RADIANS", FN_RADIANS}};
+  if (math1.count(f) || (f == "ROUND" && n == 1) || (f == "LOG" && n == 1) || (f == "ATAN" && n == 1)) {
+    argc(1, 1);
+    uint16_t id = f == "ROUND" ? FN_ROUND : f == "LOG" ? FN_LN : f == "ATAN" ? FN_ATAN : math1.at(f);
+    bool keepInt = (id == FN_ABS || id == FN_SIGN) && A[0]->ty != LType::DOUBLE;
+    LType ty = keepInt || id == FN_CEIL || id == FN_FLOOR || (id == FN_ROUND && A[0]->ty != LType::DOUBLE) ? LType::BIGINT : LType::DOUBLE;
+    if (id == FN_ROUND && A[0]->ty == LType::DOUBLE) ty = LType::DOUBLE;
+    finish(mkCall(id, {A[0]}, ty));
+    return;
+  }
+  static const std::map<std::string, uint16_t> math2 = {{"ROUND", FN_ROUND2}, {"TRUNCATE", FN_TRUNCATE2}, {"POW", FN_POW},
+                                                         {"POWER", FN_POW}, {"ATAN2", FN_ATAN2}, {"ATAN", FN_ATAN2},
+                                                         {"LOG", FN_LOG_B}};
+  if (math2.count(f)) {
+    argc(2, 2);
+    finish(mkCall(math2.at(f), {A[0], A[1]}, LType::DOUBLE));
+    return;
+  }
+  if (f == "MOD") { argc(2, 2); ExprP r = boundNode(Expr::BIN, "%", {A[0], A[1]}, numTy(A)); finish(r); return; }
+  if (f == "GREATEST" || f == "LEAST") {
+    argc(2, 64);
+    LType t = numTy(A);
+    ExprP r = A[0];
+    for (size_t i = 1; i < n; ++i) r = mkCall(f == "LEAST" ? FN_LEAST : FN_GREATEST, {r, A[i]}, t);
+    finish(r);
+    return;
+  }
+  // Date parts. DATETIME arguments go through DATE() first where the function is day-based.
+  static const std::map<std::string, uint16_t> dpart = {
+      {"MONTH", FN_MONTH}, {"DAY", FN_DAY}, {"DAYOFMONTH", FN_DAY}, {"DAYOFWEEK", FN_DAYOFWEEK},
+      {"WEEKDAY", FN_WEEKDAY}, {"DAYOFYEAR", FN_DAYOFYEAR}, {"QUARTER", FN_QUARTER}, {"WEEK", FN_WEEK},
+      {"YEARWEEK", FN_YEARWEEK}, {"LAST_DAY", FN_LAST_DAY}, {"TO_DAYS", FN_TO_DAYS}};
+  if (f == "YEAR") {
+    argc(1, 1);
+    A[0] = asDate(A[0]);
+    e->ty = LType::INT;
+    e->bound = true;
+    if (allLits(e)) e = boundLit(evalConst(e));
+    return;
+  }
+  if (dpart.count(f)) {
+    argc(1, 2);
+    uint16_t id = dpart.at(f);
+    finish(mkCall(id, {asDate(A[0])}, id == FN_LAST_DAY ? LType::DATE : LType::INT));
+    return;
+  }
+  if (f == "HOUR" || f == "MINUTE" || f == "SECOND" || f == "MICROSECOND") {
+    argc(1, 1);
+    uint16_t id = f == "HOUR" ? FN_DT_HOUR : f == "MINUTE" ? FN_DT_MINUTE : f == "SECOND" ? FN_DT_SECOND : FN_DT_MICRO;
+    finish(mkCall(id, {asDateTime(A[0])}, LType::INT));
+    return;
+  }
+  if (f == "DATE_TRUNC") {  // DATE_TRUNC('unit', x): SingleStore / PostgreSQL
+    argc(2, 2);
+    if (A[0]->kind != Expr::LIT || A[0]->lit.kind != Value::STR) throw SqlError("DATE_TRUNC needs a constant unit", 1235);
+    std::string u = upper(A[0]->lit.s);
+    const bool dt = A[1]->ty == LType::DATETIME;
+    static const std::map<std::string, int64_t> us = {{"MICROSECOND", 1}, {"MILLISECOND", 1000}, {"SECOND", 1000000ll},
+                                                       {"MINUTE", 60000000ll}, {"HOUR", 3600000000ll}};
+    if (us.count(u)) {
+      ExprP x = asDateTime(A[1]);
+      ExprP q = mkCall(FN_IDIV, {x, boundLit(Value::I(us.at(u)))}, LType::BIGINT);
+      finish(boundNode(Expr::BIN, "*", {q, boundLit(Value::I(us.at(u)))}, LType::DATETIME));
+      return;
+    }
+    ExprP d = asDate(A[1]);
+    ExprP r;
+    if (u == "DAY") r = d;
+    else if (u == "WEEK") {  // Monday-based weeks (day 0 = 1970-01-01, a Thursday)
+      ExprP shifted = boundNode(Expr::BIN, "+", {d, boundLit(Value::I(3))}, LType::BIGINT);
+      ExprP wk = mkCall(FN_IDIV, {shifted, boundLit(Value::I(7))}, LType::BIGINT);
+      r = boundNode(Expr::BIN, "-", {boundNode(Expr::BIN, "*", {wk, boundLit(Value::I(7))}, LType::BIGINT), boundLit(Value::I(3))}, LType::DATE);
+    } else if (u == "MONTH" || u == "YEAR") {
+      r = mkCall(FN_DATE_TRUNC_MONTH, {d, boundLit(Value::I(u == "YEAR"))}, LType::DATE);
+    } else {
+      throw SqlError("DATE_TRUNC unit '" + A[0]->lit.s + "' is not supported", 1235);
+    }
+    r->ty = LType::DATE;
+    finish(dt ? asDateTime(r) : r);
+    return;
+  }
+  if (f == "DATE") { argc(1, 1); finish(asDate(A[0])); return; }
+  if (f == "TIMESTAMP" || f == "DATETIME") { argc(1, 1); finish(asDateTime(A[0])); return; }
+  if (f == "FROM_DAYS") { argc(1, 1); finish(mkCall(FN_FROM_DAYS, {A[0]}, LType::DATE)); return; }
+  if (f == "UNIX_TIMESTAMP") { argc(1, 1); finish(mkCall(FN_DT_UNIX, {asDateTime(A[0])}, LType::BIGINT)); return; }
+  if (f == "FROM_UNIXTIME") { argc(1, 1); finish(mkCall(FN_UNIX_DT, {A[0]}, LType::DATETIME)); return; }
+  if (f == "DATEDIFF") {
+    argc(2, 2);
+    finish(boundNode(Expr::BIN, "-", {asDate(A[0]), asDate(A[1])}, LType::BIGINT));
+    return;
+  }
+  if (f == "DATE_ADD" || f == "ADDDATE" || f == "DATE_SUB" || f == "SUBDATE") {
+    argc(2, 2);
+    bool sub = f == "DATE_SUB" || f == "SUBDATE";
+    if (A[1]->kind == Expr::INTERVAL) e = intervalArith(A[0], sub ? -A[1]->lit.i : A[1]->lit.i, A[1]->op);
+    else e = intervalArith(A[0], 0, "DAY"), e = boundNode(Expr::BIN, sub ? "-" : "+", {e, A[1]}, e->ty);  // ADDDATE(d, n days)
+    return;
+  }
+  if (f == "TIMESTAMPDIFF") {
+    argc(2, 2);
+    const std::string u = e->castType;
+    static const std::map<std::string, int64_t> us = {{"MICROSECOND", 1}, {"SECOND", 1000000ll}, {"MINUTE", 60000000ll},
+                                                       {"HOUR", 3600000000ll}, {"DAY", kUsPerDay}, {"WEEK", 7 * kUsPerDay}};
+    if (us.count(u)) {
+      ExprP d = boundNode(Expr::BIN, "-", {asDateTime(A[1]), asDateTime(A[0])}, LType::BIGINT);
+      finish(mkCall(FN_IDIV, {d, boundLit(Value::I(us.at(u)))}, LType::BIGINT));
+    } else {  // MONTH / QUARTER / YEAR: calendar months between the dates
+      auto months = [&](const ExprP& x) {
+        ExprP d = asDate(x);
+        ExprP y = boundNode(Expr::FUNC, "YEAR", {d}, LType::INT);
+        return boundNode(Expr::BIN, "+", {boundNode(Expr::BIN, "*", {y, boundLit(Value::I(12))}, LType::BIGINT),
+                                          mkCall(FN_MONTH, {d}, LType::INT)}, LType::BIGINT);
+      };
+      ExprP m = boundNode(Expr::BIN, "-", {months(A[1]), months(A[0])}, LType::BIGINT);
+      int64_t div = u == "YEAR" ? 12 : u == "QUARTER" ? 3 : 1;
+      finish(div == 1 ? m : mkCall(FN_IDIV, {m, boundLit(Value::I(div))}, LType::BIGINT));
+    }
+    return;
+  }
+  if (f == "DIV") {  // a DIV b: integer division (truncating)
+    argc(2, 2);
+    finish(mkCall(FN_IDIV, {A[0], A[1]}, LType::BIGINT));
+    return;
+  }
+  if (f == "TIME_BUCKET") {  // TIME_BUCKET('5m', ts [, origin]): start of ts's bucket
+    argc(2, 3);
+    if (A[0]->kind != Expr::LIT || A[0]->lit.kind != Value::STR) throw SqlError("TIME_BUCKET needs a constant width such as '5m'", 1235);
+    const std::string w = A[0]->lit.s;
+    char* endp = nullptr;
+    const double num = std::strtod(w.c_str(), &endp);
+    std::string unit = lower(std::string(endp));
+    while (!unit.empty() && unit[0] == ' ') unit.erase(0, 1);
+    const int64_t us = unit == "us" ? 1 : unit == "ms" ? 1000 : unit == "s" ? 1000000 : unit == "m" ? 60000000ll
+                     : unit == "h" ? 3600000000ll : unit == "d" ? 86400000000ll : unit == "w" ? 604800000000ll : 0;
+    if (!us || num <= 0) throw SqlError("TIME_BUCKET width must look like '30s', '5m', '1h' or '1d'", 1235);
+    const int64_t width = (int64_t)std::llround(num * (double)us);
+    int64_t origin = 0;
+    if (n == 3) {
+      if (A[2]->kind != Expr::LIT) throw SqlError("TIME_BUCKET needs a constant origin", 1235);
+      if (A[2]->lit.kind == Value::STR) {
+        if (!parseDateTime(A[2]->lit.s, origin)) throw SqlError("bad TIME_BUCKET origin", 1292);
+      } else {
+        origin = A[2]->lit.kind == Value::DATE ? A[2]->lit.i * kUsPerDay : A[2]->lit.i;
+      }
+    }
+    ExprP ts = asDateTime(A[1]);
+    ExprP diff = boundNode(Expr::BIN, "-", {ts, boundLit(Value::I(origin))}, LType::BIGINT);
+    ExprP q = mkCall(FN_IDIV, {diff, boundLit(Value::I(width))}, LType::BIGINT);
+    ExprP start = boundNode(Expr::BIN, "+", {boundNode(Expr::BIN, "*", {q, boundLit(Value::I(width))}, LType::BIGINT), boundLit(Value::I(origin))},
+                            LType::DATETIME);
+    finish(start);
+    return;
+  }
+  if (f == "TIMESTAMPADD") {
+    argc(2, 2);
+    if (A[0]->kind != Expr::LIT) throw SqlError("TIMESTAMPADD needs a constant amount in this PoC", 1235);
+    e = intervalArith(A[1], (int64_t)A[0]->lit.num(), e->castType);
+    return;
+  }
+  if (f == "CAST") {
+    const std::string t = e->castType;
+    if (t == "SIGNED" || t == "UNSIGNED" || t == "INTEGER" || t == "INT" || t == "BIGINT") {
+      if (A[0]->ty == LType::VARCHAR) { finish(strToNum(A[0], c, true)); return; }
+      finish(A[0]->ty == LType::DOUBLE ? mkCall(FN_ROUND, {A[0]}, LType::BIGINT) : A[0]);
+      if (e->ty != LType::DOUBLE && e->kind != Expr::LIT) e->ty = LType::BIGINT;
+      return;
+    }
+    if (t == "DECIMAL" || t == "DOUBLE" || t == "FLOAT" || t == "REAL" || t == "NUMERIC") {
+      if (A[0]->ty == LType::VARCHAR) { finish(strToNum(A[0], c)); return; }
+      ExprP r = boundNode(Expr::BIN, "*", {A[0], boundLit(Value::D(1.0))}, LType::DOUBLE);
+      finish(r);
+      return;
+    }
+    if (t == "DATE") { finish(asDate(A[0])); return; }
+    if (t == "DATETIME" || t == "TIMESTAMP") { finish(asDateTime(A[0])); return; }
+    if (t == "CHAR" || t == "VARCHAR" || t == "TEXT" || t == "BINARY" || t == "NCHAR" || t == "JSON") {
+      if (A[0]->ty == LType::VARCHAR) { e = A[0]; return; }
+      e->op = "CASTCHAR";
+      e->ty = LType::VARCHAR;
+      e->bound = true;
+      if (allLits(e)) e = boundLit(evalConst(e));
+      else encodeStrings(e, c);
+      return;
+    }
+    throw SqlError("CAST to " + t + " is not supported here", 1235);
+  }
+  // Vector similarity (SingleStore): one VECTOR column against a constant vector.
+  if (f == "JSON_ARRAY_PACK" || f == "JSON_ARRAY_UNPACK" || f == "VECTOR" || f == "TO_VECTOR") {
+    argc(1, 1);
+    e = A[0];
+    return;
+  }
+  if (f == "DOT_PRODUCT" || f == "EUCLIDEAN_DISTANCE" || f == "VECTOR_DOT_PRODUCT") {
+    argc(2, 2);
+    ExprP col = A[0]->ty == LType::VECTOR ? A[0] : A[1], k = A[0]->ty == LType::VECTOR ? A[1] : A[0];
+    auto parseConst = [&](const ExprP& x, std::vector<float>& v) {
+      return x->kind == Expr::LIT && x->lit.kind == Value::STR && parseVector(x->lit.s, v);
+    };
+    std::vector<float> qa, qb;
+    if (parseConst(A[0], qa) && parseConst(A[1], qb)) {  // both constant
+      if (qa.size() != qb.size()) throw SqlError("vector dimensions differ", 1105);
+      double acc = 0;
+      for (size_t i = 0; i < qa.size(); ++i) acc += f == "EUCLIDEAN_DISTANCE" ? (qa[i] - qb[i]) * (qa[i] - qb[i]) : qa[i] * qb[i];
+      e = boundLit(Value::D(f == "EUCLIDEAN_DISTANCE" ? std::sqrt(acc) : acc));
+      return;
+    }
+    if (col->kind != Expr::COL || col->ty != LType::VECTOR || !parseConst(k, qa))
+      throw SqlError(f + "() needs a VECTOR column and a constant vector such as '[0.1, 0.2]'", 1235);
+    const int dim = c.tabs[col->bt]->cols[col->bc].vecDim;
+    if ((int)qa.size() != dim)
+      throw SqlError("vector has " + std::to_string(qa.size()) + " elements but the column is VECTOR(" + std::to_string(dim) + ")", 1105);
+    ExprP r = boundNode(Expr::FUNC, f == "EUCLIDEAN_DISTANCE" ? "#VEUC" : "#VDOT", {col}, LType::DOUBLE);
+    r->aux = std::make_shared<std::vector<double>>(qa.begin(), qa.end());
+    e = r;
+    return;
+  }
+  if (f == "VECTOR_NUM_ELEMENTS") {
+    argc(1, 1);
+    if (A[0]->kind != Expr::COL || A[0]->ty != LType::VECTOR) throw SqlError("VECTOR_NUM_ELEMENTS needs a VECTOR column", 1235);
+    e = boundLit(Value::I(c.tabs[A[0]->bt]->cols[A[0]->bc].vecDim));
+    return;
+  }
+  // String / JSON functions: host evaluated, encoded over the dictionary when possible.
+  static const std::map<std::string, LType> strFns = {
+      {"CONCAT", LType::VARCHAR}, {"CONCAT_WS", LType::VARCHAR}, {"UPPER", LType::VARCHAR}, {"UCASE", LType::VARCHAR},
+      {"LOWER", LType::VARCHAR}, {"LCASE", LType::VARCHAR}, {"SUBSTRING", LType::VARCHAR}, {"SUBSTR", LType::VARCHAR},
+      {"MID", LType::VARCHAR}, {"LEFT", LType::VARCHAR}, {"RIGHT", LType::VARCHAR}, {"TRIM", LType::VARCHAR},
+      {"LTRIM", LType::VARCHAR}, {"RTRIM", LType::VARCHAR}, {"REPLACE", LType::VARCHAR}, {"REVERSE", LType::VARCHAR},
+      {"LPAD", LType::VARCHAR}, {"RPAD", LType::VARCHAR}, {"REPEAT", LType::VARCHAR}, {"SPACE", LType::VARCHAR},
+      {"SUBSTRING_INDEX", LType::VARCHAR}, {"FORMAT", LType::VARCHAR}, {"DATE_FORMAT", LType::VARCHAR},
+      {"TIME_FORMAT", LType::VARCHAR}, {"DAYNAME", LType::VARCHAR}, {"MONTHNAME", LType::VARCHAR}, {"HEX", LType::VARCHAR},
+      {"JSON_EXTRACT_STRING", LType::VARCHAR}, {"JSON_EXTRACT_JSON", LType::VARCHAR}, {"JSON_EXTRACT", LType::VARCHAR},
+      {"JSON_UNQUOTE", LType::VARCHAR}, {"JSON_ARRAY", LType::VARCHAR}, {"JSON_OBJECT", LType::VARCHAR}, {"JSON_QUOTE", LType::VARCHAR},
+      {"UUID", LType::VARCHAR}, {"ELT", LType::VARCHAR}, {"REGEXP_REPLACE", LType::VARCHAR},
+      {"LENGTH", LType::BIGINT}, {"OCTET_LENGTH", LType::BIGINT}, {"CHAR_LENGTH", LType::BIGINT},
+      {"CHARACTER_LENGTH", LType::BIGINT}, {"LOCATE", LType::BIGINT}, {"POSITION", LType::BIGINT}, {"INSTR", LType::BIGINT},
+      {"ASCII", LType::BIGINT}, {"STRCMP", LType::BIGINT}, {"FIELD", LType::BIGINT}, {"JSON_EXTRACT_BIGINT", LType::BIGINT},
+      {"JSON_LENGTH", LType::BIGINT}, {"REGEXP_LIKE", LType::INT}, {"RLIKE", LType::INT}, {"REGEXP", LType::INT},
+      {"JSON_EXTRACT_DOUBLE", LType::DOUBLE}, {"MATCH_AGAINST", LType::DOUBLE},
+      {"REGEXP_SUBSTR", LType::VARCHAR}, {"REGEXP_INSTR", LType::BIGINT},
+      {"SHA2", LType::VARCHAR}, {"MD5", LType::VARCHAR}, {"SHA1", LType::VARCHAR}, {"SHA", LType::VARCHAR}, {"TO_BASE64", LType::VARCHAR}, {"FROM_BASE64", LType::VARCHAR}, {"CRC32", LType::BIGINT}, {"BIT_COUNT", LType::BIGINT}, {"RAND", LType::DOUBLE},
+      {"CONVERT_TZ", LType::DATETIME}, {"GEOGRAPHY_POINT", LType::VARCHAR}, {"GEOGRAPHY_DISTANCE", LType::DOUBLE},
+      {"GEOGRAPHY_WITHIN_DISTANCE", LType::INT}, {"GEOGRAPHY_CONTAINS", LType::INT}, {"GEOGRAPHY_INTERSECTS", LType::INT},
+      {"GEOGRAPHY_LONGITUDE", LType::DOUBLE}, {"GEOGRAPHY_LATITUDE", LType::DOUBLE}};
+  if (f == "#UDF") {  // stored function with a procedural body over columns (proc.cpp inlineUdf)
+    const std::string t = A[1]->lit.s.substr(0, A[1]->lit.s.find('#'));
+    e->ty = t == "BIGINT" ? LType::BIGINT : t == "DOUBLE" || t == "DECIMAL" ? LType::DOUBLE : t == "DATE" ? LType::DATE
+          : t == "DATETIME" ? LType::DATETIME : LType::VARCHAR;
+    e->bound = true;
+    encodeStrings(e, c);
+    return;
+  }
+  if (strFns.count(f)) {
+    e->ty = strFns.at(f);
+    e->bound = true;
+    if (f == "JSON_ARRAY" || f == "JSON_OBJECT") {  // which arguments already are JSON (embedded, not quoted)
+      e->name.clear();
+      for (auto& x : A) e->name += isJsonExpr(x, &c) ? '1' : '0';
+    }
+    const bool volatileFn = f == "UUID" || f == "RAND";
+    if (!volatileFn && allLits(e)) { e = boundLit(evalConst(e)); return; }
+    if (!volatileFn) encodeStrings(e, c);
+    return;
+  }
+  throw SqlError("FUNCTION gpudb." + f + " does not exist", 1305);
+}
+
+// A string expression as a number (MySQL's implicit / CAST conversion): evaluated once per
+// dictionary entry; literals are converted right away.
+ExprP strToNum(const ExprP& x, BindCtx& c, bool integer) {
+  if (x->kind == Expr::LIT && x->lit.kind == Value::STR)
+    return boundLit(integer ? Value::I(std::strtoll(x->lit.s.c_str(), nullptr, 10)) : Value::D(std::strtod(x->lit.s.c_str(), nullptr)));
+  ExprP n = boundNode(Expr::FUNC, integer ? "CASTINT" : "CASTNUM", {x}, integer ? LType::BIGINT : LType::DOUBLE);
+  encodeStrings(n, c);
+  return n;
+}
+
+void bind(ExprP& e, BindCtx& c) {
+  if (e->bound) return;
+  switch (e->kind) {
+    case Expr::COL: {
+      int found = 0;
+      for (size_t t = 0; t < c.tabs.size(); ++t) {
+        if (!e->table.empty() && strcasecmp(e->table.c_str(), c.aliases[t].c_str()) != 0 &&
+            strcasecmp(e->table.c_str(), c.tabs[t]->name.c_str()) != 0)
+          continue;
+        int ci = c.tabs[t]->colIndex(e->name);
+        if (ci < 0) continue;
+        if (found && e->table.empty() && t < c.usingCols.size() &&
+            std::any_of(c.usingCols[t].begin(), c.usingCols[t].end(), [&](const std::string& u) { return strcasecmp(u.c_str(), e->name.c_str()) == 0; }))
+          continue;  // USING column: the earlier table's copy (equal by the join condition)
+        if (found++) throw SqlError("Column '" + e->name + "' in field list is ambiguous", 1052);
+        e->bt = (int)t;
+        e->bc = ci;
+        e->ty = c.tabs[t]->cols[ci].lt;
+        e->scale = e->ty == LType::DECIMAL ? c.tabs[t]->cols[ci].scale : -1;
+      }
+      if (!found) throw SqlError("Unknown column '" + e->str() + "' in 'field list'", 1054);
+      break;
+    }
+    case Expr::LIT:
+      if (e->lit.kind == Value::DBL && e->lit.scale >= 0) {  // exact decimal literal
+        e->ty = LType::DECIMAL;
+        e->scale = e->lit.scale;
+        break;
+      }
+      e->ty = e->lit.kind == Value::INT ? LType::BIGINT : e->lit.kind == Value::DBL ? LType::DOUBLE
+            : e->lit.kind == Value::DATE ? LType::DATE : e->lit.kind == Value::DATETIME ? LType::DATETIME : LType::VARCHAR;
+      break;
+    case Expr::INTERVAL: e->ty = LType::BIGINT; break;
+    case Expr::STAR: e->ty = LType::BIGINT; break;
+    case Expr::BIN: {
+      bindChildren(e, c);
+      ExprP& a = e->args[0];
+      ExprP& b = e->args[1];
+      if ((e->op == "+" || e->op == "-") && (a->kind == Expr::INTERVAL || b->kind == Expr::INTERVAL)) {
+        ExprP iv = a->kind == Expr::INTERVAL ? a : b;
+        ExprP dt = a->kind == Expr::INTERVAL ? b : a;
+        e = intervalArith(dt, e->op == "-" ? -iv->lit.i : iv->lit.i, iv->op);
+        return;
+      }
+      if (isCmp(e->op)) {
+        // Coerce string literals compared with DATE / DATETIME values, and DATE vs DATETIME.
+        for (int i = 0; i < 2; ++i) {
+          ExprP& x = e->args[i];
+          ExprP& y = e->args[1 - i];
+          if ((y->ty == LType::DATE || y->ty == LType::DATETIME) && x->kind == Expr::LIT && x->lit.kind == Value::STR)
+            x = coerceTemporal(x, y->ty);
+        }
+        if ((a->ty == LType::DATE && b->ty == LType::DATETIME) || (a->ty == LType::DATETIME && b->ty == LType::DATE)) {
+          a = asDateTime(a);
+          b = asDateTime(b);
+        }
+        // string vs number compares as numbers (MySQL)
+        auto numeric = [](LType t) { return t == LType::INT || t == LType::BIGINT || t == LType::DOUBLE || t == LType::DECIMAL; };
+        for (int i = 0; i < 2; ++i) {
+          ExprP& x = e->args[i];
+          const ExprP& y = e->args[1 - i];
+          if (x->ty == LType::VARCHAR && !isNullLit(x) && numeric(y->ty) && !(y->kind == Expr::LIT && y->lit.kind == Value::STR)) x = strToNum(x, c);
+        }
+        e->ty = LType::INT;
+      } else if (e->op == "AND" || e->op == "OR") {
+        e->ty = LType::INT;
+      } else {
+        for (int i = 0; i < 2; ++i)  // MySQL converts numeric-looking string literals in arithmetic
+          if (e->args[i]->kind == Expr::LIT && e->args[i]->lit.kind == Value::STR)
+            e->args[i] = boundLit(Value::D(std::atof(e->args[i]->lit.s.c_str())));
+        for (int i = 0; i < 2; ++i)  // string columns / expressions in arithmetic: as numbers (MySQL)
+          if (e->args[i]->ty == LType::VARCHAR && !isNullLit(e->args[i])) e->args[i] = strToNum(e->args[i], c);
+        auto numTy = [](LType t) { return t == LType::INT || t == LType::BIGINT || t == LType::DECIMAL; };
+        if (a->ty == LType::DOUBLE || b->ty == LType::DOUBLE) e->ty = LType::DOUBLE;
+        else if (e->op == "/") {  // exact numbers divide to DECIMAL with 4 more digits (div_precision_increment)
+          e->ty = numTy(a->ty) && numTy(b->ty) ? LType::DECIMAL : LType::DOUBLE;
+          if (e->ty == LType::DECIMAL) e->scale = std::min(30, std::max(0, (int)a->scale) + 4);
+        } else if (a->ty == LType::DECIMAL || b->ty == LType::DECIMAL) {
+          e->ty = LType::DECIMAL;
+          const int sa = std::max(0, (int)a->scale), sb = std::max(0, (int)b->scale);
+          e->scale = e->op == "*" ? std::min(9, sa + sb) : std::max(sa, sb);
+        }
+        else if ((a->ty == LType::DATETIME) != (b->ty == LType::DATETIME) && (e->op == "+" || e->op == "-")) e->ty = LType::DATETIME;
+        else if ((a->ty == LType::DATE) != (b->ty == LType::DATE) && (e->op == "+" || e->op == "-")) e->ty = LType::DATE;
+        else e->ty = LType::BIGINT;
+      }
+      break;
+    }
+    case Expr::UNARY:
+      bindChildren(e, c);
+      e->ty = e->op == "NOT" ? LType::INT : e->args[0]->ty;
+      break;
+    case Expr::BETWEEN: {
+      ExprP r = mkBin("AND", mkBin(">=", e->args[0], e->args[1]), mkBin("<=", e->args[0], e->args[2]));
+      if (e->neg) {
+        auto n = std::make_shared<Expr>();
+        n->kind = Expr::UNARY;
+        n->op = "NOT";
+        n->args = {r};
+        r = n;
+      }
+      e = r;
+      bind(e, c);
+      return;
+    }
+    case Expr::INLIST: {
+      bindChildren(e, c);
+      if (e->args[0]->ty == LType::VARCHAR) {
+        for (size_t i = 1; i < e->args.size(); ++i)
+          if (e->args[i]->kind != Expr::LIT || e->args[i]->lit.kind != Value::STR)
+            throw SqlError("IN list on strings must contain string literals", 1235);
+        e->ty = LType::INT;
+        break;
+      }
+      // Long literal lists: a sorted set probed by binary search on the GPU (an OR chain of
+      // thousands of equalities would not fit the bytecode).
+      bool allNum = e->args.size() > 9;
+      for (size_t i = 1; i < e->args.size() && allNum; ++i) {
+        const ExprP& a = e->args[i];
+        allNum = a->kind == Expr::LIT && !a->lit.isNull() && (a->lit.kind == Value::INT || a->lit.kind == Value::DBL || a->lit.kind == Value::DATE) &&
+                 std::fabs(a->lit.num()) < 9007199254740992.0;
+      }
+      if (allNum) {
+        auto vals = std::make_shared<std::vector<double>>();
+        for (size_t i = 1; i < e->args.size(); ++i) vals->push_back(e->args[i]->lit.num());
+        std::sort(vals->begin(), vals->end());
+        vals->erase(std::unique(vals->begin(), vals->end()), vals->end());
+        auto f = std::make_shared<Expr>();
+        f->kind = Expr::FUNC;
+        f->op = "#INSORTED";
+        f->args = {e->args[0]};
+        f->aux = vals;
+        ExprP r = f;
+        if (e->neg) {
+          auto n = std::make_shared<Expr>();
+          n->kind = Expr::UNARY;
+          n->op = "NOT";
+          n->args = {f};
+          r = n;
+        }
+        e = r;
+        bind(e, c);
+        return;
+      }
+      ExprP r;
+      for (size_t i = 1; i < e->args.size(); ++i) {
+        ExprP eq = mkBin("=", e->args[0], e->args[i]);
+        r = r ? mkBin("OR", r, eq) : eq;
+      }
+      if (e->neg) {
+        auto n = std::make_shared<Expr>();
+        n->kind = Expr::UNARY;
+        n->op = "NOT";
+        n->args = {r};
+        r = n;
+      }
+      e = r;
+      bind(e, c);
+      return;
+    }
+    case Expr::LIKE:
+      bindChildren(e, c);
+      if (isNullLit(e->args[1]) || isNullLit(e->args[0])) {  // x LIKE NULL is NULL
+        e = boundLit(Value::Null());
+        e->ty = LType::INT;
+        return;
+      }
+      if (e->args[1]->kind != Expr::LIT || e->args[1]->lit.kind != Value::STR)
+        throw SqlError("LIKE pattern must be a string literal", 1235);
+      e->ty = LType::INT;
+      break;
+    case Expr::CASE: {
+      bindChildren(e, c);
+      e->ty = LType::BIGINT;
+      for (size_t i = 1; i < e->args.size(); i += (i + 1 < e->args.size() ? 2 : 1)) {
+        if (isNullLit(e->args[i])) continue;
+        LType t = e->args[i]->ty;
+        if (t == LType::DOUBLE) e->ty = LType::DOUBLE;
+        else if (t == LType::VARCHAR || t == LType::DATE || t == LType::DATETIME) e->ty = t;
+      }
+      if (e->args.size() % 2 && !isNullLit(e->args.back()) && e->args.back()->ty == LType::DOUBLE) e->ty = LType::DOUBLE;
+      if (e->ty == LType::VARCHAR) {
+        e->bound = true;
+        unifyStrings(e, c);
+        return;
+      }
+      break;
+    }
+    case Expr::FUNC: {
+      if (isAggName(e->op)) {
+        if (c.inAgg) throw SqlError("Invalid use of group function", 1111);
+        if (e->distinct && e->op != "COUNT") throw SqlError("internal: DISTINCT aggregate reached the binder", 1105);
+        if (e->args.size() != 1) throw SqlError("Incorrect parameter count in the call to " + e->op, 1582);
+        c.inAgg = true;
+        if (e->args[0]->kind != Expr::STAR) bind(e->args[0], c);
+        c.inAgg = false;
+        LType at = e->args[0]->ty;
+        if (e->op == "COUNT") e->ty = LType::BIGINT;
+        else if (e->op == "AVG")  // of exact numbers: DECIMAL with 4 more digits (MySQL)
+          e->ty = at == LType::INT || at == LType::BIGINT || at == LType::DECIMAL ? LType::DECIMAL : LType::DOUBLE;
+        else if (e->op == "SUM") e->ty = at == LType::DOUBLE ? LType::DOUBLE : at == LType::DECIMAL ? LType::DECIMAL : LType::BIGINT;
+        else e->ty = at;
+        if (e->ty == LType::DECIMAL) e->scale = e->op == "AVG" ? std::min(30, std::max(0, (int)e->args[0]->scale) + 4) : e->args[0]->scale;
+        if (e->op != "COUNT" && e->args[0]->kind == Expr::STAR) throw SqlError("Invalid use of '*'", 1064);
+        if ((e->op == "MIN" || e->op == "MAX") && at == LType::VARCHAR) {
+          // Aggregate each string's rank in sorted order; the rank decodes through a sorted dictionary.
+          Dict* d = c.dict(*e->args[0]);
+          if (!d) throw SqlError(e->op + "() on this string expression is not supported", 1235);
+          auto sd = sortedDict(*d);  // cached per dictionary version
+          ExprP m = boundNode(Expr::FUNC, "#MAP", {e->args[0]}, LType::BIGINT);
+          m->aux = sd.second;
+          e->args[0] = m;
+          e->ty = LType::VARCHAR;
+          c.exprDict[e.get()] = d;
+          c.unrank[e.get()] = sd.first;
+          break;
+        }
+        if ((e->op == "SUM" || e->op == "AVG") && at == LType::VARCHAR)
+          throw SqlError(e->op + "() on strings is not supported", 1235);
+        break;
+      }
+      bindFunc(e, c);
+      return;
+    }
+  }
+  e->bound = true;
+}
+
+// Can the expression evaluate to NULL? (Conservative: columns that ever held a NULL, NULL literals,
+// division, and functions with domain errors.)
+bool nullable(const ExprP& e, const BindCtx& c) {
+  switch (e->kind) {
+    case Expr::COL: return e->bt >= 0 && (c.tabs[e->bt]->hasNull[e->bc] || c.outerTabs.count(e->bt));
+    case Expr::LIT: return e->lit.isNull();
+    case Expr::STAR: return false;
+    default: break;
+  }
+  if (e->kind == Expr::FUNC) {
+    if (e->op == "ISNULL" || e->op == "ISNOTNULL") return false;
+    if (e->op == "COALESCE2") return nullable(e->args[0], c) && nullable(e->args[1], c);
+    if (e->op == "NULLIF" || e->fnId >= 0 || e->op.rfind("#ENC", 0) == 0) return true;
+  }
+  if (e->kind == Expr::BIN && (e->op == "/" || e->op == "%")) return true;
+  if (e->kind == Expr::CASE && e->args.size() % 2 == 0) return true;  // no ELSE
+  for (auto& a : e->args)
+    if (nullable(a, c)) return true;
+  return false;
+}
+
+void tablesOf(const ExprP& e, std::set<int>& out) {
+  if (e->kind == Expr::COL) out.insert(e->bt);
+  for (auto& a : e->args) tablesOf(a, out);
+}
+void colsOf(const ExprP& e, std::set<std::pair<int, int>>& out) {
+  if (!e) return;
+  if (e->kind == Expr::COL) out.insert({e->bt, e->bc});
+  for (auto& a : e->args) colsOf(a, out);
+}
+void flattenAnd(const ExprP& e, std::vector<ExprP>& out) {
+  if (!e) return;
+  if (e->kind == Expr::BIN && e->op == "AND") {
+    flattenAnd(e->args[0], out);
+    flattenAnd(e->args[1], out);
+  } else {
+    out.push_back(e);
+  }
+}
+ExprP andAll(const std::vector<ExprP>& v) {
+  ExprP r;
+  for (auto& x : v) {
+    if (!r) { r = x; continue; }
+    r = mkBin("AND", r, x);
+    r->ty = LType::INT;
+    r->bound = true;
+  }
+  return r;
+}
+
+// ================================================================== bytecode compiler
+
+// Per-thread device flag for overflowing compiled int64 arithmetic (ExprEnv::ovf).
+int* ovfFlagDev() {
+  thread_local int* p = nullptr;
+  if (!p) {
+    cudaMalloc(&p, sizeof(int));
+    cudaMemset(p, 0, sizeof(int));
+  }
+  return p;
+}
+
+struct Compiler {
+  BindCtx* ctx;
+  ExprEnv env;
+  int ncode = 0, nconst = 0, depth = 0;
+  std::map<std::pair<int, int>, int> slotOf;
+  std::vector<std::pair<int, int>> slotCols;
+  std::vector<std::vector<uint32_t>> setsHost;
+  std::vector<DevVec<uint32_t>> setsDev;
+  // Optional override: emits code for `e` and returns true (used to compile post-aggregation
+  // expressions over grouped results, where group keys and aggregates are the columns).
+  std::function<bool(const ExprP&)> hook;
+
+  explicit Compiler(BindCtx* c) : ctx(c) { memset(&env, 0, sizeof env); }
+
+  void emit(uint8_t op, int arg, int stackDelta, bool isInt = false) {
+    if (ncode >= kMaxCode) throw SqlError("expression too complex", 1105);
+    env.code[ncode++] = Instr{op, (uint8_t)isInt, (uint16_t)arg};
+    depth += stackDelta;
+    if (depth > kMaxStack) throw SqlError("expression too deeply nested", 1105);
+  }
+  // Integer constants (OP_CONST with isInt) keep their exact 64-bit pattern in the double slot;
+  // the interpreter and generated code decode it (BIGINT literals above 2^53 stay exact).
+  int constantInt(int64_t v) {
+    double d;
+    memcpy(&d, &v, 8);
+    for (int i = 0; i < nconst; ++i)
+      if (memcmp(&env.consts[i], &d, 8) == 0) return i;
+    if (nconst >= kMaxConsts) throw SqlError("too many constants in query", 1105);
+    env.consts[nconst] = d;
+    return nconst++;
+  }
+  int constant(double v) {
+    for (int i = 0; i < nconst; ++i)
+      if (env.consts[i] == v) return i;
+    if (nconst >= kMaxConsts) throw SqlError("too many constants in query", 1105);
+    env.consts[nconst] = v;
+    return nconst++;
+  }
+  int slot(int bt, int bc) {
+    auto it = slotOf.find({bt, bc});
+    if (it != slotOf.end()) return it->second;
+    int s = (int)slotCols.size();
+    if (s >= kMaxCols) throw SqlError("too many columns referenced", 1105);
+    slotOf[{bt, bc}] = s;
+    slotCols.push_back({bt, bc});
+    // Typed codegen needs the type up front; integer columns that have ever held a NULL use the
+    // NULL-aware variants (3/4) so columns without NULLs keep the plain int64 fast path.
+    const Table& tb = *ctx->tabs[bt];
+    const uint8_t pt = (uint8_t)tb.cols[bc].pt;
+    const bool nul = tb.hasNull[bc] || ctx->outerTabs.count(bt);
+    const bool dec = tb.cols[bc].lt == LType::DECIMAL;
+    env.cols[s] = ColView{nullptr, (uint8_t)(pt == (uint8_t)PType::VEC ? 5 : dec ? 6 : nul && pt != (uint8_t)PType::F64 ? pt + 3 : pt),
+                          (uint8_t)(dec ? tb.cols[bc].scale : 0)};
+    // Codegen hint: generate the decoding branch only for columns with compressed segments (each
+    // such branch makes NVRTC version the loop; many of them blow up compile time).
+    for (auto& sg : tb.segs)
+      if ((int)sg->enc.size() > bc && sg->enc[bc]) { env.cols[s].enc = sg->enc[bc]; break; }
+    return s;
+  }
+  std::vector<const uint32_t*> extSets;  // bitmaps already in VRAM (join filters), by set index
+  std::vector<const std::vector<double>*> mapIds;  // value table per OP_DICTMAP / OP_INSORTED slot
+  std::vector<DevVec<double>> mapsDev;
+  std::vector<std::shared_ptr<void>> keepAlive;  // cached device copies this query uses
+  std::vector<std::shared_ptr<std::vector<double>>> keepMaps;  // maps referenced only by this compiler
+  int addMap(const std::vector<double>* m) {
+    for (size_t i = 0; i < mapIds.size(); ++i)
+      if (mapIds[i] == m) return (int)i;
+    if ((int)mapIds.size() >= kMaxSets) throw SqlError("too many encoded expressions / IN subqueries in one query", 1105);
+    mapIds.push_back(m);
+    env.mapSize[mapIds.size() - 1] = (int32_t)m->size();
+    return (int)mapIds.size() - 1;
+  }
+  int addSet(std::vector<uint32_t> bits, int nbits) {
+    if ((int)setsHost.size() >= kMaxSets) throw SqlError("too many string predicates", 1105);
+    env.setSize[setsHost.size()] = nbits;
+    setsHost.push_back(std::move(bits));
+    extSets.push_back(nullptr);
+    return (int)setsHost.size() - 1;
+  }
+  int addDeviceSet(const uint32_t* devBits, int nbits) {
+    int i = addSet({}, nbits);
+    extSets[i] = devBits;
+    return i;
+  }
+  // Bitmap of the dictionary entries satisfying pred (evaluated once per entry, on all cores).
+  int dictSet(const Dict& d, const std::function<bool(const std::string&)>& pred, const std::string& cacheKey = "") {
+    if (!cacheKey.empty()) {  // cached bitmap (and its device copy) for this dictionary version
+      const std::string key = derivKey(d, cacheKey);
+      DictDerived e;
+      if (!derivGet(d, key, e)) {
+        DictDerived stale;
+        size_t from = derivGetStale(d, key, stale) && stale.bits ? stale.n & ~(size_t)31 : 0;  // whole words
+        e = DictDerived{};
+        e.d = &d;
+        e.n = d.strs.size();
+        e.bits = std::make_shared<std::vector<uint32_t>>((d.strs.size() + 31) / 32 + 1, 0);
+        auto& bits = *e.bits;
+        if (from) std::copy(stale.bits->begin(), stale.bits->begin() + from / 32, bits.begin());
+        parallelFor(d.strs.size() - from, [&, from](size_t b, size_t en) {
+          b += from, en += from;
+          for (size_t i = b; i < en; ++i)
+            if (pred(d.strs[i])) bits[i >> 5] |= 1u << (i & 31);
+        });
+        e.bitsDev = std::make_shared<DevVec<uint32_t>>((int64_t)bits.size());
+        h2d(e.bitsDev->p, bits.data(), bits.size() * 4);
+        derivPut(key, e);
+      }
+      keepAlive.push_back(e.bitsDev);
+      int i = addSet(*e.bits, (int)d.strs.size());
+      extSets[i] = e.bitsDev->p;
+      return i;
+    }
+    std::vector<uint32_t> bits((d.strs.size() + 31) / 32 + 1, 0);
+    parallelFor(d.strs.size(), [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; ++i)
+        if (pred(d.strs[i])) bits[i >> 5] |= 1u << (i & 31);
+    });
+    return addSet(std::move(bits), (int)d.strs.size());
+  }
+
+  Prog compile(const ExprP& e) {
+    Prog p;
+    p.start = (int16_t)ncode;
+    depth = 0;
+    gen(e);
+    p.len = (int16_t)(ncode - p.start);
+    return p;
+  }
+
+  void strCompare(const std::string& op, const ExprP& col, const std::string& lit) {
+    Dict& d = *ctx->dict(*col);
+    if ((op == "=" || op == "<>") && ciColl()) {  // every case variant of the literal
+      const std::string f = foldCase(lit);
+      int s = dictSet(d, [&](const std::string& v) { return foldCase(v) == f; });
+      gen(col);
+      emit(OP_INSET, s, 0);
+      if (op == "<>") emit(OP_NOT, 0, 0);
+      return;
+    }
+    if (op == "=" || op == "<>") {
+      gen(col);
+      emit(OP_CONST, constantInt(d.find(lit)), 1, true);
+      emit(op == "=" ? OP_EQ : OP_NE, 0, -1);
+      return;
+    }
+    int s = dictSet(d, [&](const std::string& v) {
+      int c = collCmp(v, lit);
+      return op == "<" ? c < 0 : op == "<=" ? c <= 0 : op == ">" ? c > 0 : c >= 0;
+    });
+    gen(col);
+    emit(OP_INSET, s, 0);
+  }
+
+  void gen(const ExprP& e) {
+    if (hook && hook(e)) return;
+    switch (e->kind) {
+      case Expr::COL:
+        if (e->ty == LType::VECTOR) throw SqlError("VECTOR values are only usable through vector functions on the GPU", 1235);
+        emit(OP_COL, slot(e->bt, e->bc), 1);
+        return;
+      case Expr::LIT:
+        if (e->lit.kind == Value::STR) throw SqlError("string literal '" + e->lit.s + "' used in a numeric context", 1235);
+        if (e->lit.kind == Value::INT || e->lit.kind == Value::DATE) emit(OP_CONST, constantInt(e->lit.i), 1, true);
+        else emit(OP_CONST, constant(e->lit.num()), 1, false);
+        return;
+      case Expr::BIN: {
+        const ExprP& a = e->args[0];
+        const ExprP& b = e->args[1];
+        if (isCmp(e->op) && (isNullLit(a) || isNullLit(b))) {  // x = NULL is NULL
+          emit(OP_CONST, constant(nullv()), 1);
+          return;
+        }
+        if (isCmp(e->op) && (a->ty == LType::VARCHAR || b->ty == LType::VARCHAR)) {
+          static const std::map<std::string, std::string> flip = {{"=", "="}, {"<>", "<>"}, {"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}};
+          if (ctx->dict(*a) && b->kind == Expr::LIT && b->lit.kind == Value::STR) return strCompare(e->op, a, b->lit.s);
+          if (ctx->dict(*b) && a->kind == Expr::LIT && a->lit.kind == Value::STR) return strCompare(flip.at(e->op), b, a->lit.s);
+          if (ctx->dict(*a) && ctx->dict(*a) == ctx->dict(*b) && (e->op == "=" || e->op == "<>")) {
+            auto canon = ciColl() ? ciCanon(*ctx->dict(*a)) : nullptr;
+            gen(a);
+            if (canon) emit(OP_DICTMAP, addMap(canon.get()), 0), keepMaps.push_back(canon);
+            gen(b);
+            if (canon) emit(OP_DICTMAP, addMap(canon.get()), 0);
+            emit(e->op == "=" ? OP_EQ : OP_NE, 0, -1);
+            return;
+          }
+          if (ctx->dict(*a) && ctx->dict(*b)) {  // columns with different dictionaries: both to ranks in their union
+            auto [ma, mb] = crossRank(*ctx->dict(*a), *ctx->dict(*b));
+            gen(a);
+            emit(OP_DICTMAP, addMap(ma.get()), 0);
+            gen(b);
+            emit(OP_DICTMAP, addMap(mb.get()), 0);
+            keepMaps.push_back(ma);
+            keepMaps.push_back(mb);
+            static const std::map<std::string, Op> cmp = {{"=", OP_EQ}, {"<>", OP_NE}, {"<", OP_LT}, {"<=", OP_LE}, {">", OP_GT}, {">=", OP_GE}};
+            emit(cmp.at(e->op), 0, -1);
+            return;
+          }
+          throw SqlError("unsupported string comparison: " + e->str(), 1235);
+        }
+        gen(a);
+        gen(b);
+        static const std::map<std::string, Op> ops = {
+            {"+", OP_ADD}, {"-", OP_SUB}, {"*", OP_MUL}, {"/", OP_DIV}, {"%", OP_MOD}, {"=", OP_EQ}, {"<>", OP_NE},
+            {"<", OP_LT}, {"<=", OP_LE}, {">", OP_GT}, {">=", OP_GE}, {"AND", OP_AND}, {"OR", OP_OR}};
+        emit(ops.at(e->op), 0, -1);
+        return;
+      }
+      case Expr::UNARY:
+        gen(e->args[0]);
+        emit(e->op == "NOT" ? OP_NOT : OP_NEG, 0, 0);
+        return;
+      case Expr::INLIST: {
+        if (!ctx->dict(*e->args[0])) throw SqlError("IN on this string expression can't run on the GPU", 1235);
+        Dict& d = *ctx->dict(*e->args[0]);
+        std::set<std::string> vals;
+        const bool ci = ciColl();
+        for (size_t i = 1; i < e->args.size(); ++i) vals.insert(ci ? foldCase(e->args[i]->lit.s) : e->args[i]->lit.s);
+        int s = dictSet(d, [&](const std::string& v) { return vals.count(ci ? foldCase(v) : v) > 0; });
+        gen(e->args[0]);
+        emit(OP_INSET, s, 0);
+        if (e->neg) emit(OP_NOT, 0, 0);
+        return;
+      }
+      case Expr::LIKE: {
+        if (e->args[0]->ty != LType::VARCHAR || !ctx->dict(*e->args[0]))
+          throw SqlError("LIKE on this expression can't run on the GPU", 1235);
+        const std::string pat = e->args[1]->lit.s;
+        const bool ci = ciColl();
+        const std::string fp = ci ? foldCase(pat) : pat;
+        const auto m = likeMatcher(fp);
+        int s = dictSet(*ctx->dict(*e->args[0]), [&](const std::string& v) { return ci ? m(foldCase(v)) : m(v); }, "LIKE|" + pat);
+        gen(e->args[0]);
+        emit(OP_INSET, s, 0);
+        if (e->neg) emit(OP_NOT, 0, 0);
+        return;
+      }
+      case Expr::CASE: genCase(e, 0); return;
+      case Expr::FUNC:
+        if (e->op == "YEAR") {
+          gen(e->args[0]);
+          emit(OP_YEAR, 0, 0);
+          return;
+        }
+        if (e->op == "ISNULL" || e->op == "ISNOTNULL") {
+          gen(e->args[0]);
+          emit(OP_ISNULL, 0, 0);
+          if (e->op == "ISNOTNULL") emit(OP_NOT, 0, 0);
+          return;
+        }
+        if (e->op == "COALESCE2" || e->op == "NULLIF") {
+          gen(e->args[0]);
+          gen(e->args[1]);
+          emit(e->op == "NULLIF" ? OP_NULLIF : OP_COALESCE, 0, -1);
+          return;
+        }
+        if (e->op.rfind("#ENC", 0) == 0) {  // encoded expression: compile its GPU form
+          gen(e->args[0]);
+          return;
+        }
+        if (e->op == "#VDOT" || e->op == "#VEUC") {
+          const ExprP& c = e->args[0];
+          const int sl = slot(c->bt, c->bc), m = addMap(e->aux.get());
+          emit(e->op == "#VDOT" ? OP_VDOT : OP_VEUC, sl | (m << 8), 1);
+          return;
+        }
+        if (e->op == "#RAW") {  // stored integer of a DECIMAL column (exact sums)
+          emit(OP_COLRAW, slot(e->args[0]->bt, e->args[0]->bc), 1, !nullable(e->args[0], *ctx));
+          return;
+        }
+        if (e->op == "#MAP" || e->op == "#INSORTED") {
+          gen(e->args[0]);
+          emit(e->op == "#MAP" ? OP_DICTMAP : OP_INSORTED, addMap(e->aux.get()), 0);
+          return;
+        }
+        if (e->fnId >= 0) {
+          for (auto& a : e->args) gen(a);
+          emit(e->args.size() == 1 ? OP_CALL1 : OP_CALL2, e->fnId, 1 - (int)e->args.size());
+          return;
+        }
+        if (isAggName(e->op)) throw SqlError("aggregate in an invalid position: " + e->str(), 1111);
+        throw SqlError("cannot run " + e->op + "() on the GPU", 1235);
+      default: throw SqlError("cannot compile expression: " + e->str(), 1235);
+    }
+  }
+  void genCase(const ExprP& e, size_t i) {
+    if (i + 1 >= e->args.size()) {
+      if (i < e->args.size()) gen(e->args[i]);
+      else emit(OP_CONST, constantInt(0), 1, true);
+      return;
+    }
+    if (e->args[i + 1]->ty == LType::VARCHAR) throw SqlError("CASE returning strings is not supported", 1235);
+    gen(e->args[i]);
+    gen(e->args[i + 1]);
+    genCase(e, i + 2);
+    emit(OP_SELECT, 0, -2);
+  }
+
+  void uploadSets() {
+    env.ovf = ovfFlagDev();
+    mapsDev.clear();
+    for (size_t i = 0; i < mapIds.size(); ++i) {
+      const auto& m = *mapIds[i];
+      if (auto dv = derivMapDev(&m)) {  // cached map: shared device copy, no upload
+        keepAlive.push_back(dv);
+        env.maps[i] = dv->p;
+        continue;
+      }
+      mapsDev.emplace_back(std::max<int64_t>((int64_t)m.size(), 1));
+      if (!m.empty()) h2d(mapsDev.back().p, m.data(), m.size() * 8);
+      env.maps[i] = mapsDev.back().p;
+    }
+    setsDev.clear();
+    for (size_t i = 0; i < setsHost.size(); ++i) {
+      if (extSets[i]) {
+        env.sets[i] = extSets[i];
+        continue;
+      }
+      setsDev.emplace_back((int64_t)setsHost[i].size());
+      h2d(setsDev.back().p, setsHost[i].data(), setsHost[i].size() * 4);
+      env.sets[i] = setsDev.back().p;
+    }
+  }
+  ExprEnv hostEnv() const {
+    ExprEnv h = env;
+    for (size_t i = 0; i < setsHost.size(); ++i) h.sets[i] = setsHost[i].data();
+    for (size_t i = 0; i < mapIds.size(); ++i) h.maps[i] = mapIds[i]->data();
+    return h;
+  }
+};
+
+// ================================================================== helpers
+
+Value typedVal(double v, LType t, const Dict* d, int scale = -1) {
+  if (std::isnan(v)) return Value::Null();
+  switch (t) {
+    case LType::DECIMAL: return Value::Dec(v, scale < 0 ? 2 : scale);
+    case LType::INT:
+    case LType::BIGINT: return Value::I((int64_t)std::llround(v));
+    case LType::DOUBLE: return Value::D(v);
+    case LType::DATE: return Value::Dt((int64_t)std::llround(v));
+    case LType::DATETIME: return Value::Ts((int64_t)std::llround(v));
+    case LType::VARCHAR: {
+      int64_t c = (int64_t)v;
+      return Value::S(d && c >= 0 && c < (int64_t)d->strs.size() ? d->strs[c] : "");
+    }
+  }
+  return Value::D(v);
+}
+
+std::string cell(const Value& v) { return v.isNull() ? kNullCell : v.toString(); }
+
+int cmpVal(const Value& a, const Value& b) {
+  if (a.isNull() || b.isNull()) return a.isNull() == b.isNull() ? 0 : a.isNull() ? -1 : 1;
+  if (a.kind == Value::STR && b.kind == Value::STR) return collCmp(a.s, b.s);
+  if (a.kind != Value::DBL && b.kind != Value::DBL && a.kind != Value::STR && b.kind != Value::STR)
+    return a.i < b.i ? -1 : a.i > b.i ? 1 : 0;
+  double x = a.num(), y = b.num();
+  return x < y ? -1 : x > y ? 1 : 0;
+}
+
+struct AggRef {
+  std::string fn;
+  int slot = -1;     // SUM/MIN/MAX slot; for COUNT the slot holding the count (0 = COUNT(*))
+  int cntSlot = 0;   // slot counting the argument's non-NULL rows (0 = COUNT(*) when it can't be NULL)
+  LType argTy = LType::BIGINT;
+  const Dict* dict = nullptr;  // MIN/MAX over strings: the value is a rank of this dictionary's strings
+  std::shared_ptr<const std::vector<int32_t>> unrank;  // ... decoded through rank -> code
+  int decScale = -1;           // SUM over a DECIMAL column: the slot holds the exact raw (scaled) sum
+  int scale = -1;              // display scale of a DECIMAL result
+  bool distinct = false;       // COUNT(DISTINCT x) (two-phase GPU path)
+  int hiSlot = -1;             // grouped BIGINT SUM: slot summing the high 32 bits (slot sums the low 32)
+};
+
+// Host-side evaluation of post-aggregation expressions (and constant expressions).
+struct PostCtx {
+  const BindCtx* bc = nullptr;
+  std::vector<std::string> keyCanon;
+  std::vector<LType> keyTy;
+  std::vector<const Dict*> keyDict;
+  std::vector<int> keyScale;
+  const double* keys = nullptr;
+  std::vector<uint8_t> keyInt;  // key k holds its exact int64 bits (AggPlan::keyInt)
+  std::map<std::string, AggRef>* aggs = nullptr;
+  const double* accs = nullptr;
+  const uint8_t* accBits = nullptr;  // slot holds an exact sum's low 64 bits (GpuAggregator::sumBitsSlots)
+  const int64_t* accHi = nullptr;    // ... and these its high 64 bits
+  const std::vector<Value>* row = nullptr;  // host row evaluation: values of bound columns (see colSlot)
+  std::function<int(int, int)> colSlot;     // (table, column) -> index into *row
+  mutable std::unordered_map<const Expr*, std::string> canonCache;
+  const std::string& canonOf(const ExprP& e) const {
+    auto it = canonCache.find(e.get());
+    if (it == canonCache.end()) it = canonCache.emplace(e.get(), canon(e)).first;
+    return it->second;
+  }
+};
+
+Value evalHostFunc(const ExprP& e, const struct PostCtx& c);
+
+double numOf(const Value& v) {
+  if (v.isNull()) return nullv();
+  switch (v.kind) {
+    case Value::DBL: return v.d;
+    case Value::STR: return std::atof(v.s.c_str());
+    default: return (double)v.i;
+  }
+}
+bool isTrue(const Value& v) { return !v.isNull() && (v.kind == Value::STR ? std::atof(v.s.c_str()) != 0 : numOf(v) != 0); }
+Value boolVal(double v) { return v != v ? Value::Null() : Value::I(v != 0); }
+
+Value evalPost(const ExprP& e, const PostCtx& c) {
+  if (!c.keyCanon.empty() && c.keys) {
+    const std::string& k = c.canonOf(e);
+    for (size_t i = 0; i < c.keyCanon.size(); ++i)
+      if (c.keyCanon[i] == k) {
+        if (i < c.keyInt.size() && c.keyInt[i]) {  // exact integer key
+          const long long v = bitsOf(c.keys[i]);
+          switch (c.keyTy[i]) {
+            case LType::INT: case LType::BIGINT: return Value::I(v);
+            case LType::DATE: return Value::Dt(v);
+            case LType::DATETIME: return Value::Ts(v);
+            default: return typedVal((double)v, c.keyTy[i], c.keyDict[i], i < c.keyScale.size() ? c.keyScale[i] : -1);
+          }
+        }
+        return typedVal(c.keys[i], c.keyTy[i], c.keyDict[i], i < c.keyScale.size() ? c.keyScale[i] : -1);
+      }
+  }
+  switch (e->kind) {
+    case Expr::LIT: return e->lit;
+    case Expr::COL:
+      if (c.row && c.colSlot) {
+        int i = c.colSlot(e->bt, e->bc);
+        if (i >= 0) return (*c.row)[i];
+      }
+      throw SqlError("Expression '" + e->str() + "' is not in GROUP BY clause", 1055);
+    case Expr::FUNC: {
+      if (isAggName(e->op)) {
+        if (!c.aggs || !c.accs) throw SqlError("Invalid use of group function", 1111);
+        const AggRef& r = c.aggs->at(c.canonOf(e));
+        if (r.fn == "COUNT") return Value::I((int64_t)c.accs[r.slot]);
+        double cnt = c.accs[r.cntSlot];
+        if (cnt == 0) return Value::Null();
+        if (c.accBits && c.accBits[r.slot] && (r.fn == "SUM" || r.fn == "AVG")) {  // exact integer sum
+          const __int128 w = r.hiSlot >= 0 && c.accBits[r.hiSlot]
+                                 ? (__int128)bitsOf(c.accs[r.hiSlot]) * ((__int128)1 << 32) + bitsOf(c.accs[r.slot])
+                                 : (__int128)(((unsigned __int128)(uint64_t)(c.accHi ? c.accHi[r.slot] : 0) << 64) | (uint64_t)bitsOf(c.accs[r.slot]));
+          const double wd = (double)w;
+          if (r.fn == "AVG") {
+            const double av = wd / (r.decScale >= 0 ? pow10i(r.decScale) : 1.0) / cnt;
+            return r.scale >= 0 ? Value::Dec(av, r.scale) : Value::D(av);
+          }
+          if (r.argTy == LType::DECIMAL || r.decScale >= 0) return Value::Dec(wd / pow10i(std::max(0, r.decScale)), std::max(0, r.scale));
+          if (w >= (__int128)INT64_MIN && w <= (__int128)INT64_MAX) return Value::I((int64_t)w);
+          return Value::D(wd);  // beyond 64 bits
+        }
+        double v = c.accs[r.slot];
+        if (r.decScale >= 0) v /= pow10i(r.decScale);
+        if (r.fn == "AVG") return r.scale >= 0 && !r.dict ? Value::Dec(v / cnt, r.scale) : Value::D(v / cnt);
+        if (r.fn == "SUM")
+          return r.argTy == LType::DOUBLE ? Value::D(v) : r.argTy == LType::DECIMAL ? Value::Dec(v, std::max(0, r.scale))
+                                                         : Value::I((int64_t)std::llround(v));
+        if (c.accBits && c.accBits[r.slot]) {  // exact int64 MIN / MAX
+          const int64_t iv = bitsOf(c.accs[r.slot]);
+          if (r.unrank) return typedVal(iv >= 0 && iv < (int64_t)r.unrank->size() ? (*r.unrank)[iv] : -1, LType::VARCHAR, r.dict);
+          if (r.argTy == LType::DATETIME) return Value::Ts(iv);
+          if (r.argTy == LType::DATE) return Value::Dt(iv);
+          if (r.argTy == LType::INT || r.argTy == LType::BIGINT) return Value::I(iv);
+          return typedVal((double)iv, r.argTy, r.dict, r.scale);
+        }
+        if (r.unrank) {  // string MIN/MAX: rank -> code
+          const int64_t rk = std::llround(v);
+          return typedVal(rk >= 0 && rk < (int64_t)r.unrank->size() ? (*r.unrank)[rk] : -1, LType::VARCHAR, r.dict);
+        }
+        return typedVal(v, r.argTy, r.dict, r.scale);
+      }
+      if (e->op == "ISNULL" || e->op == "ISNOTNULL") return Value::I(evalPost(e->args[0], c).isNull() == (e->op == "ISNULL"));
+      if (e->op == "COALESCE2") {
+        Value a = evalPost(e->args[0], c);
+        return a.isNull() ? evalPost(e->args[1], c) : a;
+      }
+      if (e->op == "NULLIF") {
+        Value a = evalPost(e->args[0], c), b = evalPost(e->args[1], c);
+        return !a.isNull() && !b.isNull() && cmpVal(a, b) == 0 ? Value::Null() : a;
+      }
+      if (e->op == "YEAR") {
+        Value a = evalPost(e->args[0], c);
+        if (a.isNull()) return a;
+        int64_t y; unsigned m, d;
+        civilFromDays(a.kind == Value::DATETIME ? floorDiv(a.i, kUsPerDay) : a.i, y, m, d);
+        return Value::I(y);
+      }
+      if (e->fnId >= 0) {
+        double x = numOf(evalPost(e->args[0], c));
+        double r = e->args.size() == 1 ? gdbCall1(e->fnId, x) : gdbCall2(e->fnId, x, numOf(evalPost(e->args[1], c)));
+        return typedVal(r, e->ty, nullptr, e->scale);
+      }
+      if (e->op.rfind("#ENC", 0) == 0) return evalPost(e->args[1], c);
+      if (e->op == "#MAP") throw SqlError("internal: encoded map evaluated on the host", 1105);
+      if (e->op == "#VDOT" || e->op == "#VEUC") {
+        Value x = evalPost(e->args[0], c);
+        std::vector<float> v;
+        if (x.isNull() || !parseVector(x.toString(), v) || v.size() != e->aux->size()) return Value::Null();
+        double acc = 0;
+        for (size_t i = 0; i < v.size(); ++i) {
+          double q = (*e->aux)[i];
+          acc += e->op == "#VDOT" ? v[i] * q : (v[i] - q) * (v[i] - q);
+        }
+        return Value::D(e->op == "#VDOT" ? acc : std::sqrt(acc));
+      }
+      if (e->op == "#INSORTED") {
+        Value x = evalPost(e->args[0], c);
+        if (x.isNull()) return x;
+        const auto& v = *e->aux;
+        return Value::I(std::binary_search(v.begin(), v.end(), numOf(x)));
+      }
+      return evalHostFunc(e, c);
+    }
+    case Expr::UNARY: {
+      Value a = evalPost(e->args[0], c);
+      if (e->op == "NOT") return a.isNull() ? a : Value::I(!isTrue(a));
+      if (a.isNull()) return a;
+      return a.kind == Value::DBL ? Value::D(-a.d) : Value::I(-a.i);
+    }
+    case Expr::BIN: {
+      const std::string& o = e->op;
+      Value a = evalPost(e->args[0], c);
+      if (o == "AND" && !a.isNull() && !isTrue(a)) return Value::I(0);
+      if (o == "OR" && isTrue(a)) return Value::I(1);
+      Value b = evalPost(e->args[1], c);
+      if (o == "AND") return boolVal(and3(a.isNull() ? nullv() : isTrue(a), b.isNull() ? nullv() : isTrue(b)));
+      if (o == "OR") return boolVal(or3(a.isNull() ? nullv() : isTrue(a), b.isNull() ? nullv() : isTrue(b)));
+      if (a.isNull() || b.isNull()) return Value::Null();
+      if (isCmp(o)) {
+        int r = cmpVal(a, b);
+        return Value::I(o == "=" ? r == 0 : o == "<>" ? r != 0 : o == "<" ? r < 0 : o == "<=" ? r <= 0 : o == ">" ? r > 0 : r >= 0);
+      }
+      const bool ints = a.kind != Value::DBL && a.kind != Value::STR && b.kind != Value::DBL && b.kind != Value::STR;
+      if (ints && o != "/") {
+        int64_t x = a.i, y = b.i;
+        if (o == "%" && y == 0) return Value::Null();
+        int64_t r;
+        const bool ovf = o == "+" ? __builtin_add_overflow(x, y, &r) : o == "-" ? __builtin_sub_overflow(x, y, &r)
+                       : o == "*" ? __builtin_mul_overflow(x, y, &r) : (r = (y == -1 ? 0 : x % y), false);
+        if (ovf && e->ty != LType::DATE && e->ty != LType::DATETIME)
+          throw SqlError("BIGINT value is out of range in '" + e->str() + "'", 1690);
+        return typedVal((double)r, e->ty, nullptr).kind == Value::DBL ? Value::D((double)r)
+             : e->ty == LType::DATE ? Value::Dt(r) : e->ty == LType::DATETIME ? Value::Ts(r) : Value::I(r);
+      }
+      double x = numOf(a), y = numOf(b);
+      double r = o == "+" ? x + y : o == "-" ? x - y : o == "*" ? x * y : o == "/" ? divz(x, y) : (y == 0 ? nullv() : std::fmod(x, y));
+      return typedVal(r, e->ty == LType::VARCHAR ? LType::DOUBLE : e->ty, nullptr, e->scale);
+    }
+    case Expr::CASE: {
+      for (size_t i = 0; i + 1 < e->args.size(); i += 2)
+        if (isTrue(evalPost(e->args[i], c))) return evalPost(e->args[i + 1], c);
+      return e->args.size() % 2 ? evalPost(e->args.back(), c) : Value::Null();
+    }
+    case Expr::INLIST: {
+      Value a = evalPost(e->args[0], c);
+      if (a.isNull()) return a;
+      bool hit = false;
+      for (size_t i = 1; i < e->args.size() && !hit; ++i) hit = cmpVal(a, evalPost(e->args[i], c)) == 0;
+      return Value::I(hit != e->neg);
+    }
+    case Expr::LIKE: {
+      Value a = evalPost(e->args[0], c);
+      if (a.isNull()) return a;
+      return Value::I((ciColl() ? likeMatch(foldCase(a.toString()), foldCase(e->args[1]->lit.s))
+                                : likeMatch(a.toString(), e->args[1]->lit.s)) != e->neg);
+    }
+    default: throw SqlError("cannot evaluate " + e->str(), 1235);
+  }
+}
+
+Value evalConst(const ExprP& e) {
+  PostCtx pc;
+  return evalPost(e, pc);
+}
+
+// ---- Minimal JSON navigation for JSON_EXTRACT_* (SingleStore) and JSON_EXTRACT (MySQL).
+size_t jsonWs(const std::string& s, size_t i) {
+  while (i < s.size() && isspace((unsigned char)s[i])) ++i;
+  return i;
+}
+size_t jsonSkip(const std::string& s, size_t i) {  // index just past the value starting at i
+  i = jsonWs(s, i);
+  if (i >= s.size()) return i;
+  char ch = s[i];
+  if (ch == '"') {
+    for (++i; i < s.size() && s[i] != '"'; ++i)
+      if (s[i] == '\\') ++i;
+    return i + 1;
+  }
+  if (ch == '{' || ch == '[') {
+    char close = ch == '{' ? '}' : ']';
+    ++i;
+    for (;;) {
+      i = jsonWs(s, i);
+      if (i >= s.size()) return i;
+      if (s[i] == close) return i + 1;
+      if (s[i] == ',') { ++i; continue; }
+      if (ch == '{') {
+        i = jsonSkip(s, i);  // key
+        i = jsonWs(s, i);
+        if (i < s.size() && s[i] == ':') ++i;
+      }
+      i = jsonSkip(s, i);
+    }
+  }
+  while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']' && !isspace((unsigned char)s[i])) ++i;
+  return i;
+}
+std::string jsonUnquote(const std::string& v) {
+  if (v.size() < 2 || v[0] != '"') return v;
+  std::string r;
+  for (size_t i = 1; i + 1 < v.size(); ++i) {
+    if (v[i] == '\\' && i + 2 < v.size()) {
+      char n = v[++i];
+      r += n == 'n' ? '\n' : n == 't' ? '\t' : n == 'r' ? '\r' : n;
+    } else {
+      r += v[i];
+    }
+  }
+  return r;
+}
+// Returns the raw JSON text at the path (object keys or array indexes), or false.
+bool jsonFind(const std::string& js, const std::vector<std::string>& path, std::string& out) {
+  size_t b = jsonWs(js, 0), e = jsonSkip(js, b);
+  for (const std::string& key : path) {
+    if (b >= js.size()) return false;
+    if (js[b] == '{') {
+      size_t i = b + 1;
+      bool found = false;
+      for (;;) {
+        i = jsonWs(js, i);
+        if (i >= e || js[i] == '}') break;
+        if (js[i] == ',') { ++i; continue; }
+        size_t ke = jsonSkip(js, i);
+        std::string k = jsonUnquote(js.substr(i, ke - i));
+        i = jsonWs(js, ke);
+        if (i < js.size() && js[i] == ':') ++i;
+        size_t vb = jsonWs(js, i), ve = jsonSkip(js, vb);
+        if (k == key) { b = vb; e = ve; found = true; break; }
+        i = ve;
+      }
+      if (!found) return false;
+    } else if (js[b] == '[') {
+      long idx = std::atol(key.c_str());
+      size_t i = b + 1;
+      long n = 0;
+      bool found = false;
+      for (;;) {
+        i = jsonWs(js, i);
+        if (i >= e || js[i] == ']') break;
+        if (js[i] == ',') { ++i; continue; }
+        size_t ve = jsonSkip(js, i);
+        if (n++ == idx) { b = i; e = ve; found = true; break; }
+        i = ve;
+      }
+      if (!found) return false;
+    } else {
+      return false;
+    }
+  }
+  out = js.substr(b, e - b);
+  return true;
+}
+std::vector<std::string> jsonPathOf(const std::string& p) {  // '$.a.b[2]' -> {a, b, 2}
+  std::vector<std::string> r;
+  size_t i = p.rfind('$', 0) == 0 ? 1 : 0;
+  while (i < p.size()) {
+    if (p[i] == '.') {
+      size_t j = ++i;
+      if (j < p.size() && p[j] == '"') {
+        size_t k = p.find('"', j + 1);
+        r.push_back(p.substr(j + 1, k - j - 1));
+        i = k + 1;
+        continue;
+      }
+      while (i < p.size() && p[i] != '.' && p[i] != '[') ++i;
+      r.push_back(p.substr(j, i - j));
+    } else if (p[i] == '[') {
+      size_t k = p.find(']', i);
+      r.push_back(p.substr(i + 1, k - i - 1));
+      i = k + 1;
+    } else {
+      ++i;
+    }
+  }
+  return r;
+}
+
+std::string dateFormat(const Value& v, const std::string& fmt) {
+  int64_t us = v.kind == Value::DATETIME ? v.i : v.kind == Value::DATE ? v.i * kUsPerDay : 0;
+  if (v.kind == Value::STR && !parseDateTime(v.s, us)) return "";
+  int64_t days = floorDiv(us, kUsPerDay), rem = us - days * kUsPerDay;
+  int64_t y;
+  unsigned m, d;
+  civilFromDays(days, y, m, d);
+  int H = (int)(rem / 3600000000ll), M = (int)(rem / 60000000ll % 60), S = (int)(rem / 1000000ll % 60);
+  static const char* mon[] = {"January", "February", "March", "April", "May", "June", "July", "August", "September",
+                              "October", "November", "December"};
+  static const char* wd[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+  int dow = (int)((days + 4) - floorDiv(days + 4, 7) * 7);
+  std::string r;
+  char b[32];
+  for (size_t i = 0; i < fmt.size(); ++i) {
+    if (fmt[i] != '%' || i + 1 == fmt.size()) { r += fmt[i]; continue; }
+    switch (fmt[++i]) {
+      case 'Y': snprintf(b, sizeof b, "%04lld", (long long)y); break;
+      case 'y': snprintf(b, sizeof b, "%02lld", (long long)(y % 100)); break;
+      case 'm': snprintf(b, sizeof b, "%02u", m); break;
+      case 'c': snprintf(b, sizeof b, "%u", m); break;
+      case 'd': snprintf(b, sizeof b, "%02u", d); break;
+      case 'e': snprintf(b, sizeof b, "%u", d); break;
+      case 'H': snprintf(b, sizeof b, "%02d", H); break;
+      case 'k': snprintf(b, sizeof b, "%d", H); break;
+      case 'h': case 'I': snprintf(b, sizeof b, "%02d", H % 12 ? H % 12 : 12); break;
+      case 'l': snprintf(b, sizeof b, "%d", H % 12 ? H % 12 : 12); break;
+      case 'i': snprintf(b, sizeof b, "%02d", M); break;
+      case 's': case 'S': snprintf(b, sizeof b, "%02d", S); break;
+      case 'f': snprintf(b, sizeof b, "%06lld", (long long)(rem % 1000000)); break;
+      case 'p': snprintf(b, sizeof b, "%s", H < 12 ? "AM" : "PM"); break;
+      case 'M': snprintf(b, sizeof b, "%s", mon[m - 1]); break;
+      case 'b': snprintf(b, sizeof b, "%.3s", mon[m - 1]); break;
+      case 'W': snprintf(b, sizeof b, "%s", wd[dow]); break;
+      case 'a': snprintf(b, sizeof b, "%.3s", wd[dow]); break;
+      case 'w': snprintf(b, sizeof b, "%d", dow); break;
+      case 'j': snprintf(b, sizeof b, "%03lld", (long long)(days - daysFromCivil(y, 1, 1) + 1)); break;
+      case 'T': snprintf(b, sizeof b, "%02d:%02d:%02d", H, M, S); break;
+      case 'r': snprintf(b, sizeof b, "%02d:%02d:%02d %s", H % 12 ? H % 12 : 12, M, S, H < 12 ? "AM" : "PM"); break;
+      case 'D': snprintf(b, sizeof b, "%u%s", d, (d % 10 == 1 && d != 11) ? "st" : (d % 10 == 2 && d != 12) ? "nd" : (d % 10 == 3 && d != 13) ? "rd" : "th"); break;
+      default: b[0] = fmt[i]; b[1] = 0;
+    }
+    r += b;
+  }
+  return r;
+}
+
+size_t utf8Len(const std::string& s) {
+  size_t n = 0;
+  for (unsigned char ch : s) n += (ch & 0xc0) != 0x80;
+  return n;
+}
+
+// String (and other host-only) scalar functions: evaluated on the CPU, per dictionary entry when
+// the expression has a single string column (encoded execution), otherwise per result row.
+// JSON text of a value: numbers bare, strings / dates quoted (MySQL's JSON rendering); raw: the value
+// already is JSON text (a JSON column, JSON_ARRAY(..), ..) and is embedded as is.
+std::string jsonQuoteStr(const std::string& x) {
+  std::string o = "\"";
+  for (unsigned char ch : x) {
+    if (ch == '"' || ch == '\\') { o += '\\'; o += (char)ch; }
+    else if (ch == '\n') o += "\\n";
+    else if (ch == '\r') o += "\\r";
+    else if (ch == '\t') o += "\\t";
+    else if (ch < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", ch); o += b; }
+    else o += (char)ch;
+  }
+  return o + "\"";
+}
+std::string jsonOfValue(const Value& v, bool raw) {
+  if (v.isNull()) return "null";
+  if (raw && v.kind == Value::STR) return v.s.empty() ? "null" : v.s;
+  switch (v.kind) {
+    case Value::INT: return std::to_string(v.i);
+    case Value::DBL: {
+      if (!std::isfinite(v.d)) return "null";
+      std::string t = v.toString();
+      return t;
+    }
+    case Value::DATE: case Value::DATETIME: return jsonQuoteStr(v.toString() + (v.kind == Value::DATETIME && v.toString().find('.') == std::string::npos ? ".000000" : ""));
+    default: return jsonQuoteStr(v.toString());
+  }
+}
+
+// Is x JSON-typed: a JSON column, a JSON-building function or a JSON aggregate? (ctx: to look up columns)
+bool isJsonExpr(const ExprP& x, const BindCtx* c) {
+  if (!x) return false;
+  if (x->kind == Expr::FUNC) {
+    static const std::set<std::string> fns = {"JSON_ARRAY", "JSON_OBJECT", "JSON_ARRAYAGG", "JSON_OBJECTAGG", "JSON_AGG",
+                                              "JSON_EXTRACT", "JSON_EXTRACT_JSON", "JSON_SET", "JSON_MERGE_PATCH"};
+    if (fns.count(upper(x->op))) return true;
+    if (x->op.rfind("#ENC:", 0) == 0 && x->args.size() == 2) return isJsonExpr(x->args[1], c);
+    if ((upper(x->op) == "COALESCE" || upper(x->op) == "IFNULL") && !x->args.empty()) return isJsonExpr(x->args[0], c);
+    if (upper(x->op) == "CAST" && x->castType == "JSON") return true;
+    return false;
+  }
+  if (x->kind == Expr::COL && c && x->bt >= 0 && x->bt < (int)c->tabs.size() && x->bc >= 0 && x->bc < (int)c->tabs[x->bt]->cols.size())
+    return lower(c->tabs[x->bt]->cols[x->bc].typeText).rfind("json", 0) == 0;
+  return false;
+}
+
+// Full-text tokens: lower-cased runs of letters / digits (bytes >= 0x80 count as letters).
+std::vector<std::string> ftsWords(const std::string& x) {
+  std::vector<std::string> w;
+  std::string cur;
+  for (char ch : x) {
+    if (isalnum((unsigned char)ch) || (unsigned char)ch >= 0x80) cur += (char)tolower((unsigned char)ch);
+    else if (!cur.empty()) { w.push_back(cur); cur.clear(); }
+  }
+  if (!cur.empty()) w.push_back(cur);
+  return w;
+}
+// Query terms of AGAINST('..'): (modifier '+' / '-' / 0, word, prefix match).
+std::vector<std::tuple<char, std::string, bool>> ftsTerms(const std::string& qs, bool boolean) {
+  std::vector<std::tuple<char, std::string, bool>> r;
+  size_t i = 0;
+  while (i < qs.size()) {
+    while (i < qs.size() && isspace((unsigned char)qs[i])) ++i;
+    char mod = 0;
+    if (boolean && i < qs.size() && (qs[i] == '+' || qs[i] == '-')) mod = qs[i++];
+    size_t j = i;
+    while (j < qs.size() && !isspace((unsigned char)qs[j])) ++j;
+    std::string term = qs.substr(i, j - i);
+    i = j;
+    bool prefix = !term.empty() && term.back() == '*';
+    if (prefix) term.pop_back();
+    auto tw = ftsWords(term);
+    if (!tw.empty()) r.emplace_back(mod, tw[0], prefix);
+  }
+  return r;
+}
+// BM25 corpus statistics for the MATCH .. AGAINST nodes of e over one column's dictionary: N,
+// average document length, df per query term (stored in the node's aux).
+void ftsStats(const ExprP& e, const Dict& d) {
+  for (auto& x : e->args) ftsStats(x, d);
+  if (!(e->kind == Expr::FUNC && e->op == "MATCH_AGAINST" && e->args.size() == 2 && e->args.back()->kind == Expr::LIT)) return;
+  const auto terms = ftsTerms(e->args.back()->lit.toString(), e->castType == "BOOLEAN");
+  const size_t N = d.strs.size(), T = terms.size();
+  // Cached per dictionary size and query (dictionaries only grow).
+  static std::mutex cmu;
+  static std::unordered_map<std::string, std::shared_ptr<std::vector<double>>> cache;
+  const std::string key = std::to_string((uintptr_t)&d) + "|" + std::to_string(N) + "|" + e->castType + "|" + e->args.back()->lit.toString();
+  {
+    std::lock_guard<std::mutex> g(cmu);
+    auto it = cache.find(key);
+    if (it != cache.end()) { e->aux = it->second; return; }
+  }
+  std::vector<double> sum(T + 1, 0);
+  std::mutex mu;
+  parallelFor(N, [&](size_t b, size_t en) {
+    std::vector<double> p(T + 1, 0);
+    for (size_t i = b; i < en; ++i) {
+      auto w = ftsWords(d.strs[i]);
+      p[T] += w.size();
+      std::sort(w.begin(), w.end());
+      for (size_t t = 0; t < T; ++t) {
+        auto& [mod, term, prefix] = terms[t];
+        auto it = std::lower_bound(w.begin(), w.end(), term);
+        if (it != w.end() && (prefix ? it->rfind(term, 0) == 0 : *it == term)) p[t] += 1;
+      }
+    }
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t t = 0; t <= T; ++t) sum[t] += p[t];
+  });
+  auto st = std::make_shared<std::vector<double>>(2 + T, 0.0);
+  (*st)[0] = (double)N;
+  (*st)[1] = sum[T] / std::max<size_t>(1, N);
+  for (size_t t = 0; t < T; ++t) (*st)[2 + t] = sum[t];
+  e->aux = st;
+  std::lock_guard<std::mutex> g(cmu);
+  if (cache.size() > 4096) cache.clear();
+  cache[key] = st;
+}
+
+Value evalHostFunc(const ExprP& e, const PostCtx& c) {
+  const std::string& f = e->op;
+  std::vector<Value> a;
+  for (auto& x : e->args) a.push_back(evalPost(x, c));
+  auto str = [&](size_t i) { return a[i].toString(); };
+  auto num = [&](size_t i) { return numOf(a[i]); };
+  if (f == "#UDF") {  // run the function body once per distinct argument tuple (memoized per call site)
+    std::vector<std::string> lits;
+    std::string key = str(1);
+    for (size_t i = 2; i < a.size(); ++i) {
+      lits.push_back(udfLiteral(a[i]));
+      key += '\x1f' + lits.back();
+    }
+    thread_local std::unordered_map<std::string, Value> memo;
+    if (auto it = memo.find(key); it != memo.end()) return it->second;
+    if (memo.size() > (1u << 20)) memo.clear();
+    Value v = callUdf(str(0), lits);
+    if (!v.isNull() && v.kind == Value::STR && (e->ty == LType::DATE || e->ty == LType::DATETIME)) {
+      ExprP l = boundLit(v);
+      v = coerceTemporal(l, e->ty)->lit;
+    }
+    return memo[key] = v;
+  }
+  auto anyNull = [&]() {
+    for (auto& v : a)
+      if (v.isNull()) return true;
+    return false;
+  };
+  if (f == "CONCAT_WS") {
+    if (a.empty() || a[0].isNull()) return Value::Null();
+    std::string r;
+    bool first = true;
+    for (size_t i = 1; i < a.size(); ++i) {
+      if (a[i].isNull()) continue;
+      if (!first) r += str(0);
+      r += str(i);
+      first = false;
+    }
+    return Value::S(r);
+  }
+  if (f == "ELT") {
+    if (a.empty() || a[0].isNull()) return Value::Null();
+    int64_t k = (int64_t)num(0);
+    return k >= 1 && k < (int64_t)a.size() ? a[k] : Value::Null();
+  }
+  if (f == "FIELD") {
+    if (a.empty() || a[0].isNull()) return Value::I(0);
+    for (size_t i = 1; i < a.size(); ++i)
+      if (!a[i].isNull() && cmpVal(a[0], a[i]) == 0) return Value::I((int64_t)i);
+    return Value::I(0);
+  }
+  if (f == "UUID") {
+    char b[40];
+    snprintf(b, sizeof b, "%08x-%04x-4%03x-%04x-%012llx", (unsigned)rand(), (unsigned)rand() & 0xffff, (unsigned)rand() & 0xfff,
+             ((unsigned)rand() & 0x3fff) | 0x8000, ((unsigned long long)rand() << 20) ^ (unsigned long long)rand());
+    return Value::S(b);
+  }
+  if (f == "JSON_ARRAY" || f == "JSON_OBJECT") {  // e->name: per argument '1' = JSON-typed (embedded raw)
+    const bool obj = f == "JSON_OBJECT";
+    std::string o = obj ? "{" : "[";
+    for (size_t i = 0; i < a.size(); ++i) {
+      if (i) o += obj && (i & 1) ? ": " : ", ";
+      if (obj && !(i & 1)) {
+        if (a[i].isNull()) throw SqlError("JSON documents may not contain NULL member names", 3158);
+        o += jsonQuoteStr(a[i].toString());
+      } else {
+        o += jsonOfValue(a[i], i < e->name.size() && e->name[i] == '1');
+      }
+    }
+    return Value::S(o + (obj ? "}" : "]"));
+  }
+  if (f == "JSON_QUOTE") return a[0].isNull() ? Value::Null() : Value::S(jsonQuoteStr(a[0].toString()));
+  if (anyNull()) return Value::Null();
+  if (f == "CONCAT") {
+    std::string r;
+    for (size_t i = 0; i < a.size(); ++i) r += str(i);
+    return Value::S(r);
+  }
+  if (f == "UPPER" || f == "UCASE" || f == "LOWER" || f == "LCASE") {
+    std::string r = str(0);
+    for (auto& ch : r) ch = (char)(f == "UPPER" || f == "UCASE" ? toupper((unsigned char)ch) : tolower((unsigned char)ch));
+    return Value::S(r);
+  }
+  if (f == "LENGTH" || f == "OCTET_LENGTH") return Value::I((int64_t)str(0).size());
+  if (f == "CHAR_LENGTH" || f == "CHARACTER_LENGTH") return Value::I((int64_t)utf8Len(str(0)));
+  if (f == "SUBSTRING" || f == "SUBSTR" || f == "MID") {
+    std::string s0 = str(0);
+    int64_t pos = (int64_t)num(1), len = a.size() > 2 ? (int64_t)num(2) : (int64_t)s0.size();
+    int64_t n = (int64_t)s0.size();
+    int64_t start = pos > 0 ? pos - 1 : pos < 0 ? n + pos : n;
+    if (start < 0 || start >= n || len <= 0) return Value::S("");
+    return Value::S(s0.substr(start, len));
+  }
+  if (f == "LEFT") { int64_t k = (int64_t)num(1); return Value::S(k <= 0 ? "" : str(0).substr(0, k)); }
+  if (f == "RIGHT") {
+    std::string s0 = str(0);
+    int64_t k = std::min<int64_t>((int64_t)num(1), (int64_t)s0.size());
+    return Value::S(k <= 0 ? "" : s0.substr(s0.size() - k));
+  }
+  if (f == "TRIM" || f == "LTRIM" || f == "RTRIM") {
+    std::string s0 = str(0);
+    size_t b = 0, en = s0.size();
+    if (f != "RTRIM") while (b < en && s0[b] == ' ') ++b;
+    if (f != "LTRIM") while (en > b && s0[en - 1] == ' ') --en;
+    return Value::S(s0.substr(b, en - b));
+  }
+  if (f == "REPLACE") {
+    std::string s0 = str(0), from = str(1), to = str(2);
+    if (from.empty()) return Value::S(s0);
+    std::string r;
+    for (size_t i = 0;;) {
+      size_t j = s0.find(from, i);
+      if (j == std::string::npos) { r += s0.substr(i); break; }
+      r += s0.substr(i, j - i) + to;
+      i = j + from.size();
+    }
+    return Value::S(r);
+  }
+  if (f == "REVERSE") { std::string r = str(0); std::reverse(r.begin(), r.end()); return Value::S(r); }
+  if (f == "LPAD" || f == "RPAD") {
+    std::string s0 = str(0), pad = a.size() > 2 ? str(2) : " ";
+    int64_t n = (int64_t)num(1);
+    if (n <= (int64_t)s0.size()) return Value::S(s0.substr(0, std::max<int64_t>(n, 0)));
+    if (pad.empty()) return Value::Null();
+    std::string fill;
+    while ((int64_t)(fill.size() + s0.size()) < n) fill += pad;
+    fill = fill.substr(0, n - s0.size());
+    return Value::S(f == "LPAD" ? fill + s0 : s0 + fill);
+  }
+  if (f == "REPEAT") {
+    std::string r, s0 = str(0);
+    for (int64_t i = 0; i < (int64_t)num(1) && r.size() < (1u << 24); ++i) r += s0;
+    return Value::S(r);
+  }
+  if (f == "SPACE") return Value::S(std::string((size_t)std::max<double>(0, std::min<double>(num(0), 1 << 20)), ' '));
+  if (f == "LOCATE" || f == "POSITION") {
+    std::string sub = str(0), s0 = str(1);
+    size_t from = a.size() > 2 ? (size_t)std::max<double>(1, num(2)) - 1 : 0;
+    size_t j = s0.find(sub, from);
+    return Value::I(j == std::string::npos ? 0 : (int64_t)j + 1);
+  }
+  if (f == "INSTR") {
+    size_t j = str(0).find(str(1));
+    return Value::I(j == std::string::npos ? 0 : (int64_t)j + 1);
+  }
+  if (f == "ASCII") { std::string s0 = str(0); return Value::I(s0.empty() ? 0 : (unsigned char)s0[0]); }
+  if (f == "STRCMP") { int r = str(0).compare(str(1)); return Value::I(r < 0 ? -1 : r > 0 ? 1 : 0); }
+  if (f == "SUBSTRING_INDEX") {
+    std::string s0 = str(0), d = str(1);
+    int64_t k = (int64_t)num(2);
+    if (d.empty() || k == 0) return Value::S("");
+    if (k > 0) {
+      size_t pos = 0;
+      for (int64_t i = 0; i < k; ++i) {
+        pos = s0.find(d, i ? pos + d.size() : 0);
+        if (pos == std::string::npos) return Value::S(s0);
+      }
+      return Value::S(s0.substr(0, pos));
+    }
+    size_t pos = s0.size();
+    for (int64_t i = 0; i < -k; ++i) {
+      if (pos == 0) return Value::S(s0);
+      pos = s0.rfind(d, pos - 1);
+      if (pos == std::string::npos) return Value::S(s0);
+    }
+    return Value::S(s0.substr(pos + d.size()));
+  }
+  if (f == "FORMAT") {
+    char b[64];
+    snprintf(b, sizeof b, "%.*f", (int)std::max<double>(0, a.size() > 1 ? num(1) : 0), num(0));
+    std::string t = b, r;
+    size_t dot = t.find('.');
+    std::string ip = t.substr(0, dot), fp = dot == std::string::npos ? "" : t.substr(dot);
+    bool neg = !ip.empty() && ip[0] == '-';
+    if (neg) ip = ip.substr(1);
+    for (size_t i = 0; i < ip.size(); ++i) {
+      if (i && (ip.size() - i) % 3 == 0) r += ',';
+      r += ip[i];
+    }
+    return Value::S((neg ? "-" : "") + r + fp);
+  }
+  if (f == "DATE_FORMAT" || f == "TIME_FORMAT") return Value::S(dateFormat(a[0], str(1)));
+  if (f == "DAYNAME") return Value::S(dateFormat(a[0], "%W"));
+  if (f == "MONTHNAME") return Value::S(dateFormat(a[0], "%M"));
+  if (f == "CASTCHAR") return Value::S(str(0));
+  if (f == "CASTNUM" || f == "CASTINT") {  // string -> number, MySQL style: the leading numeric prefix, else 0
+    if (a[0].isNull()) return Value::Null();
+    const std::string s0 = a[0].kind == Value::STR ? a[0].s : a[0].toString();
+    if (f == "CASTINT") return Value::I(std::strtoll(s0.c_str(), nullptr, 10));
+    return Value::D(std::strtod(s0.c_str(), nullptr));
+  }
+  if (f == "HEX") {
+    std::string r;
+    char b[4];
+    if (a[0].kind == Value::STR) {
+      for (unsigned char ch : a[0].s) { snprintf(b, sizeof b, "%02X", ch); r += b; }
+    } else {
+      char h[32];
+      snprintf(h, sizeof h, "%llX", (unsigned long long)(int64_t)num(0));
+      r = h;
+    }
+    return Value::S(r);
+  }
+  if (f.rfind("JSON_EXTRACT", 0) == 0 || f == "JSON_LENGTH" || f == "JSON_UNQUOTE") {
+    std::string js = str(0), out;
+    if (f == "JSON_UNQUOTE") return Value::S(jsonUnquote(js));
+    std::vector<std::string> path;
+    if (f == "JSON_EXTRACT" || (a.size() == 2 && str(1).rfind("$", 0) == 0)) path = jsonPathOf(a.size() > 1 ? str(1) : "$");
+    else for (size_t i = 1; i < a.size(); ++i) path.push_back(str(i));
+    if (!jsonFind(js, path, out)) return f == "JSON_LENGTH" ? Value::Null() : Value::Null();
+    if (f == "JSON_LENGTH") {
+      size_t b = jsonWs(out, 0);
+      if (b >= out.size() || (out[b] != '[' && out[b] != '{')) return Value::I(1);
+      int64_t n = 0;
+      size_t i = b + 1;
+      for (;;) {
+        i = jsonWs(out, i);
+        if (i >= out.size() || out[i] == ']' || out[i] == '}') break;
+        if (out[i] == ',') { ++i; continue; }
+        if (out[b] == '{') { i = jsonSkip(out, i); i = jsonWs(out, i); if (i < out.size() && out[i] == ':') ++i; }
+        i = jsonSkip(out, i);
+        ++n;
+      }
+      return Value::I(n);
+    }
+    if (out == "null") return Value::Null();
+    if (f == "JSON_EXTRACT_DOUBLE") return Value::D(std::atof(jsonUnquote(out).c_str()));
+    if (f == "JSON_EXTRACT_BIGINT") {
+      std::string u = jsonUnquote(out);
+      return Value::I(u == "true" ? 1 : u == "false" ? 0 : (int64_t)std::atof(u.c_str()));
+    }
+    if (f == "JSON_EXTRACT_STRING") return Value::S(jsonUnquote(out));
+    return Value::S(out);  // JSON_EXTRACT / JSON_EXTRACT_JSON: JSON text
+  }
+  if (f == "MATCH_AGAINST") {  // full-text relevance: BM25 (boolean mode: +must, -must not, prefix*)
+    std::string text;
+    for (size_t i = 0; i + 1 < a.size(); ++i) text += str(i) + " ";
+    std::map<std::string, int> doc;
+    const auto dw = ftsWords(text);
+    for (auto& w : dw) ++doc[w];
+    const bool boolean = e->castType == "BOOLEAN";
+    // Corpus statistics (set by encodeStrings: N, average length, then df per query term); without
+    // them every term counts as rare and the document as average length.
+    const std::vector<double>* st = e->aux && e->aux->size() >= 2 ? e->aux.get() : nullptr;
+    const double N = st ? (*st)[0] : 1e6, avgdl = st ? std::max(1.0, (*st)[1]) : std::max<double>(1, dw.size());
+    const double k1 = 1.2, b = 0.75;
+    double score = 0;
+    int ti = 0;
+    for (auto& [mod, term, prefix] : ftsTerms(str(a.size() - 1), boolean)) {
+      const int idx = ti++;
+      int tf = 0;
+      if (prefix) {
+        for (auto it = doc.lower_bound(term); it != doc.end() && it->first.rfind(term, 0) == 0; ++it) tf += it->second;
+      } else {
+        auto it = doc.find(term);
+        tf = it == doc.end() ? 0 : it->second;
+      }
+      if (mod == '+' && !tf) return Value::D(0);
+      if (mod == '-' && tf) return Value::D(0);
+      if (!tf || mod == '-') continue;
+      const double df = st && (size_t)(2 + idx) < st->size() ? (*st)[2 + idx] : 1;
+      const double idf = std::log(1 + (N - df + 0.5) / (df + 0.5));
+      score += idf * tf / (tf + k1 * (1 - b + b * dw.size() / avgdl));  // Lucene's BM25 (no k1 + 1 factor)
+    }
+    return Value::D(score);
+  }
+  if (f == "REGEXP_SUBSTR" || f == "REGEXP_INSTR") {
+    if (a[0].isNull() || a[1].isNull()) return Value::Null();
+    std::string m;
+    int64_t pos = 0;
+    const bool hit = regexSubstr(str(0), str(1), ciColl(), m, pos);
+    if (f == "REGEXP_INSTR") return Value::I(hit ? pos : 0);
+    return hit ? Value::S(m) : Value::Null();
+  }
+  if (f == "REGEXP_LIKE" || f == "RLIKE" || f == "REGEXP") {
+    return Value::I(regexLike(str(0), str(1), ciColl()));
+  }
+  for (auto& v : a)  // the functions below are NULL on any NULL argument
+    if (v.isNull() && f != "RAND") return Value::Null();
+  if (f == "MD5" || f == "SHA1" || f == "SHA") {
+    const std::string s0 = str(0);
+    unsigned char h[20];
+    const size_t hl = f == "MD5" ? 16 : 20;
+    if (f == "MD5") MD5((const unsigned char*)s0.data(), s0.size(), h);
+    else SHA1((const unsigned char*)s0.data(), s0.size(), h);
+    static const char* hex = "0123456789abcdef";
+    std::string o;
+    for (size_t i = 0; i < hl; ++i) o += hex[h[i] >> 4], o += hex[h[i] & 15];
+    return Value::S(o);
+  }
+  if (f == "SHA2") {
+    const std::string s0 = str(0);
+    const int bits = a.size() > 1 ? (int)num(1) : 256;
+    unsigned char h[64];
+    size_t hl = 0;
+    if (bits == 224) SHA224((const unsigned char*)s0.data(), s0.size(), h), hl = 28;
+    else if (bits == 256 || bits == 0) SHA256((const unsigned char*)s0.data(), s0.size(), h), hl = 32;
+    else if (bits == 384) SHA384((const unsigned char*)s0.data(), s0.size(), h), hl = 48;
+    else if (bits == 512) SHA512((const unsigned char*)s0.data(), s0.size(), h), hl = 64;
+    else return Value::Null();
+    static const char* hex = "0123456789abcdef";
+    std::string o;
+    for (size_t i = 0; i < hl; ++i) o += hex[h[i] >> 4], o += hex[h[i] & 15];
+    return Value::S(o);
+  }
+  if (f == "TO_BASE64" || f == "FROM_BASE64") {
+    static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::string in = str(0);
+    std::string o;
+    if (f == "TO_BASE64") {
+      for (size_t i = 0; i < in.size(); i += 3) {
+        uint32_t v = (uint8_t)in[i] << 16 | (i + 1 < in.size() ? (uint8_t)in[i + 1] << 8 : 0) | (i + 2 < in.size() ? (uint8_t)in[i + 2] : 0);
+        o += b64[v >> 18 & 63];
+        o += b64[v >> 12 & 63];
+        o += i + 1 < in.size() ? b64[v >> 6 & 63] : '=';
+        o += i + 2 < in.size() ? b64[v & 63] : '=';
+      }
+      return Value::S(o);
+    }
+    uint32_t acc = 0;
+    int bits = 0;
+    for (char ch : in) {
+      const char* q = strchr(b64, ch);
+      if (!q || !ch) continue;  // '=', whitespace
+      acc = acc << 6 | (uint32_t)(q - b64);
+      bits += 6;
+      if (bits >= 8) o += (char)(acc >> (bits -= 8) & 255);
+    }
+    return Value::S(o);
+  }
+  if (f == "CRC32") {
+    const std::string s0 = str(0);
+    return Value::I((int64_t)crc32(0L, (const Bytef*)s0.data(), (uInt)s0.size()));
+  }
+  if (f == "BIT_COUNT") return Value::I(__builtin_popcountll((unsigned long long)(int64_t)num(0)));
+  if (f == "RAND") {
+    thread_local std::mt19937_64 rng(std::random_device{}());
+    if (!a.empty() && !a[0].isNull()) {  // RAND(seed): deterministic
+      std::mt19937_64 seeded((uint64_t)(int64_t)num(0));
+      return Value::D(std::uniform_real_distribution<double>(0, 1)(seeded));
+    }
+    return Value::D(std::uniform_real_distribution<double>(0, 1)(rng));
+  }
+  if (f == "CONVERT_TZ") {
+    int64_t us = a[0].kind == Value::DATETIME || a[0].kind == Value::DATE ? (a[0].kind == Value::DATE ? a[0].i * kUsPerDay : a[0].i) : 0;
+    if (a[0].kind == Value::STR && !parseDateTime(a[0].s, us)) return Value::Null();
+    int64_t from = 0, to = 0;
+    const int64_t secs = floorDiv(us, 1000000);
+    if (!tzOffset(str(1), secs, true, from)) return Value::Null();
+    const int64_t utc = secs - from;
+    if (!tzOffset(str(2), utc, false, to)) return Value::Null();
+    return Value::Ts(us + (to - from) * 1000000);
+  }
+  if (f.rfind("GEOGRAPHY_", 0) == 0) return geoFunction(f, a);
+  if (f == "REGEXP_REPLACE") {
+    return Value::S(regexReplace(str(0), str(1), str(2)));
+  }
+  throw SqlError("FUNCTION gpudb." + f + " does not exist", 1305);
+}
+
+ExprP boundCol(BindCtx& c, int bt, int bc) {
+  auto col = std::make_shared<Expr>();
+  col->kind = Expr::COL;
+  col->bt = bt;
+  col->bc = bc;
+  col->ty = c.tabs[bt]->cols[bc].lt;
+  col->name = c.tabs[bt]->cols[bc].name;
+  col->table = c.aliases[bt];
+  col->bound = true;
+  return col;
+}
+
+int encSeq = 0;
+
+// Encoded execution of a string expression with exactly one string column: evaluate it once per
+// dictionary entry, then the GPU only applies the resulting code -> value map (OP_DICTMAP).
+bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi);
+
+// A host-only expression over one integer / DATE column with a small value range: evaluated once per
+// value in [min, max] into a GPU lookup map indexed by (value - min), like the per-dictionary-entry
+// encoding of string columns. NULL input: the map's NULL, or a CASE when the result isn't NULL.
+void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
+  const Table& t = *c.tabs[bt];
+  const LType lt = t.cols[bc].lt;
+  if (lt != LType::INT && lt != LType::BIGINT && lt != LType::DATE) return;
+  const std::string es = upper(e->str());
+  for (const char* f : {"NOW(", "RAND(", "UUID(", "CURDATE(", "CURTIME(", "SYSDATE(", "CURRENT_", "UNIX_TIMESTAMP()", "UTC_"})
+    if (es.find(f) != std::string::npos) return;
+  const bool udf = es.find("#UDF(") != std::string::npos;  // runs the procedure interpreter: one thread, fewer values
+  int64_t lo, hi;
+  if (!colRange(t, bc, lo, hi) || hi - lo >= (udf ? (1 << 16) : (1 << 20))) return;
+  const size_t N = (size_t)(hi - lo + 1);
+  auto colSlot = [bt = bt, bc = bc](int tt, int cc) { return tt == bt && cc == bc ? 0 : -1; };
+  std::vector<Value> res(N);
+  auto evalRange = [&](size_t b, size_t en) {
+    PostCtx tpc;
+    std::vector<Value> trow(1);
+    tpc.row = &trow;
+    tpc.colSlot = colSlot;
+    for (size_t i = b; i < en; ++i) {
+      trow[0] = lt == LType::DATE ? Value::Dt(lo + (int64_t)i) : Value::I(lo + (int64_t)i);
+      res[i] = evalPost(e, tpc);
+    }
+  };
+  if (udf) evalRange(0, N);
+  else parallelFor(N, evalRange);
+  Value nullRes;
+  {
+    PostCtx tpc;
+    std::vector<Value> trow(1, Value::Null());
+    tpc.row = &trow;
+    tpc.colSlot = colSlot;
+    nullRes = evalPost(e, tpc);
+  }
+  std::vector<double> map(N);
+  std::shared_ptr<Dict> outShared;
+  if (e->ty == LType::VARCHAR) {
+    outShared = std::make_shared<Dict>();
+    c.sharedDicts.push_back(outShared);
+    for (size_t i = 0; i < N; ++i) map[i] = res[i].isNull() ? nullv() : (double)outShared->getOrAdd(res[i].toString());
+  } else {
+    for (size_t i = 0; i < N; ++i) map[i] = res[i].isNull() ? nullv() : numOf(res[i]);
+  }
+  ExprP idx = boundNode(Expr::BIN, "-", {boundCol(c, bt, bc), boundLit(Value::I(lo))}, LType::BIGINT);
+  ExprP gpu = boundNode(Expr::FUNC, "#MAP", {idx}, outShared ? LType::BIGINT : e->ty);
+  gpu->aux = std::make_shared<std::vector<double>>(std::move(map));
+  if (!nullRes.isNull()) {  // e.g. COALESCE / IFNULL / a UDF handling NULL
+    ExprP whenNull = boundNode(Expr::FUNC, "ISNULL", {boundCol(c, bt, bc)}, LType::INT);
+    ExprP nullVal = outShared ? boundLit(Value::I(outShared->getOrAdd(nullRes.toString()))) : boundLit(Value::D(numOf(nullRes)));
+    gpu = boundNode(Expr::CASE, "", {whenNull, nullVal, gpu}, outShared ? LType::BIGINT : e->ty);
+  }
+  ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {gpu, e}, e->ty);
+  if (outShared) c.exprDict[node.get()] = outShared.get();
+  e = node;
+}
+
+void encodeStrings(ExprP& e, BindCtx& c) {
+  if (hasAgg(e)) return;
+  std::set<std::pair<int, int>> cs;
+  colsOf(e, cs);
+  if (cs.size() != 1) return;  // several columns: evaluated per result row on the host
+  auto [bt, bc] = *cs.begin();
+  const Table& t = *c.tabs[bt];
+  if (t.cols[bc].lt != LType::VARCHAR) {
+    encodeIntDomain(e, c, bt, bc);
+    return;
+  }
+  const Dict& src = *t.dicts[bc];
+  if (c.lazyStr && src.strs.size() > 4096) return;
+  if (e->str().find("MATCH") != std::string::npos) ftsStats(e, src);
+  PostCtx pc;
+  std::vector<Value> row(1);
+  pc.row = &row;
+  pc.colSlot = [bt = bt, bc = bc](int tt, int cc) { return tt == bt && cc == bc ? 0 : -1; };
+  // Cached per dictionary version and expression (repeated queries skip the evaluation and the upload).
+  const std::string ckey = derivKey(src, std::string("ENC|") + (e->ty == LType::VARCHAR ? "s|" : "n|") + e->str());
+  const std::string es = upper(e->str());
+  bool volatileExpr = false;
+  for (const char* f : {"NOW(", "RAND(", "UUID(", "CURDATE(", "CURTIME(", "SYSDATE(", "CURRENT_", "UNIX_TIMESTAMP()", "UTC_"})
+    volatileExpr |= es.find(f) != std::string::npos;
+  // The result for a NULL input (dictionary maps only see non-NULL strings): non-NULL for COALESCE,
+  // IFNULL, UDFs handling NULL, ..: then a CASE in front of the map.
+  auto withNull = [&](ExprP gpu, Dict* outDict) {
+    PostCtx npc;
+    std::vector<Value> nrow(1, Value::Null());
+    npc.row = &nrow;
+    npc.colSlot = pc.colSlot;
+    Value nv;
+    try { nv = evalPost(e, npc); } catch (...) { return gpu; }
+    if (nv.isNull() || (e->ty == LType::VARCHAR && !outDict)) return gpu;
+    ExprP nullVal = outDict ? boundLit(Value::I(outDict->getOrAdd(nv.toString()))) : boundLit(Value::D(numOf(nv)));
+    return boundNode(Expr::CASE, "", {boundNode(Expr::FUNC, "ISNULL", {boundCol(c, bt, bc)}, LType::INT), nullVal, gpu}, gpu->ty);
+  };
+  if (!volatileExpr) {
+    DictDerived hit;
+    if (derivGet(src, ckey, hit) && hit.map) {
+      ExprP gpu = boundNode(Expr::FUNC, "#MAP", {boundCol(c, bt, bc)}, hit.out ? LType::BIGINT : e->ty);
+      gpu->aux = hit.map;
+      gpu = withNull(gpu, hit.out.get());
+      ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {gpu, e}, e->ty);
+      if (hit.out) {
+        c.sharedDicts.push_back(hit.out);
+        c.exprDict[node.get()] = hit.out.get();
+      }
+      e = node;
+      return;
+    }
+  }
+  // The dictionary grew since the cached map was built: evaluate only the new entries (copies, as
+  // running queries may hold the old map and dictionary).
+  DictDerived stale;
+  size_t from = 0;
+  if (!volatileExpr && derivGetStale(src, ckey, stale) && (e->ty == LType::VARCHAR) == (stale.out != nullptr)) from = stale.n;
+  std::vector<double> map(src.strs.size());
+  if (from) std::copy(stale.map->begin(), stale.map->begin() + from, map.begin());
+  Dict* out = nullptr;
+  std::shared_ptr<Dict> outShared;
+  if (e->ty == LType::VARCHAR) {
+    outShared = from ? std::make_shared<Dict>(*stale.out) : std::make_shared<Dict>();
+    c.sharedDicts.push_back(outShared);
+    out = outShared.get();
+  }
+  const auto tEnc = std::chrono::steady_clock::now();
+  struct EncTrace {
+    std::chrono::steady_clock::time_point t;
+    size_t n;
+    std::string what;
+    ~EncTrace() {
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
+      if (ms > 20 && getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %s over %zu dictionary entries: %.1f ms\n", what.c_str(), n, ms);
+    }
+  } encTrace{tEnc, src.strs.size() - from, e->str()};
+  if (out) {  // string results: computed on all cores, then added to the new dictionary in order
+    const size_t N = src.strs.size();
+    std::vector<std::string> res(N);
+    std::vector<uint8_t> nul(N, 0);
+    // REGEXP_REPLACE(col, 'pattern', 'replacement'): straight to the regex engine.
+    const bool directRegex = e->kind == Expr::FUNC && e->op == "REGEXP_REPLACE" && e->args.size() == 3 && e->args[0]->kind == Expr::COL &&
+                             e->args[1]->kind == Expr::LIT && e->args[1]->lit.kind == Value::STR && e->args[2]->kind == Expr::LIT &&
+                             e->args[2]->lit.kind == Value::STR;
+    parallelFor(N - from, [&, from](size_t b, size_t en) {
+      b += from, en += from;
+      if (directRegex) {
+        for (size_t i = b; i < en; ++i) res[i] = regexReplace(src.strs[i], e->args[1]->lit.s, e->args[2]->lit.s);
+        return;
+      }
+      PostCtx tpc;
+      std::vector<Value> trow(1);
+      tpc.row = &trow;
+      tpc.colSlot = pc.colSlot;
+      for (size_t i = b; i < en; ++i) {
+        trow[0] = Value::S(src.strs[i]);
+        Value v = evalPost(e, tpc);
+        if (v.isNull()) nul[i] = 1;
+        else res[i] = v.toString();
+      }
+    });
+    const auto tAdd = std::chrono::steady_clock::now();
+    // Distinct results on all cores (hash-sharded), then only those enter the dictionary, in order of
+    // first occurrence (the codes are what a sequential pass would give).
+    auto tick = [t = std::chrono::steady_clock::now()]() mutable {
+      auto n = std::chrono::steady_clock::now();
+      double ms = std::chrono::duration<double, std::milli>(n - t).count();
+      t = n;
+      return ms;
+    };
+    constexpr size_t kShards = 64;
+    std::vector<uint8_t> shardOf(N);
+    parallelFor(N - from, [&, from](size_t b, size_t en) {
+      for (size_t i = b + from; i < en + from; ++i) shardOf[i] = (uint8_t)(std::hash<std::string_view>{}(res[i]) % kShards);
+    });
+    const double tHash = tick();
+    std::vector<std::vector<uint32_t>> byShard(kShards);
+    for (size_t i = from; i < N; ++i)
+      if (!nul[i]) byShard[shardOf[i]].push_back((uint32_t)i);
+    const double tBucket = tick();
+    std::vector<int64_t> code(N, -1);   // known code (already in the dictionary)
+    std::vector<uint32_t> first(N, 0);  // first index with the same result
+    parallelFor(kShards, [&](size_t b, size_t en) {
+      for (size_t sh = b; sh < en; ++sh) {
+        std::unordered_map<std::string_view, uint32_t> seen;
+        for (uint32_t i : byShard[sh]) {
+          const int32_t have = out->strs.empty() ? -1 : out->find(res[i]);
+          if (have >= 0) { code[i] = have; continue; }
+          first[i] = seen.emplace(std::string_view(res[i]), i).first->second;
+        }
+      }
+    }, 1);
+    const double tShard = tick();
+    {
+      size_t fresh = 0;
+      for (size_t i = from; i < N; ++i) fresh += !nul[i] && code[i] < 0 && first[i] == i;
+      out->strs.reserve(out->strs.size() + fresh);
+    }
+    for (size_t i = from; i < N; ++i)
+      if (!nul[i] && code[i] < 0 && first[i] == i) code[i] = out->appendUnique(std::move(res[i]));
+    const double tIns = tick();
+    if (getenv("GPUDB_TRACE"))
+      fprintf(stderr, "[trace]   dedupe: hash %.1f, bucket %.1f, shards %.1f, inserts %.1f ms\n", tHash, tBucket, tShard, tIns);
+    parallelFor(N - from, [&, from](size_t b, size_t en) {
+      for (size_t i = b + from; i < en + from; ++i) map[i] = nul[i] ? nullv() : (double)(code[i] >= 0 ? code[i] : code[first[i]]);
+    });
+    if (getenv("GPUDB_TRACE"))
+      fprintf(stderr, "[trace]   evaluate %.1f ms, dictionary inserts %.1f ms (%zu distinct)\n",
+              std::chrono::duration<double, std::milli>(tAdd - tEnc).count(),
+              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tAdd).count(), out->strs.size());
+  } else {  // numeric results (length(), predicates, ..): every dictionary entry on all cores
+    parallelFor(src.strs.size() - from, [&, from](size_t b, size_t en) {
+      b += from, en += from;
+      PostCtx tpc;
+      std::vector<Value> trow(1);
+      tpc.row = &trow;
+      tpc.colSlot = pc.colSlot;
+      for (size_t i = b; i < en; ++i) {
+        trow[0] = Value::S(src.strs[i]);
+        Value v = evalPost(e, tpc);
+        map[i] = v.isNull() ? nullv() : numOf(v);
+      }
+    });
+  }
+  ExprP gpu = boundNode(Expr::FUNC, "#MAP", {boundCol(c, bt, bc)}, out ? LType::BIGINT : e->ty);
+  auto mapPtr = std::make_shared<std::vector<double>>(std::move(map));
+  gpu->aux = mapPtr;
+  gpu = withNull(gpu, out);
+  if (!volatileExpr) {
+    DictDerived de;
+    de.d = &src;
+    de.n = src.strs.size();
+    de.map = mapPtr;
+    de.out = outShared;
+    derivPut(ckey, std::move(de));
+  }
+  ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {gpu, e}, e->ty);
+  if (out) c.exprDict[node.get()] = out;
+  e = node;
+}
+
+// A VARCHAR-valued expression as codes of the merged dictionary `out` (literals and every dictionary
+// involved are folded into it), or null when a branch has no dictionary (host evaluation then).
+// Maps of dictionaries into a merged dictionary, reused from the cache when the merge is cached.
+using CodeMaps = std::map<const Dict*, std::shared_ptr<std::vector<double>>>;
+ExprP toCodes(const ExprP& x, Dict* out, BindCtx& c, CodeMaps& maps) {
+  if (isNullLit(x)) return x;
+  if (x->kind == Expr::LIT && x->lit.kind == Value::STR) return boundLit(Value::I(out->getOrAdd(x->lit.s)));
+  if (x->kind == Expr::CASE && x->ty == LType::VARCHAR) {
+    auto y = std::make_shared<Expr>(*x);
+    const size_t n = y->args.size();
+    for (size_t i = 1; i < n; i += 2)
+      if (!(y->args[i] = toCodes(x->args[i], out, c, maps))) return nullptr;
+    if (n % 2 && !(y->args[n - 1] = toCodes(x->args[n - 1], out, c, maps))) return nullptr;  // ELSE
+    y->ty = LType::BIGINT;
+    return y;
+  }
+  if (x->kind == Expr::FUNC && (x->op == "COALESCE2" || x->op == "NULLIF") && x->ty == LType::VARCHAR) {
+    auto y = std::make_shared<Expr>(*x);
+    for (auto& a : y->args)
+      if (!(a = toCodes(a, out, c, maps))) return nullptr;
+    y->ty = LType::BIGINT;
+    return y;
+  }
+  if (Dict* dx = c.dict(*x)) {
+    auto& m = maps[dx];
+    if (!m) {
+      m = std::make_shared<std::vector<double>>(dx->strs.size());
+      if (dx == out) {  // the merge reuses this dictionary: codes stay the same (shared identity map)
+        static std::mutex idMu;
+        static std::map<size_t, std::shared_ptr<std::vector<double>>> ids;
+        std::lock_guard<std::mutex> g(idMu);
+        if (ids.size() > 16 && !ids.count(dx->strs.size())) ids.clear();
+        auto& id = ids[dx->strs.size()];
+        if (!id) {
+          id = m;
+          for (size_t i = 0; i < m->size(); ++i) (*m)[i] = (double)i;
+        }
+        m = id;
+      } else if (out->strs.empty()) {  // first dictionary merged: copy it whole, codes stay the same
+        *out = *dx;
+        for (size_t i = 0; i < m->size(); ++i) (*m)[i] = (double)i;
+      } else {
+        for (size_t i = 0; i < m->size(); ++i) (*m)[i] = out->getOrAdd(dx->strs[i]);
+      }
+    }
+    ExprP g = boundNode(Expr::FUNC, "#MAP", {x}, LType::BIGINT);
+    g->aux = m;
+    return g;
+  }
+  return nullptr;
+}
+
+// Merged dictionaries of string expressions (CASE / COALESCE over columns and literals), cached by
+// expression and source dictionary versions (a merge over a big dictionary is a full pass over it).
+struct UnifyEntry {
+  std::shared_ptr<Dict> out;
+  CodeMaps maps;
+};
+std::mutex gUnifyMu;
+std::unordered_map<std::string, UnifyEntry> gUnify;
+
+void unifyStrings(ExprP& e, BindCtx& c) {
+  // Cache key: the expression and every table dictionary it reads (identity and size).
+  std::string key = std::string(ciColl() ? "i|" : "b|") + e->str();
+  bool cacheable = true;
+  std::function<void(const ExprP&)> dicts = [&](const ExprP& x) {
+    if (!x) return;
+    if (x->kind == Expr::COL && x->ty == LType::VARCHAR) {
+      if (Dict* d = c.dict(*x)) key += "|" + std::to_string((uintptr_t)d) + ":" + std::to_string(d->strs.size());
+      return;
+    }
+    if (x->kind == Expr::FUNC && x->op.rfind("#", 0) == 0) cacheable = false;  // per-query derived dictionaries
+    for (auto& a : x->args) dicts(a);
+  };
+  dicts(e);
+  // One dictionary and literals it already contains (CASE WHEN .. THEN Referer ELSE '' END): use
+  // that dictionary as the result's, instead of copying a possibly huge dictionary.
+  std::set<Dict*> srcDicts;
+  std::vector<std::string> lits;
+  std::function<bool(const ExprP&)> leaves = [&](const ExprP& x) -> bool {
+    if (isNullLit(x)) return true;
+    if (x->kind == Expr::LIT && x->lit.kind == Value::STR) return lits.push_back(x->lit.s), true;
+    if ((x->kind == Expr::CASE || (x->kind == Expr::FUNC && (x->op == "COALESCE2" || x->op == "NULLIF"))) && x->ty == LType::VARCHAR) {
+      const size_t n = x->args.size();
+      for (size_t i = 0; i < n; ++i) {
+        const bool result = x->kind != Expr::CASE || (i % 2 == 1) || (n % 2 && i == n - 1);
+        if (result && !leaves(x->args[i])) return false;
+      }
+      return true;
+    }
+    if (Dict* d = c.dict(*x)) return srcDicts.insert(d), true;
+    return false;
+  };
+  if (leaves(e) && srcDicts.size() == 1) {
+    Dict* d = *srcDicts.begin();
+    bool all = true;
+    for (auto& l : lits) all = all && d->find(l) >= 0;
+    if (all) {
+      std::shared_ptr<Dict> same(d, [](Dict*) {});  // owned by its table (locked for the query)
+      UnifyEntry ent{same, {}};
+      ExprP g = toCodes(e, d, c, ent.maps);
+      if (g) {
+        for (auto& [dd, m] : ent.maps) derivShareMap(m);
+        ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {g, e}, LType::VARCHAR);
+        c.exprDict[node.get()] = d;
+        e = node;
+        return;
+      }
+    }
+  }
+  UnifyEntry ent;
+  bool hit = false;
+  if (cacheable) {
+    std::lock_guard<std::mutex> g(gUnifyMu);
+    auto it = gUnify.find(key);
+    if (it != gUnify.end()) ent = it->second, hit = true;
+  }
+  if (!hit) ent.out = std::make_shared<Dict>();
+  c.sharedDicts.push_back(ent.out);
+  Dict* out = ent.out.get();
+  ExprP g = toCodes(e, out, c, ent.maps);
+  if (!g) return;  // host-only
+  if (cacheable && !hit) {
+    for (auto& [d, m] : ent.maps) derivShareMap(m);
+    std::lock_guard<std::mutex> lk(gUnifyMu);
+    if (gUnify.size() > 256) gUnify.clear();
+    gUnify[key] = ent;
+  }
+  ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {g, e}, LType::VARCHAR);
+  c.exprDict[node.get()] = out;
+  e = node;
+}
+
+// Literal that a column is compared against: returns true for `col op lit` forms.
+bool simplePred(const ExprP& e, int& bt, int& bc, std::string& op, double& v) {
+  static const std::map<std::string, std::string> flip = {{"=", "="}, {"<", ">"}, {"<=", ">="}, {">", "<"}, {">=", "<="}};
+  if (e->kind != Expr::BIN || !flip.count(e->op)) return false;
+  const ExprP& a = e->args[0];
+  const ExprP& b = e->args[1];
+  if (a->kind == Expr::COL && b->kind == Expr::LIT && b->lit.kind != Value::STR && a->ty != LType::VARCHAR) {
+    bt = a->bt, bc = a->bc, op = e->op, v = b->lit.num();
+    return true;
+  }
+  if (b->kind == Expr::COL && a->kind == Expr::LIT && a->lit.kind != Value::STR && b->ty != LType::VARCHAR) {
+    bt = b->bt, bc = b->bc, op = flip.at(e->op), v = a->lit.num();
+    return true;
+  }
+  return false;
+}
+
+bool segMayMatch(const Segment& s, const std::vector<ExprP>& preds) {
+  if (s.ndel == s.n) return false;
+  for (auto& p : preds) {
+    int bt, bc;
+    std::string op;
+    double v;
+    if (!simplePred(p, bt, bc, op, v)) continue;
+    double mn = s.mn[bc], mx = s.mx[bc];
+    if ((op == "=" && (v < mn || v > mx)) || (op == "<" && mn >= v) || (op == "<=" && mn > v) ||
+        (op == ">" && mx <= v) || (op == ">=" && mx < v))
+      return false;
+  }
+  return true;
+}
+
+// Point lookup: finds a top-level `pk = literal` conjunct.
+bool findPkEq(const std::vector<ExprP>& conj, const Table& t, int bt, int64_t& key) {
+  if (t.pk < 0) return false;
+  for (auto& p : conj) {
+    int pbt, bc;
+    std::string op;
+    double v;
+    if (simplePred(p, pbt, bc, op, v) && op == "=" && pbt == bt && bc == t.pk) {
+      if (v != std::floor(v)) return false;
+      key = (int64_t)v;
+      return true;
+    }
+  }
+  return false;
+}
+
+ColView viewOf(const void* p, PType t) { return ColView{p, (uint8_t)t}; }
+
+// A `col = literal` conjunct on the first column of a secondary index: returns the index and the
+// raw key (found = false when the literal can't occur, e.g. a string not in the dictionary).
+const IndexMeta* findIndexEq(const std::vector<ExprP>& conj, const Table& t, int bt, int64_t& key, bool& found) {
+  for (auto& p : conj) {
+    if (p->kind != Expr::BIN || p->op != "=") continue;
+    const ExprP& a = p->args[0];
+    const ExprP& b = p->args[1];
+    const ExprP* col = a->kind == Expr::COL && b->kind == Expr::LIT ? &a : b->kind == Expr::COL && a->kind == Expr::LIT ? &b : nullptr;
+    if (!col || (*col)->bt != bt) continue;
+    const Value& v = (col == &a ? b : a)->lit;
+    if (v.isNull()) continue;
+    for (auto& ix : t.indexes) {
+      if (ix.cols[0] != (*col)->bc || t.cols[ix.cols[0]].lt == LType::DECIMAL) continue;
+      const ColumnMeta& cm = t.cols[ix.cols[0]];
+      found = true;
+      if (cm.lt == LType::VARCHAR) {
+        if (v.kind != Value::STR) return nullptr;
+        int32_t code = t.dicts[ix.cols[0]]->find(v.s);
+        if (code < 0) found = false;
+        key = code;
+      } else if (cm.pt == PType::F64) {
+        double d = numOf(v);
+        if (d == 0) d = 0;
+        memcpy(&key, &d, 8);
+      } else if (cm.lt == LType::DATE && v.kind == Value::STR) {
+        int32_t d;
+        if (!parseDate(v.s, d)) return nullptr;
+        key = d;
+      } else if (cm.lt == LType::DATETIME && v.kind == Value::STR) {
+        if (!parseDateTime(v.s, key)) return nullptr;
+      } else {
+        double d = numOf(v);
+        if (d != std::floor(d)) found = false;
+        key = (int64_t)d;
+      }
+      return &ix;
+    }
+  }
+  return nullptr;
+}
+
+// Dictionary code -> lexicographic rank, in VRAM (for ORDER BY on strings). Dictionaries only
+// grow, so (dictionary, size, collation) identifies a version: ranks are cached per version and
+// built with a parallel sort.
+std::shared_ptr<DevVec<int32_t>> dictRankDev(const Dict& d) {
+  static std::mutex mu;
+  static std::map<std::pair<const Dict*, bool>, std::pair<size_t, std::shared_ptr<DevVec<int32_t>>>> cache;
+  const bool ci = ciColl();
+  const size_t n = d.strs.size();
+  {
+    std::lock_guard<std::mutex> g(mu);
+    auto it = cache.find({&d, ci});
+    if (it != cache.end() && it->second.first == n) return it->second.second;
+  }
+  auto sorted = sortedDict(d);  // cached (and pre-built in the background after loads)
+  const std::vector<int32_t>& order = *sorted.first;
+  std::vector<int32_t> rank(n + 1);
+  for (size_t i = 0; i < n; ++i)  // case variants share a rank under a _ci collation
+    rank[order[i]] = i > 0 && ci && collCmp(d.strs[order[i]], d.strs[order[i - 1]]) == 0 ? rank[order[i - 1]] : (int32_t)i;
+  auto r = std::make_shared<DevVec<int32_t>>((int64_t)rank.size());
+  h2d(r->p, rank.data(), rank.size() * 4);
+  std::lock_guard<std::mutex> g(mu);
+  cache[{&d, ci}] = {n, r};
+  return r;
+}
+
+// A materialized intermediate relation in VRAM (filtered base table or join result).
+struct RelCol {
+  int bt, bc;
+  PType pt;
+  DevVec<uint8_t> data;
+  int esize = 0;  // bytes per element (VECTOR columns: 4 * dim)
+};
+
+void gatherCol(const void* src, PType pt, int esize, const int32_t* idx, int64_t m, void* dst, bool nulls) {
+  if (pt == PType::VEC) gpuGatherBytes(src, esize, idx, m, dst, nulls);
+  else if (nulls) gpuGatherNull(src, pt, idx, m, dst);
+  else gpuGather(src, pt, idx, m, dst);
+}
+struct Rel {
+  int64_t n = 0;
+  std::vector<RelCol> cols;
+  std::set<int> tabs;
+  // Hash partitioning of the rows, when known: rows of partition p are [partOff[p], partOff[p+1]),
+  // and every column in partCols is a shard key that determines the partition.
+  std::vector<int64_t> partOff;
+  std::set<std::pair<int, int>> partCols;
+  int find(int bt, int bc) const {
+    for (size_t i = 0; i < cols.size(); ++i)
+      if (cols[i].bt == bt && cols[i].bc == bc) return (int)i;
+    return -1;
+  }
+};
+
+void bindRelCols(Compiler& comp, const Rel& r) {
+  for (size_t s = 0; s < comp.slotCols.size(); ++s) {
+    int i = r.find(comp.slotCols[s].first, comp.slotCols[s].second);
+    if (i < 0) throw SqlError("internal: column not materialized", 1105);
+    comp.env.cols[s].p = r.cols[i].data.p;
+    comp.env.cols[s].enc = 0;  // materialized columns are decoded
+  }
+}
+
+using Clock = std::chrono::steady_clock;
+double msSince(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+// ---- PROFILE support (per session = per connection thread, like SingleStore's SHOW PROFILE).
+struct ProfRow {
+  std::string stage;
+  double ms;
+  int64_t rows;
+  std::string detail;
+};
+thread_local bool tProfOn = false;
+thread_local std::vector<ProfRow> tProf, tLastProf;
+thread_local bool tDense = true;  // SET gpudb_dense_groupby
+
+// Times one stage of a PROFILE'd query. It waits for the GPU at the end of the stage so time is
+// attributed to the stage that queued the work (only when profiling).
+struct ProfStage {
+  std::string stage;
+  Clock::time_point t0 = Clock::now();
+  explicit ProfStage(std::string s) : stage(std::move(s)) {}
+  void done(int64_t rows = -1, std::string detail = "") {
+    if (!tProfOn) return;
+    gpuSync();
+    tProf.push_back({stage, msSince(t0), rows, std::move(detail)});
+    t0 = Clock::now();
+  }
+};
+
+struct ScanStats {
+  int segsTotal = 0, segsScanned = 0, partsTotal = 0, partsScanned = 0;
+  int64_t rowsScanned = 0, bufferRows = 0;
+  int64_t segRows = 0;  // rows of the scanned segments before sort-key range narrowing
+};
+
+// Partitions that can hold rows matching `preds`: just one when every shard-key column is pinned by
+// a `col = literal` conjunct (SingleStore's single-partition routing), otherwise all of them.
+std::vector<int> partsToScan(const Table& t, int bt, const std::vector<ExprP>& preds) {
+  if (tOnlyPart >= 0 && t.nparts > 1 && !t.reference) return tOnlyPart < t.nparts ? std::vector<int>{tOnlyPart} : std::vector<int>{};
+  std::vector<int> all(t.nparts);
+  for (int p = 0; p < t.nparts; ++p) all[p] = p;
+  if (!t.partitioned()) return all;
+  std::vector<Value> vals;
+  for (int c : t.shardKey) {
+    bool found = false;
+    for (auto& p : preds) {
+      if (p->kind != Expr::BIN || p->op != "=") continue;
+      const ExprP& a = p->args[0];
+      const ExprP& b = p->args[1];
+      const ExprP* col = a->kind == Expr::COL && b->kind == Expr::LIT ? &a : b->kind == Expr::COL && a->kind == Expr::LIT ? &b : nullptr;
+      if (!col || (*col)->bt != bt || (*col)->bc != c) continue;
+      vals.push_back((col == &a ? b : a)->lit);
+      found = true;
+      break;
+    }
+    if (!found) return all;
+  }
+  int p = t.partOfValues(vals);
+  return p < 0 ? all : std::vector<int>{p};
+}
+
+struct BatchRef {
+  int part;
+  int64_t n;
+  const std::vector<void*>* dev;
+  const uint32_t* del;
+  const std::vector<uint8_t>* enc = nullptr;  // per column ColView::enc (segments); null: all raw
+  int32_t off = 0;                            // first row, for encoded columns of a range scan
+  Segment* seg = nullptr;                     // segment batches: column reads are counted (VRAM cache)
+};
+
+// Column view of column c of a batch, for a slot whose type fields are already set.
+inline void bindView(ColView& v, const BatchRef& b, int c) {
+  if (b.seg && (size_t)c < b.seg->uses.size()) __atomic_fetch_add(&b.seg->uses[c], 1u, __ATOMIC_RELAXED);
+  v.p = (*b.dev)[c];
+  v.enc = b.enc ? (*b.enc)[c] : 0;
+  v.off = v.enc ? b.off : 0;
+}
+
+// Visits, partition by partition (ascending), every segment that survives min/max elimination and
+// then that partition's write buffer. Stops early when fn returns false.
+void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>& preds, ScanStats& st,
+               const std::function<bool(const BatchRef&)>& fn, bool dryRun = false) {
+  st.segsTotal += (int)t.segs.size();
+  st.partsTotal += t.nparts;
+  st.partsScanned += (int)parts.size();
+  // Range predicates on the SORT KEY: segments are sorted by it, so a binary search on the host
+  // mirror narrows each segment to the row range that can match (zone maps at row granularity).
+  std::vector<std::pair<std::string, double>> sortPreds;
+  if (t.sortKey >= 0 && (t.cols[t.sortKey].pt == PType::I32 || t.cols[t.sortKey].pt == PType::I64))
+    for (auto& p : preds) {
+      int bt, bc;
+      std::string op;
+      double v;
+      if (simplePred(p, bt, bc, op, v) && bc == t.sortKey) sortPreds.push_back({op, v});
+    }
+  // Read committed: other sessions' open transactions -> per-batch visibility adjustments (their
+  // inserts hidden, their deletes still visible).
+  std::map<int32_t, std::vector<std::pair<int32_t, bool>>> adjust;  // batch (segment, or -1-part) -> (row, hide)
+  for (auto& [k, v] : t.txnPending) {
+    if (k == (const void*)undoLog()) continue;
+    if (v.commitSeq && (!tSnapSeq || v.commitSeq <= tSnapSeq)) continue;  // committed before this snapshot
+    for (auto& l : v.hidden) adjust[l.seg].push_back({l.row, true});
+    for (auto& l : v.ghosts) adjust[l.seg].push_back({l.row, false});
+  }
+  auto viewDel = [&](int32_t key, const std::vector<uint32_t>& host, const uint32_t* dev) -> const uint32_t* {
+    auto it = adjust.find(key);
+    if (it == adjust.end() || dryRun) return dev;
+    std::vector<uint32_t> bits = host;
+    for (auto [r, hide] : it->second) {
+      if ((size_t)(r >> 5) >= bits.size()) bits.resize((r >> 5) + 1, 0);
+      if (hide) bits[r >> 5] |= 1u << (r & 31);
+      else bits[r >> 5] &= ~(1u << (r & 31));
+    }
+    auto d = std::make_shared<DevVec<uint32_t>>((int64_t)std::max<size_t>(bits.size(), 1));
+    h2d(d->p, bits.data(), bits.size() * 4);
+    tTxnViews.push_back(d);
+    return d->p;
+  };
+  std::vector<void*> adj;
+  for (int p : parts) {
+    for (auto& sp : t.segs) {
+      if (sp->part != p || !segMayMatch(*sp, preds)) continue;
+      int64_t lo = 0, hi = sp->n;
+      if (!sortPreds.empty() && (int)sp->host.size() > t.sortKey && !sp->host[t.sortKey].empty()) {
+        const bool i64 = t.cols[t.sortKey].pt == PType::I64;
+        const void* col = sp->host[t.sortKey].data();
+        auto at = [&](int64_t r) { return i64 ? (double)((const int64_t*)col)[r] : (double)((const int32_t*)col)[r]; };
+        auto lowerB = [&](double v) {  // first row >= v
+          int64_t a = 0, b = sp->n;
+          while (a < b) { int64_t m = (a + b) / 2; if (at(m) < v) a = m + 1; else b = m; }
+          return a;
+        };
+        auto upperB = [&](double v) {  // first row > v
+          int64_t a = 0, b = sp->n;
+          while (a < b) { int64_t m = (a + b) / 2; if (at(m) <= v) a = m + 1; else b = m; }
+          return a;
+        };
+        for (auto& [op, v] : sortPreds) {
+          if (op == ">=" || op == "=") lo = std::max(lo, lowerB(v));
+          if (op == ">") lo = std::max(lo, upperB(v));
+          if (op == "<") hi = std::min(hi, lowerB(v));
+          if (op == "<=" || op == "=") hi = std::min(hi, upperB(v));
+        }
+        lo &= ~(int64_t)31;  // the deleted-row bitmap is addressed in 32-row words
+      }
+      if (lo >= hi) continue;
+      ++st.segsScanned;
+      st.rowsScanned += hi - lo;
+      st.segRows += sp->n;
+      if (dryRun) continue;
+      const uint32_t* segDel = viewDel((int32_t)(&sp - t.segs.data()), sp->delHost, sp->delDev);
+      if (lo == 0 && hi == sp->n) {
+        if (!fn(BatchRef{p, sp->n, &sp->dev, segDel, &sp->enc, 0, sp.get()})) return;
+        continue;
+      }
+      // Raw columns: shift the pointer; encoded ones (header first): pass the row offset.
+      adj.assign(sp->dev.size(), nullptr);
+      for (size_t c = 0; c < sp->dev.size(); ++c)
+        adj[c] = sp->dev[c] && !sp->enc[c] ? (void*)((char*)sp->dev[c] + lo * t.colBytes((int)c)) : sp->dev[c];
+      if (!fn(BatchRef{p, hi - lo, &adj, segDel ? segDel + lo / 32 : nullptr, &sp->enc, (int32_t)lo, sp.get()})) return;
+    }
+    WriteBuffer& b = *t.bufs[p];
+    if (b.n > 0) {
+      st.bufferRows += b.n;
+      if (dryRun) continue;
+      t.syncBufferToDevice(p);
+      if (!fn(BatchRef{p, b.n, &b.dev, viewDel(-1 - p, b.del, b.delDev)})) return;
+    }
+  }
+}
+
+// Runs `fn(env, n, deleted)` over every batch of table bt that may hold matching rows.
+void forEachBatch(BindCtx& ctx, int bt, Compiler& comp, const std::vector<ExprP>& preds, ScanStats& st,
+                  const std::function<bool(ExprEnv&, int64_t, const uint32_t*)>& fn, bool dryRun = false) {
+  Table& t = *ctx.tabs[bt];
+  scanTable(t, partsToScan(t, bt, preds), preds, st, [&](const BatchRef& b) {
+    for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], b, comp.slotCols[k].second);
+    return fn(comp.env, b.n, b.del);
+  }, dryRun);
+}
+
+std::string scanDesc(const Table& t, const ScanStats& st) {
+  std::string r = t.name + ": scanned " + std::to_string(st.segsScanned) + "/" + std::to_string(st.segsTotal) +
+                  " GPU segments";
+  if (st.rowsScanned < st.segRows)
+    r += " (sort-key ranges: " + std::to_string(st.rowsScanned) + " of " + std::to_string(st.segRows) + " rows)";
+  if (t.nparts > 1)
+    r += " in " + std::to_string(st.partsScanned) + "/" + std::to_string(st.partsTotal) + " partitions" +
+         (st.partsScanned < st.partsTotal ? " (shard key routing)" : "");
+  return r + " + " + std::to_string(st.bufferRows) + " write-buffer rows";
+}
+
+// Value range of an integer-like column from statistics: dictionary size for strings, segment
+// min/max plus a pass over the (small) write buffers otherwise. False if unknown / empty.
+bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi) {
+  if (t.cols[bc].lt == LType::VARCHAR) {
+    lo = 0;
+    hi = (int64_t)t.dicts[bc]->strs.size() - 1;
+    return hi >= lo;
+  }
+  if (t.cols[bc].lt == LType::DOUBLE || t.cols[bc].lt == LType::DECIMAL) return false;
+  double mn = INFINITY, mx = -INFINITY;
+  for (auto& sp : t.segs) mn = std::min(mn, sp->mn[bc]), mx = std::max(mx, sp->mx[bc]);
+  for (int p = 0; p < t.nparts; ++p) {
+    WriteBuffer& b = *t.bufs[p];
+    std::lock_guard<std::mutex> g(b.devMu);
+    if (b.rangeGen != b.gen || b.rangeN > b.n || b.rmn.size() != t.cols.size()) {
+      b.rangeGen = b.gen;
+      b.rangeN = 0;
+      b.rmn.assign(t.cols.size(), INFINITY);
+      b.rmx.assign(t.cols.size(), -INFINITY);
+    }
+    if (b.rangeN < b.n) {  // newly appended rows extend every integer-like column's range
+      for (size_t c = 0; c < t.cols.size(); ++c) {
+        if (t.cols[c].lt == LType::VARCHAR || t.cols[c].lt == LType::DOUBLE || t.cols[c].lt == LType::DECIMAL ||
+            t.cols[c].pt == PType::VEC) continue;
+        double lo = b.rmn[c], hi = b.rmx[c];
+        for (int64_t r = b.rangeN; r < b.n; ++r) {
+          double v = t.cellNum(bufLoc(p, r), (int)c);
+          lo = std::min(lo, v), hi = std::max(hi, v);
+        }
+        b.rmn[c] = lo, b.rmx[c] = hi;
+      }
+      b.rangeN = b.n;
+    }
+    mn = std::min(mn, b.rmn[bc]), mx = std::max(mx, b.rmx[bc]);
+  }
+  if (!(mx >= mn)) return false;
+  lo = (int64_t)mn;
+  hi = (int64_t)mx;
+  return true;
+}
+
+thread_local bool tJoinFilters = true;            // SET gpudb_join_filters = ON|OFF
+thread_local bool tAnn = true;                    // SET gpudb_vector_index = ON|OFF (OFF: exact GPU search)
+thread_local int tNprobe = 0;                     // SET gpudb_nprobe = N (0: index default)
+thread_local int64_t tLazyRows = 2'000'000;        // SET gpudb_join_filter_rows = N (tables this big are filtered)
+
+// Would this expression compile for the GPU? (Host-only string functions over several columns don't.)
+bool gpuCompilable(const ExprP& e, BindCtx& ctx) {
+  try {
+    Compiler c(&ctx);
+    c.compile(e);
+    return true;
+  } catch (const SqlError&) {
+    return false;
+  }
+}
+
+// One stored cell as a typed host value (NULL-aware).
+Value cellValue(const Table& t, Loc l, int c) {
+  if (t.cols[c].pt == PType::VEC) {
+    const float* f = (const float*)t.colData(l, c).data() + (int64_t)l.row * t.cols[c].vecDim;
+    return f[0] != f[0] ? Value::Null() : Value::S(formatVector(f, t.cols[c].vecDim));
+  }
+  double v = t.cellNum(l, c);
+  if (t.cols[c].lt == LType::DECIMAL) return v != v ? Value::Null() : Value::Dec(v, t.cols[c].scale);
+  if (t.cols[c].pt == PType::I64 && v == v) {  // exact for BIGINT / DATETIME
+    int64_t x = ((const int64_t*)t.colData(l, c).data())[l.row];
+    return t.cols[c].lt == LType::DATETIME ? Value::Ts(x) : Value::I(x);
+  }
+  return typedVal(v, t.cols[c].lt, t.dicts[c].get());
+}
+
+// Semi-join ("join filter") applied while scanning a table: keep rows whose column bc has its
+// value set in an exact bitmap of the keys present on the other side of a join (value - lo).
+struct JoinFilter {
+  int bc;
+  int64_t lo, nbits;
+  const uint32_t* bits;  // VRAM
+  std::string desc;
+};
+
+// Filter table bt with pushed-down predicates (and join filters) and gather the needed columns
+// into VRAM.
+Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std::set<int>& needCols, int64_t maxRows,
+                std::vector<std::string>& notes, const std::vector<JoinFilter>& jfs = {}) {
+  Table& t = *ctx.tabs[bt];
+  ProfStage prof("scan+filter " + t.name);
+  Compiler comp(&ctx);
+  ExprP where = andAll(preds);
+  Prog wp;
+  const bool hasFilter = where || !jfs.empty();
+  if (hasFilter) {
+    // WHERE AND INSET(col - lo, bitmap) AND ... as one program (one fused, compiled filter).
+    comp.depth = 0;
+    wp.start = (int16_t)comp.ncode;
+    int terms = 0;
+    if (where) {
+      comp.gen(where);
+      ++terms;
+    }
+    for (auto& f : jfs) {
+      comp.emit(OP_COL, comp.slot(bt, f.bc), 1);
+      comp.emit(OP_CONST, comp.constantInt(f.lo), 1, true);
+      comp.emit(OP_SUB, 0, -1);
+      comp.emit(OP_INSET, comp.addDeviceSet(f.bits, (int)f.nbits), 0);
+      if (terms++) comp.emit(OP_AND, 0, -1);
+    }
+    wp.len = (int16_t)(comp.ncode - wp.start);
+  }
+  comp.uploadSets();
+  const JitProgram* jit = nullptr;
+  if (hasFilter) {
+    AggPlan fp;
+    fp.hasWhere = true;
+    fp.where = wp;
+    jit = jitGet(comp.env, (int)comp.slotCols.size(), fp, JF_FLAGM, "filter");
+  }
+  // All batches (segments + write buffers) are filtered in one launch with one synchronization;
+  // the selected rows (in batch order) are then gathered column by column across batches.
+  int64_t total = 0;
+  ScanStats st;
+  std::vector<int> need(needCols.begin(), needCols.end());
+  std::vector<int64_t> perPart(t.nparts, 0);
+  std::vector<int64_t> bn;
+  std::vector<const uint32_t*> bdel;
+  std::vector<ColView> bcols, srcCols;  // [batch][slot], [batch][need]
+  std::vector<int> bpart;
+  const int nslots = (int)comp.slotCols.size();
+  scanTable(t, partsToScan(t, bt, preds), preds, st, [&](const BatchRef& b) {
+    bn.push_back(b.n);
+    bdel.push_back(b.del);
+    bpart.push_back(b.part);
+    for (int k = 0; k < nslots; ++k) {
+      ColView v = comp.env.cols[k];
+      bindView(v, b, comp.slotCols[k].second);
+      bcols.push_back(v);
+    }
+    for (int c : need) {
+      ColView v{};
+      bindView(v, b, c);
+      srcCols.push_back(v);
+    }
+    return true;
+  });
+  DevVec<int32_t> sel;
+  std::vector<int64_t> perBatch;
+  total = gpuSelectMulti(comp.env, hasFilter, wp, bn, bdel, bcols, nslots, sel, perBatch, jit);
+  if (maxRows >= 0 && total > maxRows) total = maxRows;
+  {
+    int64_t left = total;
+    for (size_t b = 0; b < bn.size(); ++b) {
+      const int64_t k = std::min(left, perBatch[b]);
+      perPart[bpart[b]] += k;
+      left -= k;
+    }
+  }
+  std::vector<int64_t> boff(bn.size(), 0);
+  for (size_t b = 1; b < bn.size(); ++b) boff[b] = boff[b - 1] + bn[b - 1];
+  Rel r;
+  r.n = total;
+  r.tabs.insert(bt);
+  if (t.partitioned() && t.shardKey.size() == 1) {
+    r.partOff.assign(t.nparts + 1, 0);
+    for (int p = 0; p < t.nparts; ++p) r.partOff[p + 1] = r.partOff[p] + perPart[p];
+    r.partCols.insert({bt, t.shardKey[0]});
+  }
+  for (size_t ci = 0; ci < need.size(); ++ci) {
+    int c = need[ci];
+    RelCol rc{bt, c, t.cols[c].pt, DevVec<uint8_t>(std::max<int64_t>(total, 1) * t.colBytes(c)), t.colBytes(c)};
+    std::vector<ColView> src(bn.size());
+    for (size_t b = 0; b < bn.size(); ++b) src[b] = srcCols[b * need.size() + ci];
+    gpuGatherMulti(src, boff, rc.pt, rc.esize, sel.p, total, rc.data.p);
+    r.cols.push_back(std::move(rc));
+  }
+  std::string jdesc;
+  for (auto& f : jfs) jdesc += ", join filter " + f.desc;
+  notes.push_back("  materialize " + scanDesc(t, st) + (where ? ", filter " + where->str() : "") + jdesc + " -> " +
+                  std::to_string(total) + " rows");
+  prof.done(total, std::to_string(st.segsScanned) + "/" + std::to_string(st.segsTotal) + " segments, " +
+                       std::to_string(st.rowsScanned + st.bufferRows) + " rows scanned" + jdesc +
+                       (hasFilter ? jit ? ", filter compiled (plan #" + std::to_string(jit->id) + ")" : ", filter interpreted" : ""));
+  return r;
+}
+
+// String join keys: b's dictionary codes -> a's code space (strings a doesn't have -> -2, never
+// equal to a code). Under a case-insensitive collation both sides map to a's canonical codes.
+// Returns (map for a or empty, map for b).
+std::pair<std::vector<int32_t>, std::vector<int32_t>> joinCodeMaps(const Dict& a, const Dict& b) {
+  std::vector<int32_t> ma, mb(b.strs.size(), -2);
+  if (ciColl()) {
+    std::unordered_map<std::string, int32_t> folded;  // folded text -> first code in a
+    ma.resize(a.strs.size());
+    for (size_t i = 0; i < a.strs.size(); ++i) ma[i] = folded.emplace(foldCase(a.strs[i]), (int32_t)i).first->second;
+    parallelFor(b.strs.size(), [&](size_t s, size_t e) {
+      for (size_t i = s; i < e; ++i) {
+        auto it = folded.find(foldCase(b.strs[i]));
+        if (it != folded.end()) mb[i] = it->second;
+      }
+    });
+  } else {
+    parallelFor(b.strs.size(), [&](size_t s, size_t e) {
+      for (size_t i = s; i < e; ++i) mb[i] = a.find(b.strs[i]);
+      for (size_t i = s; i < e; ++i)
+        if (mb[i] < 0) mb[i] = -2;
+    });
+  }
+  return {ma, mb};
+}
+
+Rel hashJoin(Rel& a, Rel& b, int abt, int abc, int bbt, int bbc, std::vector<std::string>& notes,
+             const Dict* da = nullptr, const Dict* db = nullptr) {
+  ProfStage prof("hash join");
+  bool aBuild = a.n <= b.n;
+  Rel& build = aBuild ? a : b;
+  Rel& probe = aBuild ? b : a;
+  int bk = aBuild ? a.find(abt, abc) : b.find(bbt, bbc);
+  int pk = aBuild ? b.find(bbt, bbc) : a.find(abt, abc);
+  // String keys from different dictionaries: join on remapped codes (temporary key columns).
+  DevVec<int32_t> remapA, remapB;
+  const void* keyA = (aBuild ? build : probe).cols[aBuild ? bk : pk].data.p;
+  const void* keyB = (aBuild ? probe : build).cols[aBuild ? pk : bk].data.p;
+  if (da && db && da != db) {
+    auto [ma, mb] = joinCodeMaps(*da, *db);
+    auto apply = [&](const void* keys, int64_t n, const std::vector<int32_t>& m, DevVec<int32_t>& out) {
+      DevVec<int32_t> md((int64_t)std::max<size_t>(m.size(), 1));
+      if (!m.empty()) h2d(md.p, m.data(), m.size() * 4);
+      out = DevVec<int32_t>(std::max<int64_t>(n, 1));
+      gpuRemapCodes((const int32_t*)keys, n, md.p, (int64_t)m.size(), out.p);
+    };
+    const int64_t na = aBuild ? build.n : probe.n, nb = aBuild ? probe.n : build.n;
+    if (!ma.empty()) apply(keyA, na, ma, remapA), keyA = remapA.p;
+    apply(keyB, nb, mb, remapB), keyB = remapB.p;
+  }
+  const void* buildKey = aBuild ? keyA : keyB;
+  const void* probeKey = aBuild ? keyB : keyA;
+  // DOUBLE keys (on either side): join on the float64 bit patterns (-0.0 = 0.0; NULL never matches),
+  // the integer side converted to double first.
+  PType buildPt = build.cols[bk].pt, probePt = probe.cols[pk].pt;
+  DevVec<int64_t> fbits[2];
+  if (buildPt == PType::F64 || probePt == PType::F64) {
+    for (int sd = 0; sd < 2; ++sd) {
+      Rel& r = sd == 0 ? build : probe;
+      const void* key = sd == 0 ? buildKey : probeKey;
+      const PType pt = sd == 0 ? buildPt : probePt;
+      std::vector<int64_t> k(r.n);
+      if (pt == PType::F64) {
+        std::vector<double> h(r.n);
+        if (r.n) d2h(h.data(), key, r.n * 8);
+        for (int64_t i = 0; i < r.n; ++i) {
+          double d = h[i] == 0 ? 0.0 : h[i];
+          if (d != d) k[i] = kNullI64;
+          else memcpy(&k[i], &d, 8);
+        }
+      } else {
+        const bool i64 = pt == PType::I64;
+        std::vector<uint8_t> raw(r.n * (i64 ? 8 : 4));
+        if (r.n) d2h(raw.data(), key, raw.size());
+        for (int64_t i = 0; i < r.n; ++i) {
+          const int64_t v = i64 ? ((const int64_t*)raw.data())[i] : ((const int32_t*)raw.data())[i];
+          if (v == (i64 ? kNullI64 : (int64_t)kNullI32)) { k[i] = kNullI64; continue; }
+          double d = (double)v;
+          if (d == 0) d = 0;
+          memcpy(&k[i], &d, 8);
+        }
+      }
+      fbits[sd] = DevVec<int64_t>(std::max<int64_t>(r.n, 1));
+      if (r.n) h2d(fbits[sd].p, k.data(), r.n * 8);
+    }
+    buildKey = fbits[0].p, probeKey = fbits[1].p;
+    buildPt = probePt = PType::I64;
+  }
+  // Co-located join: both inputs are hash-partitioned the same way on exactly these join columns,
+  // so partition p of one side can only match partition p of the other.
+  auto intLike = [](PType t) { return t != PType::F64; };
+  const bool coloc = !build.partOff.empty() && build.partOff.size() == probe.partOff.size() &&
+                     a.partCols.count({abt, abc}) && b.partCols.count({bbt, bbc}) && intLike(build.cols[bk].pt) &&
+                     intLike(probe.cols[pk].pt);
+  std::vector<int64_t> bOff = coloc ? build.partOff : std::vector<int64_t>{0, build.n};
+  std::vector<int64_t> pOff = probe.partOff.empty() ? std::vector<int64_t>{0, probe.n} : probe.partOff;
+  std::vector<int64_t> outOff;
+  DevVec<int32_t> ib, ip;
+  int64_t m = gpuHashJoinParts(viewOf(buildKey, buildPt), bOff, viewOf(probeKey, probePt), pOff, ib, ip, &outOff);
+  Rel out;
+  out.n = m;
+  if (!probe.partOff.empty()) {  // output keeps the probe side's partitioning
+    out.partOff = outOff;
+    out.partCols = probe.partCols;
+    if (coloc) out.partCols.insert(build.partCols.begin(), build.partCols.end());
+  }
+  out.tabs = a.tabs;
+  out.tabs.insert(b.tabs.begin(), b.tabs.end());
+  for (auto* side : {&build, &probe}) {
+    const int32_t* idx = side == &build ? ib.p : ip.p;
+    for (auto& c : side->cols) {
+      RelCol rc{c.bt, c.bc, c.pt, DevVec<uint8_t>(std::max<int64_t>(m, 1) * c.esize), c.esize};
+      gatherCol(c.data.p, c.pt, c.esize, idx, m, rc.data.p, false);
+      out.cols.push_back(std::move(rc));
+    }
+  }
+  notes.push_back(std::string("  GPU hash join") +
+                  (coloc ? " (co-located, " + std::to_string(bOff.size() - 1) + " partitions)" : " (broadcast build side)") +
+                  ": build " + std::to_string(build.n) + " rows, probe " + std::to_string(probe.n) + " rows -> " +
+                  std::to_string(m) + " rows");
+  prof.done(m, std::string(coloc ? "co-located" : "broadcast") + ", build " + std::to_string(build.n) + " x probe " +
+                   std::to_string(probe.n));
+  return out;
+}
+
+// Outer hash join of two relations on lt.lc = rt.rc. type 1: LEFT (keep every row of a), 2: RIGHT
+// (keep every row of b), 3: FULL. Columns of the side that can be missing come out NULL.
+Rel outerJoin(Rel& a, Rel& b, int lt, int lc, int rt, int rc, int type, std::vector<std::string>& notes,
+              const Dict* da = nullptr, const Dict* db = nullptr) {
+  ProfStage prof("outer hash join");
+  Rel& build = type == 2 ? a : b;
+  Rel& probe = type == 2 ? b : a;
+  int bk = type == 2 ? a.find(lt, lc) : b.find(rt, rc);
+  int pk = type == 2 ? b.find(rt, rc) : a.find(lt, lc);
+  if (bk < 0 || pk < 0) throw SqlError("internal: outer join key not materialized", 1105);
+  // String keys from different dictionaries: b's codes (and a's, under _ci) remapped to a's.
+  const int ak = type == 2 ? bk : pk, bkk = type == 2 ? pk : bk;
+  const void* keyA = a.cols[ak].data.p;
+  const void* keyB = b.cols[bkk].data.p;
+  DevVec<int32_t> remapA, remapB;
+  if (da && db && da != db) {
+    auto [ma, mb] = joinCodeMaps(*da, *db);
+    auto apply = [&](const void* keys, int64_t n, const std::vector<int32_t>& m, DevVec<int32_t>& out) {
+      DevVec<int32_t> md((int64_t)std::max<size_t>(m.size(), 1));
+      if (!m.empty()) h2d(md.p, m.data(), m.size() * 4);
+      out = DevVec<int32_t>(std::max<int64_t>(n, 1));
+      gpuRemapCodes((const int32_t*)keys, n, md.p, (int64_t)m.size(), out.p);
+    };
+    if (!ma.empty()) apply(keyA, a.n, ma, remapA), keyA = remapA.p;
+    apply(keyB, b.n, mb, remapB), keyB = remapB.p;
+  }
+  const void* buildKey = type == 2 ? keyA : keyB;
+  const void* probeKey = type == 2 ? keyB : keyA;
+  DevVec<int32_t> ib, ip;
+  int64_t m = gpuHashJoinOuter(viewOf(buildKey, build.cols[bk].pt), build.n, viewOf(probeKey, probe.cols[pk].pt), probe.n, ib, ip, type == 3);
+  Rel out;
+  out.n = m;
+  out.tabs = a.tabs;
+  out.tabs.insert(b.tabs.begin(), b.tabs.end());
+  for (auto* side : {&build, &probe}) {
+    const int32_t* idx = side == &build ? ib.p : ip.p;
+    const bool nul = side == &build || type == 3;
+    for (auto& c : side->cols) {
+      RelCol rc2{c.bt, c.bc, c.pt, DevVec<uint8_t>(std::max<int64_t>(m, 1) * c.esize), c.esize};
+      gatherCol(c.data.p, c.pt, c.esize, idx, m, rc2.data.p, nul);
+      out.cols.push_back(std::move(rc2));
+    }
+  }
+  static const char* names[] = {"", "LEFT", "RIGHT", "FULL"};
+  notes.push_back(std::string("  GPU ") + names[type] + " OUTER hash join: build " + std::to_string(build.n) +
+                  " rows, probe " + std::to_string(probe.n) + " rows -> " + std::to_string(m) + " rows");
+  prof.done(m, std::string(names[type]) + " outer");
+  return out;
+}
+
+Rel crossJoin(Rel& a, Rel& b, std::vector<std::string>& notes) {
+  ProfStage prof("cross join");
+  DevVec<int32_t> ia, ib;
+  int64_t m = gpuCrossJoin(a.n, b.n, ia, ib);
+  Rel out;
+  out.n = m;
+  out.tabs = a.tabs;
+  out.tabs.insert(b.tabs.begin(), b.tabs.end());
+  for (auto* side : {&a, &b}) {
+    const int32_t* idx = side == &a ? ia.p : ib.p;
+    for (auto& c : side->cols) {
+      RelCol rc{c.bt, c.bc, c.pt, DevVec<uint8_t>(std::max<int64_t>(m, 1) * c.esize), c.esize};
+      gatherCol(c.data.p, c.pt, c.esize, idx, m, rc.data.p, false);
+      out.cols.push_back(std::move(rc));
+    }
+  }
+  notes.push_back("  GPU cross join: " + std::to_string(a.n) + " x " + std::to_string(b.n) + " -> " + std::to_string(m) + " rows");
+  prof.done(m);
+  return out;
+}
+
+// Column defaults for an INSERT that doesn't name every column: DEFAULT value, CURRENT_TIMESTAMP, or NULL.
+std::vector<Value> defaultRow(const Table& t) {
+  std::vector<Value> vals(t.cols.size(), Value::Null());
+  for (size_t i = 0; i < t.cols.size(); ++i) {
+    const ColumnMeta& c = t.cols[i];
+    if (!c.hasDefault) continue;
+    if (c.def.kind == Value::STR && c.def.s == "CURRENT_TIMESTAMP")
+      vals[i] = c.lt == LType::DATE ? Value::Dt(floorDiv(nowUs(), kUsPerDay)) : Value::Ts(nowUs() / 1000000 * 1000000);
+    else
+      vals[i] = c.def;
+  }
+  return vals;
+}
+
+ResultSet okResult(int64_t affected, std::string info = "") {
+  ResultSet r;
+  r.affected = affected;
+  r.info = std::move(info);
+  return r;
+}
+
+}  // namespace
+
+// ================================================================== Engine
+
+// ---- Pipelines (SingleStore CREATE PIPELINE .. AS LOAD DATA FS '/dir/*.csv' INTO TABLE t): a
+// background thread polls the glob and loads each new file once, through the normal (logged) LOAD.
+struct Pipeline {
+  std::string name, db, table, glob, delim, cols;
+  int64_t skip = 0;
+  std::atomic<bool> running{false};
+  bool wantRun = false;
+  std::thread th;
+  std::mutex mu;  // guards the fields below
+  std::set<std::string> done;
+  int64_t files = 0, rows = 0;
+  std::string state = "Stopped", lastError, createdSql;
+};
+
+
+Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
+    : dir_(dataDir), sync_(syncWal), nparts_(std::max(partitions, 1)) {
+  vramTh_ = std::thread([this] {
+    while (!vramStop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      try { vramBalance(); } catch (...) {}
+    }
+  });
+  flushTh_ = std::thread([this] {  // async durability: everything committed is on disk within ~interval
+    const int ms = getenv("GPUDB_FLUSH_MS") ? std::max(1, atoi(getenv("GPUDB_FLUSH_MS"))) : 10;
+    while (!vramStop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+      bool behind;
+      {
+        std::lock_guard<std::mutex> g(walMu_);
+        std::lock_guard<std::mutex> g2(syncMu_);
+        behind = wal_ && walWritten_ > walSynced_;
+      }
+      if (behind) walSyncNow();
+    }
+  });
+}
+
+// When columns live on the host tier (over --vram-limit, or VRAM was full), keep the columns queries
+// actually read in VRAM: per-column read counts decay into heat; the hottest columns that fit the
+// budget are wanted in VRAM, resident columns outside that set are moved out first to make room.
+// Copies and mappings are made outside the table lock; only the pointer swap takes it exclusively
+// (running queries hold it shared, so none still reads an old pointer when it is freed).
+void Engine::vramBalance() {
+  struct Ent {
+    std::shared_ptr<Table> t;
+    Segment* seg;
+    int c;
+    size_t bytes;
+    bool resident;
+    float heat;  // ordering key: PIN first, NEVER last, otherwise the decayed read count
+    int hint;    // 0 AUTO, 1 PIN, 2 NEVER
+  };
+  static const bool off = getenv("GPUDB_NO_VRAM_CACHE") != nullptr;  // static placement (A/B comparisons)
+  if (off) return;
+  std::vector<std::shared_ptr<Table>> tabs;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables) tabs.push_back(t);
+  }
+  std::vector<Ent> ents;
+  bool anyMapped = false, neverResident = false;
+  int64_t resident = 0;
+  for (auto& t : tabs) {
+    std::shared_lock<FairSharedMutex> lk(t->mu);
+    for (auto& sp : t->segs) {
+      Segment& sg = *sp;
+      if (sg.uses.size() != sg.dev.size()) continue;  // GPU-built temp segments: not cacheable
+      for (size_t c = 0; c < sg.dev.size(); ++c) {
+        const std::vector<uint8_t>& h = sg.enc[c] ? sg.encHost[c] : sg.host[c];
+        if (!sg.dev[c] || h.empty()) continue;
+        const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
+        sg.heat[c] = sg.heat[c] * 0.9f + (float)u;
+        const int hint = t->vramHint((int)c);
+        anyMapped |= sg.mapped[c] != 0;
+        neverResident |= hint == 2 && !sg.mapped[c];
+        if (!sg.mapped[c]) resident += (int64_t)h.size();
+        ents.push_back({t, &sg, (int)c, h.size(), !sg.mapped[c], hint == 1 ? 1e30f : hint == 2 ? -1.f : sg.heat[c], hint});
+      }
+    }
+  }
+  if (!anyMapped && !neverResident) return;
+  const int64_t limit = gpuVramLimit();
+  const int64_t budget = limit != INT64_MAX ? limit : resident + std::max<int64_t>(0, gpuVramFree() - (1ll << 30));
+  // Hottest first; at equal heat resident columns stay (no churn).
+  std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+    if (a.heat != b.heat) return a.heat > b.heat;
+    return a.resident > b.resident;
+  });
+  int64_t cum = 0;
+  std::vector<const Ent*> promote, demote;
+  for (auto& e : ents) {
+    const bool want = e.hint != 2 && e.heat > 0.05f && cum + (int64_t)e.bytes <= budget;
+    if (want) cum += (int64_t)e.bytes;
+    if (want && !e.resident) promote.push_back(&e);
+    // Resident and not wanted: only moved out when the space is needed for a hotter column (VRAM =
+    // NEVER: always).
+    if (!want && e.resident) demote.push_back(&e);
+  }
+  if (promote.empty() && !neverResident) return;
+  int64_t need = 0;
+  for (auto* e : promote) need += (int64_t)e->bytes;
+  need = std::min<int64_t>(need, 256ll << 20);  // bounded work per round
+  const int64_t room = budget - resident;
+  // Coldest first among the demotion candidates; a column is only moved out for one at least 1.5x
+  // hotter (no ping-pong when the working set is larger than the budget).
+  std::reverse(demote.begin(), demote.end());
+  {
+    float coldestIn = INFINITY;
+    int64_t acc = 0;
+    for (auto* e : promote) {
+      if (acc >= need) break;
+      coldestIn = std::min(coldestIn, e->heat);
+      acc += (int64_t)e->bytes;
+    }
+    demote.erase(std::remove_if(demote.begin(), demote.end(), [&](const Ent* e) { return e->hint != 2 && e->heat * 1.5f >= coldestIn; }), demote.end());
+    std::stable_partition(demote.begin(), demote.end(), [](const Ent* e) { return e->hint == 2; });  // NEVER first
+  }
+  struct Move {
+    const Ent* e;
+    void* nptr;
+  };
+  std::map<Table*, std::vector<Move>> moves;
+  int64_t freed = 0;
+  auto hostOf = [](Segment& sg, int c) -> std::vector<uint8_t>& { return sg.enc[c] ? sg.encHost[c] : sg.host[c]; };
+  auto alive = [](Table& t, const Segment* sg) {
+    for (auto& sp : t.segs)
+      if (sp.get() == sg) return true;
+    return false;
+  };
+  for (auto* e : demote) {
+    if (e->hint != 2 && room + freed >= need) break;
+    std::shared_lock<FairSharedMutex> lk(e->t->mu);  // the segment stays alive while it is mapped
+    if (!alive(*e->t, e->seg)) continue;
+    std::vector<uint8_t>& h = hostOf(*e->seg, e->c);
+    void* d = hostMap(h.data(), h.size());
+    if (!d) continue;
+    moves[e->t.get()].push_back({e, d});
+    freed += (int64_t)e->bytes;
+  }
+  // Swap demotions in first (frees VRAM), then copy the promotions in.
+  auto apply = [&](std::map<Table*, std::vector<Move>>& mv, bool toVram) {
+    for (auto& [tp, list] : mv) {
+      std::vector<std::pair<void*, size_t>> oldDev;  // freed after the swap
+      std::vector<void*> oldHost;
+      {
+        std::unique_lock<FairSharedMutex> lk(tp->mu);
+        for (auto& m : list) {
+          const bool live = alive(*tp, m.e->seg);
+          if (!live) {  // segment gone: undo (its host bytes went with it)
+            if (toVram) vramRelease(m.nptr, m.e->bytes);
+            continue;
+          }
+          Segment& sg = *m.e->seg;
+          std::vector<uint8_t>& h = hostOf(sg, m.e->c);
+          if ((sg.mapped[m.e->c] != 0) == !toVram) {  // already moved: undo
+            if (toVram) vramRelease(m.nptr, m.e->bytes);
+            else hostUnmap(h.data());
+            continue;
+          }
+          void* old = sg.dev[m.e->c];
+          sg.dev[m.e->c] = m.nptr;
+          sg.mapped[m.e->c] = toVram ? 0 : 1;
+          if (toVram) oldHost.push_back(h.data());
+          else oldDev.push_back({old, m.e->bytes});
+        }
+      }
+      for (auto& [p, b] : oldDev) vramRelease(p, b);
+      for (void* p : oldHost) hostUnmap(p);
+    }
+  };
+  apply(moves, false);
+  std::map<Table*, std::vector<Move>> ups;
+  int64_t done = 0;
+  for (auto* e : promote) {
+    if (done >= need) break;
+    std::shared_lock<FairSharedMutex> lk(e->t->mu);
+    if (!alive(*e->t, e->seg)) continue;
+    const std::vector<uint8_t>& h = hostOf(*e->seg, e->c);
+    void* d = vramAcquire(h.data(), h.size());
+    if (!d) break;  // budget reached
+    ups[e->t.get()].push_back({e, d});
+    done += (int64_t)e->bytes;
+  }
+  apply(ups, true);
+  if (getenv("GPUDB_TRACE") && (freed || done))
+    fprintf(stderr, "[trace] vram cache: moved %.0f MB out, %.0f MB in (budget %.0f MB)\n", freed / 1048576.0, done / 1048576.0, budget / 1048576.0);
+}
+
+Engine::~Engine() {
+  vramStop_ = true;
+  if (vramTh_.joinable()) vramTh_.join();
+  if (flushTh_.joinable()) flushTh_.join();
+  if (wal_) { fflush(wal_); fdatasync(fileno(wal_)); }
+  std::vector<std::shared_ptr<Pipeline>> ps;
+  {
+    std::lock_guard<std::mutex> g(pipesMu_);
+    for (auto& [n, p] : pipes_) ps.push_back(p);
+  }
+  for (auto& p : ps) stopPipeline(*p);
+  if (wal_) fclose(wal_);
+}
+
+// Replays one WAL file (format 1: u64 length + payload; format 2: header, u32 length + u32 CRC32 +
+// payload). Stops at the first torn or corrupt record; repairTail truncates the file there, so
+// records appended later are not hidden behind garbage. Returns the number of records applied.
+int64_t Engine::replayWal(const std::string& path, bool repairTail) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return 0;
+  fseeko(f, 0, SEEK_END);
+  const int64_t size = ftello(f);
+  fseeko(f, 0, SEEK_SET);
+  char hdr[8];
+  const bool v2 = fread(hdr, 1, 8, f) == 8 && memcmp(hdr, "GDBWAL2\n", 8) == 0;
+  if (!v2) fseeko(f, 0, SEEK_SET);
+  int64_t good = ftello(f), n = 0;
+  replaying_ = true;
+  auto apply = [&](std::string sql) {
+    size_t sep = sql.find('\x1f');
+    if (sep != std::string::npos) {  // "<db>\x1f<statement>"
+      currentDb() = sql.substr(0, sep);
+      sql = sql.substr(sep + 1);
+    }
+    try {
+      execute(sql);
+    } catch (std::exception& e) {
+      fprintf(stderr, "WAL replay error: %s\n", e.what());
+    }
+  };
+  for (;;) {
+    const int64_t at = ftello(f);
+    uint64_t len = 0;
+    uint32_t crc = 0;
+    if (v2) {
+      uint32_t l32;
+      if (fread(&l32, 4, 1, f) != 1 || fread(&crc, 4, 1, f) != 1) break;
+      len = l32;
+    } else if (fread(&len, 8, 1, f) != 1) {
+      break;
+    }
+    if (v2 && len == 0) break;  // the pre-zeroed space after the last record
+    if (len > (uint64_t)(size - at)) break;  // torn (or garbage) length
+    std::string rec(len, '\0');
+    if (fread(rec.data(), 1, len, f) != len) break;
+    if (v2 && (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)len) != crc) {
+      fprintf(stderr, "[gpu-db] WAL %s: checksum mismatch at offset %lld; ignoring the rest\n", path.c_str(), (long long)at);
+      break;
+    }
+    if (rec.rfind("\x1eTXN", 0) == 0) {  // a committed transaction: its statements, applied together
+      size_t i = 4;
+      while (i + 4 <= rec.size()) {
+        uint32_t l;
+        memcpy(&l, rec.data() + i, 4);
+        i += 4;
+        if (i + l > rec.size()) break;
+        apply(rec.substr(i, l));
+        i += l;
+      }
+    } else {
+      apply(rec);
+    }
+    ++n;
+    good = ftello(f);
+  }
+  fclose(f);
+  replaying_ = false;
+  if (repairTail && good < size) {  // pre-zeroed space (normal) or a torn / corrupt tail: cut it off either way
+    bool zeros = true;
+    if (FILE* g = fopen(path.c_str(), "rb")) {
+      fseeko(g, good, SEEK_SET);
+      char buf[65536];
+      size_t k;
+      while (zeros && (k = fread(buf, 1, sizeof buf, g)) > 0)
+        for (size_t i = 0; i < k && zeros; ++i) zeros = buf[i] == 0;
+      fclose(g);
+    }
+    if (!zeros) fprintf(stderr, "[gpu-db] WAL %s: dropping incomplete records at the end (offset %lld)\n", path.c_str(), (long long)good);
+    if (truncate(path.c_str(), good) != 0) perror("truncate WAL");
+  }
+  if (repairTail && !v2 && size > 0) {  // upgrade a format-1 log: rewrite it in format 2
+    std::vector<std::string> keep;
+    if (FILE* g = fopen(path.c_str(), "rb")) {
+      for (;;) {
+        uint64_t len;
+        if (fread(&len, 8, 1, g) != 1) break;
+        std::string rec(len, '\0');
+        if (fread(rec.data(), 1, len, g) != len) break;
+        keep.push_back(std::move(rec));
+      }
+      fclose(g);
+    }
+    const std::string tmp = path + ".v2";
+    if (FILE* g = fopen(tmp.c_str(), "wb")) {
+      fwrite("GDBWAL2\n", 1, 8, g);
+      for (auto& rec : keep) {
+        const uint32_t l = (uint32_t)rec.size(), c = (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)rec.size());
+        fwrite(&l, 4, 1, g);
+        fwrite(&c, 4, 1, g);
+        fwrite(rec.data(), 1, rec.size(), g);
+      }
+      fflush(g);
+      fdatasync(fileno(g));
+      fclose(g);
+      rename(tmp.c_str(), path.c_str());
+    }
+  }
+  return n;
+}
+
+// The WAL is written into space zeroed ahead of time (64 MB at a time), so a commit's fdatasync only
+// flushes data blocks: the file size, and with it the filesystem journal, change once per chunk.
+void Engine::walOpen(bool truncate) {
+  const std::string path = dir_ + "/wal.log";
+  wal_ = fopen(path.c_str(), truncate ? "w+b" : "r+b");
+  if (!wal_ && !truncate) wal_ = fopen(path.c_str(), "w+b");
+  if (!wal_) return;
+  fseeko(wal_, 0, SEEK_END);
+  walOff_ = walCap_ = ftello(wal_);  // after replay the file ends at its last record
+  if (walOff_ == 0) {
+    fwrite("GDBWAL2\n", 1, 8, wal_);
+    fflush(wal_);
+    walOff_ = walCap_ = 8;
+  }
+}
+
+void Engine::walAppendLocked(const std::string& rec) {
+  if (!wal_) return;
+  const uint32_t len = (uint32_t)rec.size(), crc = (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)rec.size());
+  const int64_t need = 8 + (int64_t)rec.size();
+  if (walOff_ + need > walCap_) {  // zero the next chunk (and make its size durable) before using it
+    const int64_t chunk = std::max<int64_t>(64ll << 20, need);
+    static const std::vector<char> zeros(1 << 20, 0);
+    fseeko(wal_, walCap_, SEEK_SET);
+    for (int64_t w = 0; w < chunk; w += (int64_t)zeros.size()) fwrite(zeros.data(), 1, (size_t)std::min<int64_t>(zeros.size(), chunk - w), wal_);
+    fflush(wal_);
+    fdatasync(fileno(wal_));
+    walCap_ += chunk;
+  }
+  fseeko(wal_, walOff_, SEEK_SET);
+  fwrite(&len, 4, 1, wal_);
+  fwrite(&crc, 4, 1, wal_);
+  fwrite(rec.data(), 1, rec.size(), wal_);
+  fflush(wal_);
+  walOff_ += need;
+  ++walWritten_;
+}
+
+// Durability, as in SingleStore: async by default (a commit is acknowledged once it is in the WAL in
+// the OS page cache, which survives a process crash; a background thread makes it durable on disk
+// within ~10 ms, and writers are throttled if that falls behind), sync for databases created WITH
+// SYNC DURABILITY, sessions with SET gpudb_sync_durability = ON, or every write with --sync-durability.
+thread_local int tSyncDurability = -1;  // SET gpudb_sync_durability: -1 database / server default, 0 off, 1 on
+bool Engine::needsSync(const std::string& db) {
+  if (tSyncDurability >= 0) return tSyncDurability == 1;
+  if (sync_) return true;
+  std::lock_guard<std::mutex> g(cat_.mu);
+  return !cat_.syncDbs.empty() && cat_.syncDbs.count(lower(db.empty() ? currentDb() : db)) > 0;
+}
+void Engine::walSyncNow() { walDurable(true); }
+
+// Group commit: the first waiter syncs everything written so far; the others wait for that sync.
+void Engine::walDurable(bool wait) {
+  if (!wal_) return;
+  if (!wait) {  // async durability: only throttle when the disk is far behind (64K records)
+    uint64_t written;
+    {
+      std::lock_guard<std::mutex> g(walMu_);
+      written = walWritten_;
+    }
+    {
+      std::lock_guard<std::mutex> g(syncMu_);
+      if (written - walSynced_ < 65536) return;
+    }
+  }
+  uint64_t mine;
+  {
+    std::lock_guard<std::mutex> g(walMu_);
+    mine = walWritten_;
+  }
+  std::unique_lock<std::mutex> lk(syncMu_);
+  while (walSynced_ < mine) {
+    if (syncing_) {
+      syncCv_.wait(lk);
+      continue;
+    }
+    syncing_ = true;
+    lk.unlock();
+    uint64_t target;
+    int fd;
+    {
+      std::lock_guard<std::mutex> g(walMu_);
+      target = walWritten_;
+      fd = wal_ ? fileno(wal_) : -1;
+    }
+    if (fd >= 0) fdatasync(fd);
+    lk.lock();
+    walSynced_ = std::max(walSynced_, target);
+    syncing_ = false;
+    syncCv_.notify_all();
+  }
+}
+
+void Engine::recover() {
+  if (dir_.empty()) return;
+  replaying_ = true;
+  loadSnapshot(dir_ + "/snapshot.bin");
+  replaying_ = false;
+  std::string path = dir_ + "/wal.log";
+  // An interrupted SNAPSHOT (see writeSnapshot): snapshot.bin.tmp left over means the new snapshot was
+  // not installed, so the rotated-out wal.old still has to be replayed; otherwise wal.old is covered.
+  const std::string old = dir_ + "/wal.old";
+  const bool tmpLeft = access((dir_ + "/snapshot.bin.tmp").c_str(), F_OK) == 0;
+  if (tmpLeft) unlink((dir_ + "/snapshot.bin.tmp").c_str());
+  {
+    auto t0 = Clock::now();
+    int64_t n = 0;
+    if (access(old.c_str(), F_OK) == 0) {
+      if (tmpLeft) n += replayWal(old, false);
+      unlink(old.c_str());
+    }
+    n += replayWal(path, true);
+    fprintf(stderr, "[gpu-db] replayed %lld WAL records in %.0f ms\n", (long long)n, msSince(t0));
+  }
+  {
+    std::vector<std::shared_ptr<Table>> all;
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      for (auto& [k, t] : cat_.tables) all.push_back(t);
+    }
+    for (auto& t : all) warmDicts(t);
+  }
+  walOpen(false);
+  // Pipelines that were running when the server stopped resume now (after replay, so their
+  // loads are logged and files loaded before the restart are not loaded again).
+  std::vector<std::shared_ptr<Pipeline>> resume;
+  {
+    std::lock_guard<std::mutex> g(pipesMu_);
+    for (auto& [n, p] : pipes_)
+      if (p->wantRun) resume.push_back(p);
+  }
+  for (auto& p : resume) startPipeline(p);
+  if (!wal_) fprintf(stderr, "[gpu-db] warning: cannot open WAL %s\n", path.c_str());
+}
+
+// Per-connection transaction: writes are visible immediately (read uncommitted), WAL records are
+// held until COMMIT, and ROLLBACK replays the undo log backwards.
+struct Txn {
+  bool active = false;
+  bool autocommit = true;
+  bool needSync = false;  // a write to a SYNC DURABILITY database (or a sync session): COMMIT waits for the disk
+  std::vector<std::string> wal;
+  std::vector<UndoRec> undo;
+  std::vector<std::pair<std::string, std::pair<size_t, size_t>>> savepoints;  // name -> (undo size, wal size)
+};
+thread_local Txn tTxn;
+
+// ---- Read committed: an open transaction's changes are applied to the tables (so it reads its own
+// writes) and recorded in Table::txnPending; other sessions' scans see the committed state through
+// per-batch visibility bitmaps, and their writes to those tables wait for the COMMIT / ROLLBACK.
+void waitTxnFree(Table& t, std::unique_lock<FairSharedMutex>& lk) {
+  const auto t0 = Clock::now();
+  while (foreignPending(t)) {
+    if (msSince(t0) > 10000) throw SqlError("Lock wait timeout exceeded; another transaction has uncommitted changes to " + t.name, 1205);
+    lk.unlock();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    lk.lock();
+  }
+}
+// Row-level write conflicts: does another open transaction have uncommitted changes to these rows?
+bool rowsPending(const Table& t, const std::vector<Loc>& rows) {
+  std::unordered_set<int64_t> mine;
+  for (auto& [k, v] : t.txnPending) {
+    if (k == (const void*)undoLog() || v.commitSeq) continue;
+    for (const Loc& l : v.hidden) mine.insert((int64_t)l.seg << 32 | (uint32_t)l.row);
+    for (const Loc& l : v.ghosts) mine.insert((int64_t)l.seg << 32 | (uint32_t)l.row);
+  }
+  if (mine.empty()) return false;
+  for (const Loc& l : rows)
+    if (mine.count((int64_t)l.seg << 32 | (uint32_t)l.row)) return true;
+  return false;
+}
+// Inserts only conflict through unique keys (another transaction's uncommitted row with the same key).
+bool hasUniqueKey(const Table& t) {
+  if (t.pk >= 0 || !t.pkCols.empty()) return true;
+  for (auto& ix : t.indexes)
+    if (ix.unique) return true;
+  return false;
+}
+
+void clearTxnPending(Catalog& cat, const void* key) {
+  std::vector<std::shared_ptr<Table>> ts;
+  {
+    std::lock_guard<std::mutex> g(cat.mu);
+    for (auto& [k, t] : cat.tables) ts.push_back(t);
+  }
+  for (auto& t : ts) {
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    t->txnPending.erase(key);
+  }
+}
+
+// COMMIT with snapshots running: the transaction's change set stays, tagged with its commit sequence
+// (under a key of its own), so the older snapshots keep not seeing it.
+static void retireTxnPending(Catalog& cat, const void* key) {
+  const uint64_t seq = ++gCommitSeq;
+  if (!snapshotsActive()) return clearTxnPending(cat, key);
+  static std::atomic<uintptr_t> next{1};
+  std::vector<std::shared_ptr<Table>> ts;
+  {
+    std::lock_guard<std::mutex> g(cat.mu);
+    for (auto& [k, t] : cat.tables) ts.push_back(t);
+  }
+  for (auto& t : ts) {
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    auto it = t->txnPending.find(key);
+    if (it == t->txnPending.end()) continue;
+    TxnPending tp = std::move(it->second);
+    t->txnPending.erase(it);
+    if (tp.hidden.empty() && tp.ghosts.empty()) continue;
+    tp.commitSeq = seq;
+    t->txnPending[(const void*)(next++ * 2 + 1)] = std::move(tp);  // (odd: never an undo log's address)
+  }
+}
+// Drops retired change sets no active snapshot needs (committed before the oldest one).
+static void gcRetired(Catalog& cat) {
+  uint64_t oldest = UINT64_MAX;
+  {
+    std::lock_guard<std::mutex> g(gSnapMu);
+    if (!gSnaps.empty()) oldest = *gSnaps.begin();
+  }
+  std::vector<std::shared_ptr<Table>> ts;
+  {
+    std::lock_guard<std::mutex> g(cat.mu);
+    for (auto& [k, t] : cat.tables) ts.push_back(t);
+  }
+  for (auto& t : ts) {
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    for (auto it = t->txnPending.begin(); it != t->txnPending.end();)
+      if (it->second.commitSeq && (oldest == UINT64_MAX || it->second.commitSeq <= oldest)) it = t->txnPending.erase(it);
+      else ++it;
+  }
+}
+static void endSnapshot(Catalog& cat) {
+  if (!tSnapSeq) return;
+  {
+    std::lock_guard<std::mutex> g(gSnapMu);
+    auto it = gSnaps.find(tSnapSeq);
+    if (it != gSnaps.end()) gSnaps.erase(it);
+  }
+  tSnapSeq = 0;
+  gcRetired(cat);
+}
+
+void Engine::commitTxn() {
+  if (!tTxn.active) return;
+  undoLog() = nullptr;
+  retireTxnPending(cat_, &tTxn.undo);  // the changes become visible (to snapshots taken from now on)
+  struct EndSnap { Catalog& c; ~EndSnap() { endSnapshot(c); } } endSnap{cat_};
+  if (!replaying_ && !tTxn.wal.empty()) {
+    {
+      std::lock_guard<std::mutex> g(walMu_);
+      std::string bundle = "\x1eTXN";  // one WAL record: replayed all or nothing
+      for (auto& rec : tTxn.wal) {
+        replAppend(rec);
+        const uint32_t l = (uint32_t)rec.size();
+        bundle.append((const char*)&l, 4);
+        bundle += rec;
+      }
+      walAppendLocked(tTxn.wal.size() == 1 ? tTxn.wal[0] : bundle);
+    }
+    walDurable(tTxn.needSync || needsSync(""));
+  }
+  tTxn.needSync = false;
+  tTxn.wal.clear();
+  tTxn.savepoints.clear();
+  tTxn.undo.clear();
+  tTxn.active = false;
+}
+
+// Replays undo records [mark, end) backwards (ROLLBACK: all of them; ROLLBACK TO SAVEPOINT: the
+// ones after it).
+static void undoRecords(std::vector<UndoRec>& undo, size_t mark) {
+  for (size_t i = undo.size(); i-- > mark;) {
+    UndoRec& u = undo[i];
+    Table& t = *u.t;
+    std::unique_lock<FairSharedMutex> lk(t.mu);
+    if (!u.inserted) {
+      t.appendRow(u.row);
+      continue;
+    }
+    // Find the inserted row again (by primary key, else by value, newest first) and delete it.
+    auto same = [&](Loc l) {
+      std::vector<Value> v = t.rowValues(l);
+      for (size_t c = 0; c < v.size(); ++c)
+        if (v[c].isNull() != u.row[c].isNull() || (!v[c].isNull() && cmpVal(v[c], u.row[c]) != 0)) return false;
+      return true;
+    };
+    bool done = false;
+    if (t.pk >= 0 && !u.row[t.pk].isNull()) {
+      auto it = t.pkIndex.find((int64_t)numOf(u.row[t.pk]));
+      if (it != t.pkIndex.end()) { t.deleteAt(it->second); done = true; }
+    }
+    for (int p = 0; p < t.nparts && !done; ++p)
+      for (int64_t r = t.bufs[p]->n; r-- > 0 && !done;)
+        if (!((t.bufs[p]->del[r >> 5] >> (r & 31)) & 1u) && same(bufLoc(p, r))) { t.deleteAt(bufLoc(p, r)); done = true; }
+    for (size_t si = t.segs.size(); si-- > 0 && !done;)
+      for (int64_t r = t.segs[si]->n; r-- > 0 && !done;)
+        if (!((t.segs[si]->delHost[r >> 5] >> (r & 31)) & 1u) && same(Loc{(int32_t)si, (int32_t)r})) {
+          t.deleteAt(Loc{(int32_t)si, (int32_t)r});
+          done = true;
+        }
+  }
+}
+
+void Engine::rollbackTxn() {
+  if (!tTxn.active) return;
+  undoLog() = nullptr;
+  struct ClearPending {  // after the undo log is replayed
+    Engine* e;
+    ~ClearPending() {
+      clearTxnPending(e->cat_, &tTxn.undo);
+      endSnapshot(e->cat_);
+    }
+  } clearPending{this};
+  undoRecords(tTxn.undo, 0);
+  tTxn.wal.clear();
+  tTxn.undo.clear();
+  tTxn.savepoints.clear();
+  tTxn.active = false;
+}
+
+thread_local bool tIsoSnapshot = false;  // SET TRANSACTION ISOLATION LEVEL REPEATABLE READ / SERIALIZABLE
+std::string isolationLevel() { return tIsoSnapshot ? "REPEATABLE-READ" : "READ-COMMITTED"; }
+
+ResultSet Engine::doTxn(const std::string& what) {
+  if (what == "BEGIN" || what == "BEGIN SNAPSHOT") {
+    commitTxn();  // MySQL: BEGIN implicitly commits an open transaction
+    tTxn.active = true;
+    undoLog() = &tTxn.undo;
+    if (what == "BEGIN SNAPSHOT" || tIsoSnapshot) {  // the snapshot: every commit so far
+      std::lock_guard<std::mutex> g(gSnapMu);
+      tSnapSeq = gCommitSeq.load();
+      gSnaps.insert(tSnapSeq);
+    }
+  } else if (what == "COMMIT") {
+    commitTxn();
+  } else if (what == "ROLLBACK") {
+    rollbackTxn();
+  } else if (what.rfind("SAVEPOINT ", 0) == 0 || what.rfind("ROLLBACK TO ", 0) == 0 || what.rfind("RELEASE ", 0) == 0) {
+    const std::string name = lower(what.substr(what.rfind(' ') + 1));
+    auto& sp = tTxn.savepoints;
+    auto it = std::find_if(sp.begin(), sp.end(), [&](const auto& x) { return x.first == name; });
+    if (what.rfind("SAVEPOINT ", 0) == 0) {
+      if (!tTxn.active) return ResultSet{};  // autocommit: nothing to roll back to
+      if (it != sp.end()) sp.erase(it);
+      sp.push_back({name, {tTxn.undo.size(), tTxn.wal.size()}});
+      return ResultSet{};
+    }
+    if (it == sp.end()) throw SqlError("SAVEPOINT " + name + " does not exist", 1305);
+    if (what.rfind("RELEASE ", 0) == 0) {
+      sp.erase(it, sp.end());
+      return ResultSet{};
+    }
+    const size_t undoMark = it->second.first, walMark = it->second.second;
+    undoLog() = nullptr;
+    undoRecords(tTxn.undo, undoMark);
+    tTxn.undo.resize(undoMark);
+    tTxn.wal.resize(walMark);
+    sp.erase(it + 1, sp.end());  // later savepoints are gone; this one stays
+    undoLog() = &tTxn.undo;
+    return ResultSet{};
+  }
+  if (!tTxn.autocommit && !tTxn.active) {  // autocommit = 0: the next transaction starts right away
+    tTxn.active = true;
+    undoLog() = &tTxn.undo;
+  }
+  ResultSet r;
+  return r;
+}
+
+void Engine::logWrite(const std::string& sql, const std::string& db) {
+  if (replaying_) return;
+  const bool sync = needsSync(db);
+  if (tTxn.active) {  // held until COMMIT
+    tTxn.wal.push_back(currentDb() + "\x1f" + sql);
+    tTxn.needSync = tTxn.needSync || sync;
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> g(walMu_);
+    const std::string rec = currentDb() + "\x1f" + sql;
+    replAppend(rec);
+    walAppendLocked(rec);
+  }
+  walDurable(sync);
+}
+
+namespace {
+
+ResultSet table(std::vector<std::string> names, std::vector<LType> types) {
+  ResultSet r;
+  r.isResult = true;
+  r.names = std::move(names);
+  r.types = std::move(types);
+  return r;
+}
+
+std::string fmtMs(double ms) {
+  char b[32];
+  snprintf(b, sizeof b, "%.3f", ms);
+  return b;
+}
+
+// Runs a SELECT with plan-cache bookkeeping (and stage timings when profiling).
+ResultSet runSelect(Engine* e, const std::function<ResultSet()>& fn, const std::string& sql, bool profile) {
+  jitBeginQuery(sql);
+  tProfOn = profile;
+  tProf.clear();
+  auto t0 = Clock::now();
+  ResultSet r;
+  try {
+    r = fn();
+  } catch (...) {
+    tProfOn = false;
+    jitEndQuery(msSince(t0));
+    throw;
+  }
+  if (profile) gpuSync();
+  const double ms = msSince(t0);
+  JitQueryInfo ji = jitEndQuery(ms);
+  if (profile) {
+    std::string plans;
+    for (int id : ji.ids) plans += (plans.empty() ? "#" : ", #") + std::to_string(id);
+    tProf.insert(tProf.begin(), {"codegen summary", ji.compileMs, -1,
+                                 std::to_string(ji.hits) + " plan-cache hits, " + std::to_string(ji.fromDisk) +
+                                     " loaded from disk, " + std::to_string(ji.compiled) + " compiled now, " +
+                                     std::to_string(ji.background) + " compiling in background" +
+                                     (ji.background ? " (those parts ran interpreted)" : "") +
+                                     (plans.empty() ? "" : "; plans used: " + plans)});
+    tProf.push_back({"total", ms, (int64_t)r.rows.size(), r.info});
+    tLastProf = tProf;
+    tProfOn = false;
+  }
+  (void)e;
+  return r;
+}
+
+}  // namespace
+
+thread_local int tExecDepth = 0;
+ResultSet Engine::execute(const std::string& sql) {
+  if (tExecDepth == 0) tTxnViews.clear();  // visibility bitmaps of the previous statement
+  ++tExecDepth;
+  struct Depth { ~Depth() { --tExecDepth; } } depthGuard;
+  {
+    ResultSet rr;
+    if (routineStatement(sql, rr)) return rr;
+  }
+  {
+    static const std::regex replStatusRe(R"(^\s*SHOW\s+(REPLICATION|REPLICA|SLAVE)\s+STATUS\s*;?\s*$)", std::regex::icase);
+    static const std::regex promoteRe(R"(^\s*PROMOTE(\s+\w+)?\s*;?\s*$)", std::regex::icase);
+    if (std::regex_match(sql, replStatusRe)) return replicationStatus();
+    if (std::regex_match(sql, promoteRe)) {
+      if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
+      promote();
+      return okResult(0, "promoted to primary");
+    }
+  }
+  if (!leaves_.empty()) {  // cluster administration (not SQL the parser knows)
+    static const std::regex leavesRe(R"(^\s*SHOW\s+(LEAVES|CLUSTER\s+STATUS)\s*;?\s*$)", std::regex::icase);
+    if (std::regex_match(sql, leavesRe)) return clusterStatus();
+    static const std::regex adminRe(R"(^\s*((ALTER\s+CLUSTER\s+)?ADD\s+LEAF|REBALANCE(\s+ALL)?\s+PARTITIONS)\b[\s\S]*$)", std::regex::icase);
+    if (std::regex_match(sql, adminRe)) {
+      if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
+      return clusterAdmin(sql);
+    }
+  }
+  Stmt s = parseSql(sql);
+  if (!replaying_ && !tApplying) checkPrivileges(s);
+  if (!leaves_.empty()) {  // cluster aggregator: sharded tables live on the leaves
+    ResultSet cr;
+    if (clusterStatement(sql, s, cr)) return cr;
+  }
+  if (isReplica_ && !tApplying) {
+    switch (s.type) {
+      case Stmt::SELECT: if (s.outfile.empty()) break; [[fallthrough]];
+      case Stmt::INSERT: case Stmt::UPDATE: case Stmt::DELETE: case Stmt::LOAD: case Stmt::CREATE: case Stmt::DROP:
+      case Stmt::ALTER: case Stmt::TRUNCATE: case Stmt::RENAME: case Stmt::CREATE_DB: case Stmt::DROP_DB:
+      case Stmt::CREATE_VIEW: case Stmt::DROP_VIEW: case Stmt::PIPELINE: case Stmt::USER: case Stmt::BACKUP:
+        if (s.type == Stmt::CREATE && s.temporary) break;
+        throw SqlError("The server is a read-only replica (--replica-of); run writes on the primary or PROMOTE it", 1290);
+      default: break;
+    }
+  }
+  if (s.type == Stmt::SET && (s.setName == "TRANSACTION" || s.setName == "TRANSACTION_ISOLATION" || s.setName == "TX_ISOLATION")) {
+    static const std::regex snapRe(R"(REPEATABLE[\s_-]+READ|SERIALIZABLE|SNAPSHOT)", std::regex::icase);
+    static const std::regex rcRe(R"(READ[\s_-]+(COMMITTED|UNCOMMITTED))", std::regex::icase);
+    if (std::regex_search(sql, snapRe)) tIsoSnapshot = true;
+    else if (std::regex_search(sql, rcRe)) tIsoSnapshot = false;
+    return ResultSet{};
+  }
+  if (s.type == Stmt::TXN && s.setName == "BEGIN") {
+    static const std::regex consistentRe(R"(WITH\s+CONSISTENT\s+SNAPSHOT)", std::regex::icase);
+    if (std::regex_search(sql, consistentRe)) return doTxn("BEGIN SNAPSHOT");
+  }
+  // Autocommit writes while snapshots run: an implicit transaction, so its changes are retired with a
+  // commit sequence like any other (the snapshots keep not seeing them).
+  thread_local bool tImplicitTxn = false;
+  if (!tTxn.active && !tImplicitTxn && !replaying_ && tExecDepth == 1 &&
+      (s.type == Stmt::INSERT || s.type == Stmt::UPDATE || s.type == Stmt::DELETE || s.type == Stmt::LOAD) && snapshotsActive()) {
+    tImplicitTxn = true;
+    struct Flag { ~Flag() { tImplicitTxn = false; } } flag;
+    tTxn.active = true;
+    undoLog() = &tTxn.undo;
+    try {
+      --tExecDepth;  // (the nested execute counts again)
+      struct Inc { ~Inc() { ++tExecDepth; } } inc;
+      ResultSet rr = execute(sql);
+      commitTxn();
+      return rr;
+    } catch (...) {
+      rollbackTxn();
+      throw;
+    }
+  }
+  ResultSet r;
+  switch (s.type) {  // DDL commits an open transaction first (as in MySQL)
+    case Stmt::CREATE: case Stmt::DROP: case Stmt::ALTER: case Stmt::TRUNCATE: case Stmt::RENAME:
+    case Stmt::CREATE_DB: case Stmt::DROP_DB: case Stmt::CREATE_VIEW: case Stmt::DROP_VIEW: case Stmt::PIPELINE:
+      if (tTxn.active) {
+        commitTxn();
+        if (!tTxn.autocommit) doTxn("");
+      }
+      break;
+    default: break;
+  }
+  switch (s.type) {
+    case Stmt::TXN: return doTxn(s.setName);
+    case Stmt::SELECT: {
+      if (s.outfile.empty()) return runSelect(this, [&] { return runStatementQuery(s, false); }, sql, false);
+      ResultSet q = runStatementQuery(s, false);  // SELECT .. INTO OUTFILE: tab-separated, \N for NULL
+      FILE* f = fopen(s.outfile.c_str(), "wx");
+      if (!f) throw SqlError("Can't create/write to file '" + s.outfile + "' (it may already exist)", 1086);
+      for (auto& row : q.rows) {
+        for (size_t i = 0; i < row.size(); ++i) {
+          if (i) fputc(s.outDelim, f);
+          if (row[i] == kNullCell) fputs("\\N", f);
+          else fwrite(row[i].data(), 1, row[i].size(), f);
+        }
+        fputc('\n', f);
+      }
+      fclose(f);
+      return okResult((int64_t)q.rows.size());
+    }
+    case Stmt::EXPLAIN: return runSelect(this, [&] { return runStatementQuery(*s.inner, true); }, sql, false);
+    case Stmt::PROFILE: return runSelect(this, [&] { return runStatementQuery(*s.inner, false); }, sql, true);
+    case Stmt::SHOW_PROFILE: {
+      r = table({"stage", "time_ms", "rows", "detail"}, {LType::VARCHAR, LType::DOUBLE, LType::BIGINT, LType::VARCHAR});
+      for (auto& p : tLastProf)
+        r.rows.push_back({p.stage, fmtMs(p.ms), p.rows < 0 ? kNullCell : std::to_string(p.rows), p.detail});
+      return r;
+    }
+    case Stmt::SHOW_PLANCACHE: {
+      r = table({"plan_id", "kind", "origin", "compile_ms", "executions", "avg_query_ms", "last_query_ms", "source_bytes",
+                 "query_text"},
+                {LType::BIGINT, LType::VARCHAR, LType::VARCHAR, LType::DOUBLE, LType::BIGINT, LType::DOUBLE, LType::DOUBLE,
+                 LType::BIGINT, LType::VARCHAR});
+      for (auto& p : jitPlanCache())
+        r.rows.push_back({std::to_string(p.id), p.kind, p.origin, fmtMs(p.compileMs), std::to_string(p.execs),
+                          fmtMs(p.avgMs), fmtMs(p.lastMs), std::to_string(p.sourceBytes), p.sql});
+      return r;
+    }
+    case Stmt::SHOW_PLAN: {
+      std::string src = jitSourceOf((int)s.planId);
+      if (src.empty()) throw SqlError("Unknown plan id " + std::to_string(s.planId), 1105);
+      r = table({"generated_source"}, {LType::VARCHAR});
+      size_t a = 0;
+      for (size_t b; (b = src.find('\n', a)) != std::string::npos; a = b + 1) r.rows.push_back({src.substr(a, b - a)});
+      return r;
+    }
+    case Stmt::DROP_PLANCACHE: jitClearCache(); return okResult(0);
+    case Stmt::SET: {
+      auto on = [&] { return s.setValue == "ON" || s.setValue == "1" || s.setValue == "TRUE"; };
+      if (s.setName == "GPUDB_CODEGEN") jitSetMode(s.setValue == "SYNC" ? JIT_SYNC : on() ? JIT_ON : JIT_OFF);
+      else if (s.setName == "GPUDB_DENSE_GROUPBY") tDense = on();
+      else if (s.setName == "GPUDB_JOIN_FILTERS") tJoinFilters = on();
+      else if (s.setName == "GPUDB_VECTOR_INDEX") tAnn = on();
+      else if (s.setName == "GPUDB_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
+      else if (s.setName == "GPUDB_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
+      else if (s.setName == "GPUDB_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
+      else if (s.setName == "COLLATION_CONNECTION" || s.setName == "COLLATION_SERVER" || s.setName == "GPUDB_COLLATION")
+        tCi = s.setValue.find("_BIN") != std::string::npos || s.setValue == "BINARY" ? 0 : 1;
+      else if (s.setName == "NAMES" && s.setValue.find("BIN") != std::string::npos) tCi = 0;
+      else if (s.setName == "AUTOCOMMIT") {
+        tTxn.autocommit = on();
+        if (tTxn.autocommit) commitTxn();  // SET autocommit = 1 commits
+        else doTxn("");
+      }
+      return okResult(0);
+    }
+    case Stmt::INSERT: r = doInsert(s); break;
+    case Stmt::CREATE:
+      r = doCreate(s);
+      if (s.temporary) tTempTables.push_back(dbOf(s.table) + "." + plainName(s.table));
+      break;
+    case Stmt::DROP: r = doDrop(s); break;
+    case Stmt::DELETE:
+    case Stmt::UPDATE: r = doModify(s); break;
+    case Stmt::LOAD:
+      if ((s.setValue != "FS" && !s.setValue.empty()) || s.path.rfind("http://", 0) == 0 || s.path.rfind("https://", 0) == 0 ||
+          s.format == "JSON" || s.format == "PARQUET" || s.format == "AVRO" || s.format == "ORC" ||
+          (s.path.size() > 4 && lower(s.path.substr(s.path.size() - 4)) == ".orc") ||
+          (s.path.size() > 8 && lower(s.path.substr(s.path.size() - 8)) == ".parquet") ||
+          (s.path.size() > 5 && lower(s.path.substr(s.path.size() - 5)) == ".avro"))
+        return loadRemote(s);  // logs the staged LOAD DATA INFILE statements it runs, not this one
+      r = doLoad(s);
+      break;
+    case Stmt::OPTIMIZE: r = doOptimize(s); break;
+    case Stmt::SHOW_TABLES: return doShowTables(s);
+    case Stmt::SHOW_MISC:
+      if (s.setName == "PIPELINES") return showPipelines();
+      return doShowMisc(s);
+    case Stmt::PIPELINE: r = doPipeline(s); break;
+    case Stmt::SNAPSHOT: return doSnapshot();
+    case Stmt::USER: r = doUser(s); break;
+    case Stmt::BACKUP: return doBackup(s);
+    case Stmt::ALTER: r = doAlter(s); break;
+    case Stmt::TRUNCATE: r = doTruncate(s); break;
+    case Stmt::RENAME: r = doRename(s); break;
+    case Stmt::USE: {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      if (!cat_.dbs.count(lower(s.table)) && lower(s.table) != "information_schema")
+        throw SqlError("Unknown database '" + s.table + "'", 1049);
+      currentDb() = lower(s.table);
+      return okResult(0);
+    }
+    case Stmt::CREATE_DB: {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      if (cat_.dbs.count(lower(s.table))) {
+        if (!s.ifNotExists) throw SqlError("Can't create database '" + s.table + "'; database exists", 1007);
+      } else {
+        cat_.dbs.insert(lower(s.table));
+        if (s.setValue == "SYNC") cat_.syncDbs.insert(lower(s.table));
+      }
+      r = okResult(1);
+      break;
+    }
+    case Stmt::DROP_DB: {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      const std::string db = lower(s.table);
+      if (!cat_.dbs.count(db)) {
+        if (!s.ifExists) throw SqlError("Can't drop database '" + s.table + "'; database doesn't exist", 1008);
+      } else {
+        for (auto it = cat_.tables.begin(); it != cat_.tables.end();)
+          it = it->first.rfind(db + ".", 0) == 0 ? cat_.tables.erase(it) : std::next(it);
+        for (auto it = cat_.views.begin(); it != cat_.views.end();)
+          it = it->first.rfind(db + ".", 0) == 0 ? cat_.views.erase(it) : std::next(it);
+        cat_.dbs.erase(db);
+        cat_.syncDbs.erase(db);
+        if (currentDb() == db) currentDb() = "gpudb";
+      }
+      r = okResult(0);
+      break;
+    }
+    case Stmt::CREATE_VIEW: {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      const std::string k = Catalog::key(s.table);
+      if (cat_.tables.count(k)) throw SqlError("Table '" + s.table + "' already exists", 1050);
+      std::string sql2 = s.viewSql;
+      if (!s.insertCols.empty()) {  // CREATE VIEW v (a, b) AS ..: column names applied when the view is used
+        std::string names;
+        for (auto& c : s.insertCols) names += (names.empty() ? "" : ",") + c;
+        sql2 = "/*cols:" + names + "*/ " + sql2;
+      }
+      cat_.views[k] = sql2;
+      r = okResult(0);
+      break;
+    }
+    case Stmt::DROP_VIEW: {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      for (auto& n : s.names)
+        if (!cat_.views.erase(Catalog::key(n)) && !s.ifExists) throw SqlError("Unknown view '" + n + "'", 1051);
+      r = okResult(0);
+      break;
+    }
+    case Stmt::SHOW_DATABASES: {
+      r.isResult = true;
+      r.names = {"Database"};
+      r.types = {LType::VARCHAR};
+      std::set<std::string> dbs;
+      {
+        std::lock_guard<std::mutex> g(cat_.mu);
+        dbs = cat_.dbs;
+      }
+      dbs.insert("information_schema");
+      for (auto& d : dbs)
+        if (s.path.empty() || likeMatch(d, lower(s.path))) r.rows.push_back({d});
+      return r;
+    }
+    case Stmt::SHOW_SEGMENTS: return doShowSegments(s);
+    case Stmt::DESCRIBE: return doDescribe(s);
+    default: return okResult(0);
+  }
+  if (s.type != Stmt::OPTIMIZE) logWrite(sql, s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
+  return r;
+}
+
+// IndexMeta for a parsed index definition (VECTOR INDEX: IVF options).
+static IndexMeta indexMetaOf(const IndexDef& ix, const Table& t, const std::vector<int>& cols) {
+  IndexMeta m;
+  m.name = ix.name.empty() ? ix.cols.at(0) : ix.name;
+  m.unique = ix.unique;
+  m.cols = cols;
+  if (ix.vector) {
+    if (cols.size() != 1 || t.cols[cols[0]].pt != PType::VEC)
+      throw SqlError("VECTOR INDEX needs exactly one VECTOR column", 1235);
+    m.vec = true;
+    m.options = ix.options;
+    m.dim = t.cols[cols[0]].vecDim;
+    std::string o = ix.options;
+    for (auto& ch : o) ch = (char)toupper((unsigned char)ch);
+    m.metric = o.find("EUCLIDEAN") != std::string::npos ? 1 : 0;
+    size_t p = ix.options.find("\"nprobe\"");
+    m.nprobe = p == std::string::npos ? 0 : std::atoi(ix.options.c_str() + ix.options.find(':', p) + 1);
+  }
+  return m;
+}
+
+ResultSet Engine::doCreate(Stmt& s) {
+  if (s.select) {  // CREATE TABLE t AS SELECT ..: schema from the result, then insert it
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      if (cat_.tables.count(Catalog::key(s.table))) {
+        if (s.ifNotExists) return okResult(0);
+        throw SqlError("Table '" + s.table + "' already exists", 1050);
+      }
+    }
+    QueryCtx q;
+    ResultSet r;
+    try {
+      r = query(*s.select, q, false, true);
+    } catch (...) {
+      dropTemps(q);
+      throw;
+    }
+    dropTemps(q);
+    Stmt c;
+    c.type = Stmt::CREATE;
+    c.table = s.table;
+    c.pkCols = s.pkCols;
+    c.shardKey = s.shardKey;
+    c.hasShardKey = s.hasShardKey;
+    c.sortKey = s.sortKey;
+    std::set<std::string> seen;
+    for (size_t i = 0; i < r.names.size(); ++i) {
+      ColumnDef d;
+      d.name = r.names[i];
+      for (int k = 2; seen.count(lower(d.name)); ++k) d.name = r.names[i] + "_" + std::to_string(k);
+      seen.insert(lower(d.name));
+      d.type = r.types[i];
+      d.typeText = ltypeName(d.type);
+      c.cols.push_back(d);
+    }
+    doCreate(c);
+    auto t = cat_.get(s.table);
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    for (auto& row : r.vals) t->appendRow(row);
+    return okResult((int64_t)r.vals.size());
+  }
+  if (!s.path.empty()) {  // CREATE TABLE t LIKE other
+    auto o = cat_.get(s.path);
+    std::lock_guard<std::mutex> g(cat_.mu);
+    if (cat_.tables.count(Catalog::key(s.table))) {
+      if (s.ifNotExists) return okResult(0);
+      throw SqlError("Table '" + s.table + "' already exists", 1050);
+    }
+    auto nt = std::make_shared<Table>(plainName(s.table), o->cols, o->pk, o->sortKey, o->pkCols, o->shardKey, o->nparts,
+                                      o->reference);
+    nt->db = dbOf(s.table);
+    nt->vram = o->vram;
+    nt->fks = o->fks;
+    cat_.tables[Catalog::key(s.table)] = nt;
+    return okResult(0);
+  }
+  std::lock_guard<std::mutex> g(cat_.mu);
+  std::string key = Catalog::key(s.table);
+  if (!cat_.dbs.count(dbOf(s.table))) throw SqlError("Unknown database '" + dbOf(s.table) + "'", 1049);
+  if (cat_.tables.count(key)) {
+    if (s.ifNotExists) return okResult(0);
+    throw SqlError("Table '" + s.table + "' already exists", 1050);
+  }
+  std::vector<ColumnMeta> cols;
+  for (auto& c : s.cols) {
+    ColumnMeta m;
+    m.name = c.name;
+    m.lt = c.type;
+    m.pt = physOf(c.type);
+    m.notNull = c.notNull;
+    m.autoInc = c.autoInc;
+    m.typeText = c.typeText;
+    m.vecDim = c.vecDim;
+    m.scale = c.scale;
+    m.vram = c.vram;
+    m.defText = c.defText;
+    if (c.type == LType::VECTOR && c.vecDim <= 0) throw SqlError("VECTOR columns need a dimension: VECTOR(n)", 1235);
+    if (c.def) {
+      m.hasDefault = true;
+      if (c.def->kind == Expr::LIT && c.def->lit.kind == Value::STR && c.def->lit.s == "CURRENT_TIMESTAMP") {
+        m.def = c.def->lit;  // evaluated at insert time
+      } else {
+        BindCtx bc;
+        PostCtx pc;
+        ExprP d = c.def;
+        bind(d, bc);
+        m.def = evalPost(d, pc);
+      }
+    }
+    cols.push_back(m);
+  }
+  if (cols.size() > 4096) throw SqlError("too many columns", 1117);  // (a query may reference up to kMaxCols)
+  auto find = [&](const std::string& n) {
+    if (n.empty()) return -1;
+    for (size_t i = 0; i < cols.size(); ++i)
+      if (strcasecmp(cols[i].name.c_str(), n.c_str()) == 0) return (int)i;
+    throw SqlError("Key column '" + n + "' doesn't exist in table", 1072);
+  };
+  int sk = find(s.sortKey);
+  std::vector<int> pkCols, shard;
+  for (auto& n : s.pkCols) pkCols.push_back(find(n));
+  for (auto& n : s.shardKey) shard.push_back(find(n));
+  // Single-column integer-like primary keys get the hash index (point lookups, uniqueness).
+  int pk = pkCols.size() == 1 ? pkCols[0] : -1;
+  if (pk >= 0 && cols[pk].lt == LType::DOUBLE) throw SqlError("PRIMARY KEY on DOUBLE is not supported", 1235);
+  if (pk >= 0 && cols[pk].lt == LType::VARCHAR) pk = -1;
+  // SingleStore semantics: the shard key defaults to the primary key, and a primary key must
+  // contain every shard-key column (so uniqueness can be checked inside one partition).
+  if (s.reference) {
+    if (s.hasShardKey && !shard.empty()) throw SqlError("Reference tables cannot have a SHARD KEY", 1235);
+    shard.clear();
+  } else if (!s.hasShardKey) {
+    shard = pkCols;
+  } else if (!pkCols.empty()) {
+    for (int c : shard)
+      if (std::find(pkCols.begin(), pkCols.end(), c) == pkCols.end())
+        throw SqlError("The unique key named: 'PRIMARY' must contain all columns specified in the shard key", 1705);
+  }
+  auto nt = std::make_shared<Table>(plainName(s.table), cols, pk, sk, pkCols, shard, nparts_, s.reference);
+  nt->db = dbOf(s.table);
+  nt->vram = s.vram;
+  for (auto& f : s.fks) {
+    for (auto& c : f.cols) find(c);
+    Table::FkMeta m{f.name, f.refTable, f.onDelete, f.onUpdate, f.cols, f.refCols};
+    if (m.name.empty()) m.name = plainName(s.table) + "_ibfk_" + std::to_string(nt->fks.size() + 1);
+    nt->fks.push_back(m);
+  }
+  if (pk < 0 && !pkCols.empty()) {  // composite or string PRIMARY KEY: enforced by a unique index
+    IndexMeta m;
+    m.name = "PRIMARY";
+    m.unique = true;
+    m.cols = pkCols;
+    nt->indexes.push_back(m);
+    for (int c : pkCols) nt->cols[c].notNull = true;
+  }
+  for (auto& ix : s.indexes) {
+    std::vector<int> ic;
+    for (auto& c : ix.cols) ic.push_back(find(c));
+    nt->indexes.push_back(indexMetaOf(ix, *nt, ic));
+  }
+  cat_.tables[key] = nt;
+  return okResult(0);
+}
+
+ResultSet Engine::doDrop(Stmt& s) {
+  for (auto& name : s.names.empty() ? std::vector<std::string>{s.table} : s.names) {
+    std::shared_ptr<Table> t;
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      auto it = cat_.tables.find(Catalog::key(name));
+      if (it == cat_.tables.end()) {
+        if (cat_.views.erase(Catalog::key(name))) continue;  // DROP TABLE on a view
+        if (s.ifExists) continue;
+        throw SqlError("Unknown table '" + dbOf(name) + "." + plainName(name) + "'", 1051);
+      }
+      t = it->second;
+      cat_.tables.erase(it);
+    }
+    std::unique_lock<FairSharedMutex> lk(t->mu);  // wait for in-flight readers
+  }
+  return okResult(0);
+}
+
+namespace {
+void forEachLiveRow(const Table& t, const std::function<void(Loc)>& fn) {
+  for (size_t si = 0; si < t.segs.size(); ++si) {
+    const Segment& sg = *t.segs[si];
+    for (int64_t r = 0; r < sg.n; ++r)
+      if (!((sg.delHost[r >> 5] >> (r & 31)) & 1u)) fn(Loc{(int32_t)si, (int32_t)r});
+  }
+  for (int p = 0; p < t.nparts; ++p) {
+    const WriteBuffer& b = *t.bufs[p];
+    for (int64_t r = 0; r < b.n; ++r)
+      if (!((b.del[r >> 5] >> (r & 31)) & 1u)) fn(bufLoc(p, r));
+  }
+}
+
+ColumnMeta metaOf(const ColumnDef& c) {
+  ColumnMeta m;
+  m.name = c.name;
+  m.lt = c.type;
+  m.pt = physOf(c.type);
+  m.notNull = c.notNull;
+  m.autoInc = c.autoInc;
+  m.typeText = c.typeText;
+  m.vecDim = c.vecDim;
+  m.scale = c.scale;
+  m.vram = c.vram;
+  m.defText = c.defText;
+  if (c.def) {
+    m.hasDefault = true;
+    if (c.def->kind == Expr::LIT && c.def->lit.kind == Value::STR && c.def->lit.s == "CURRENT_TIMESTAMP") {
+      m.def = c.def->lit;
+    } else {
+      ExprP d = cloneExpr(c.def);
+      BindCtx bc;
+      bind(d, bc);
+      m.def = evalConst(d);
+    }
+  }
+  return m;
+}
+
+std::string colTypeText(const ColumnMeta& c) {
+  if (!c.typeText.empty()) {  // MySQL's canonical spelling of the type as written
+    std::string t = lower(c.typeText);
+    std::string base = t.substr(0, t.find_first_of("( ")), rest = t.substr(base.size());
+    static const std::map<std::string, std::string> canon = {
+        {"integer", "int"}, {"bool", "tinyint(1)"}, {"boolean", "tinyint(1)"}, {"numeric", "decimal"}, {"dec", "decimal"},
+        {"fixed", "decimal"}, {"real", "double"}, {"float8", "double"}, {"float4", "float"}, {"int4", "int"}, {"int8", "bigint"},
+        {"int2", "smallint"}, {"int1", "tinyint"}, {"middleint", "mediumint"}, {"character", "char"}, {"nchar", "char"},
+        {"nvarchar", "varchar"}, {"serial", "bigint unsigned"}};
+    auto it = canon.find(base);
+    if (it != canon.end()) {
+      if (base == "bool" || base == "boolean" || base == "serial") return it->second;
+      t = it->second + rest;
+    }
+    if (t == "decimal") t = "decimal(10,0)";
+    for (size_t i; (i = t.find(", ")) != std::string::npos;) t.erase(i + 1, 1);  // decimal(10, 2) -> decimal(10,2)
+    if (t.rfind("double precision", 0) == 0) t = "double";
+    if (t.rfind("character varying", 0) == 0) t = "varchar" + t.substr(17);
+    return t;
+  }
+  switch (c.lt) {
+    case LType::INT: return "int";
+    case LType::BIGINT: return "bigint";
+    case LType::DOUBLE: return "double";
+    case LType::DATE: return "date";
+    case LType::DATETIME: return "datetime";
+    case LType::VARCHAR: return "text";
+  }
+  return "text";
+}
+
+bool likeCI(const std::string& s, const std::string& pat) { return pat.empty() || likeMatch(lower(s), lower(pat)); }
+}  // namespace
+
+// Rebuilds a table with a new schema (ALTER TABLE): `from[i]` is the old column feeding new column i,
+// or -1 for a new column (filled with its default).
+std::shared_ptr<Table> Engine::rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from) {
+  auto mapCol = [&](int old) {
+    for (size_t i = 0; i < from.size(); ++i)
+      if (from[i] == old) return (int)i;
+    return -1;
+  };
+  std::vector<int> pkCols, shard;
+  for (int c : t.pkCols)
+    if (mapCol(c) >= 0) pkCols.push_back(mapCol(c));
+  for (int c : t.shardKey) {
+    if (mapCol(c) < 0) throw SqlError("can't drop a SHARD KEY column", 1235);
+    shard.push_back(mapCol(c));
+  }
+  int pk = t.pk >= 0 ? mapCol(t.pk) : -1;
+  int sk = t.sortKey >= 0 ? mapCol(t.sortKey) : -1;
+  auto nt = std::make_shared<Table>(t.name, cols, pk, sk, pkCols, shard, t.nparts, t.reference);
+  nt->db = t.db;
+  nt->vram = t.vram;
+  nt->fks = t.fks;
+  for (auto& ix : t.indexes) {
+    IndexMeta m = ix;
+    m.map.clear();
+    m.cols.clear();
+    for (int c : ix.cols)
+      if (mapCol(c) >= 0) m.cols.push_back(mapCol(c));
+    if (!m.cols.empty()) nt->indexes.push_back(m);
+  }
+  std::vector<Value> defaults = defaultRow(*nt);
+  forEachLiveRow(t, [&](Loc l) {
+    std::vector<Value> row = defaults;
+    for (size_t i = 0; i < from.size(); ++i)
+      if (from[i] >= 0) row[i] = cellValue(t, l, from[i]);
+    for (size_t i = 0; i < cols.size(); ++i) {  // type changes: convert through text / numbers
+      Value& v = row[i];
+      if (v.isNull()) continue;
+      if (cols[i].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+      else if (cols[i].lt != LType::VARCHAR && v.kind == Value::STR) {
+        if (cols[i].lt == LType::DATE || cols[i].lt == LType::DATETIME) continue;
+        v = cols[i].lt == LType::DOUBLE ? Value::D(std::atof(v.s.c_str())) : Value::I(std::atoll(v.s.c_str()));
+      } else if ((cols[i].lt == LType::INT || cols[i].lt == LType::BIGINT) && v.kind == Value::DBL) {
+        v = Value::I((int64_t)std::llround(v.d));
+      }
+    }
+    nt->appendRow(row);
+  });
+  nt->autoNext = std::max(nt->autoNext, t.autoNext);
+  nt->flush(true);
+  return nt;
+}
+
+ResultSet Engine::doAlter(Stmt& s) {
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  std::shared_ptr<Table> cur = t;
+  for (auto& a : s.alters) {
+    std::vector<ColumnMeta> cols = cur->cols;
+    std::vector<int> from(cols.size());
+    for (size_t i = 0; i < from.size(); ++i) from[i] = (int)i;
+    switch (a.kind) {
+      case Stmt::Alter::NOOP: continue;
+      case Stmt::Alter::ADD_COL: {
+        if (cur->colIndex(a.col.name) >= 0) throw SqlError("Duplicate column name '" + a.col.name + "'", 1060);
+        size_t pos = cols.size();
+        if (a.newName == "\x01FIRST") pos = 0;
+        else if (!a.newName.empty()) {
+          int k = cur->colIndex(a.newName);
+          if (k < 0) throw SqlError("Unknown column '" + a.newName + "' in 'table'", 1054);
+          pos = (size_t)k + 1;
+        }
+        cols.insert(cols.begin() + pos, metaOf(a.col));
+        from.insert(from.begin() + pos, -1);
+        break;
+      }
+      case Stmt::Alter::DROP_COL: {
+        int k = cur->colIndex(a.name);
+        if (k < 0) throw SqlError("Can't DROP '" + a.name + "'; check that column/key exists", 1091);
+        cols.erase(cols.begin() + k);
+        from.erase(from.begin() + k);
+        break;
+      }
+      case Stmt::Alter::RENAME_COL:
+      case Stmt::Alter::MODIFY_COL: {
+        int k = cur->colIndex(a.name);
+        if (k < 0) throw SqlError("Unknown column '" + a.name + "' in 'table'", 1054);
+        if (a.kind == Stmt::Alter::RENAME_COL) cols[k].name = a.newName;
+        else cols[k] = metaOf(a.col);
+        break;
+      }
+      case Stmt::Alter::ADD_FK: {  // metadata only (not enforced)
+        for (auto& c : a.fk.cols)
+          if (cur->colIndex(c) < 0) throw SqlError("Key column '" + c + "' doesn't exist in table", 1072);
+        Table::FkMeta m{a.fk.name, a.fk.refTable, a.fk.onDelete, a.fk.onUpdate, a.fk.cols, a.fk.refCols};
+        if (m.name.empty()) m.name = cur->name + "_ibfk_" + std::to_string(cur->fks.size() + 1);
+        for (auto& f : cur->fks)
+          if (strcasecmp(f.name.c_str(), m.name.c_str()) == 0) throw SqlError("Duplicate foreign key constraint name '" + m.name + "'", 1826);
+        cur->fks.push_back(m);
+        continue;
+      }
+      case Stmt::Alter::DROP_FK: {  // DROP FOREIGN KEY / DROP CONSTRAINT name: a foreign key, else a unique key
+        auto& f = cur->fks;
+        auto it = std::find_if(f.begin(), f.end(), [&](const Table::FkMeta& m) { return strcasecmp(m.name.c_str(), a.name.c_str()) == 0; });
+        if (it != f.end()) { f.erase(it); continue; }
+        auto& ix = cur->indexes;
+        auto jt = std::find_if(ix.begin(), ix.end(), [&](const IndexMeta& m) { return strcasecmp(m.name.c_str(), a.name.c_str()) == 0; });
+        if (jt == ix.end()) throw SqlError("Can't DROP '" + a.name + "'; check that column/key exists", 1091);
+        ix.erase(jt);
+        continue;
+      }
+      case Stmt::Alter::SET_VRAM: {  // placement hint only: the VRAM cache applies it within a second
+        if (a.name.empty()) cur->vram = a.vram;
+        else {
+          int ci = cur->colIndex(a.name);
+          if (ci < 0) throw SqlError("Unknown column '" + a.name + "' in '" + cur->name + "'", 1054);
+          cur->cols[ci].vram = a.vram;
+        }
+        continue;
+      }
+      case Stmt::Alter::RENAME_TABLE: {
+        std::lock_guard<std::mutex> g(cat_.mu);
+        if (cat_.tables.count(Catalog::key(a.newName))) throw SqlError("Table '" + a.newName + "' already exists", 1050);
+        cat_.tables.erase(Catalog::key(cur->db + "." + cur->name));
+        cur->name = plainName(a.newName);
+        cur->db = dbOf(a.newName);
+        cat_.tables[Catalog::key(a.newName)] = cur;
+        continue;
+      }
+      case Stmt::Alter::ADD_INDEX: {
+        std::vector<int> ic;
+        for (auto& c : a.index.cols) {
+          int k = cur->colIndex(c);
+          if (k < 0) throw SqlError("Key column '" + c + "' doesn't exist in table", 1072);
+          ic.push_back(k);
+        }
+        cur->indexes.push_back(indexMetaOf(a.index, *cur, ic));
+        cur->buildIndex(cur->indexes.back());
+        continue;
+      }
+      case Stmt::Alter::DROP_INDEX: {
+        auto& ix = cur->indexes;
+        ix.erase(std::remove_if(ix.begin(), ix.end(), [&](const IndexMeta& m) { return strcasecmp(m.name.c_str(), a.name.c_str()) == 0; }), ix.end());
+        continue;
+      }
+    }
+    auto nt = rebuild(*cur, cols, from);
+    std::lock_guard<std::mutex> g(cat_.mu);
+    cat_.tables[Catalog::key(cur->db + "." + cur->name)] = nt;
+    cur = nt;
+  }
+  return okResult(0);
+}
+
+ResultSet Engine::doTruncate(Stmt& s) {
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  waitTxnFree(*t, lk);  // another session's open transaction changed this table
+  auto nt = std::make_shared<Table>(t->name, t->cols, t->pk, t->sortKey, t->pkCols, t->shardKey, t->nparts, t->reference);
+  nt->db = t->db;
+  nt->vram = t->vram;
+  nt->fks = t->fks;
+  nt->indexes = t->indexes;
+  for (auto& ix : nt->indexes) ix.map.clear();
+  std::lock_guard<std::mutex> g(cat_.mu);
+  cat_.tables[Catalog::key(t->db + "." + t->name)] = nt;
+  return okResult(0);
+}
+
+ResultSet Engine::doRename(Stmt& s) {
+  std::lock_guard<std::mutex> g(cat_.mu);
+  for (size_t i = 0; i + 1 < s.names.size(); i += 2) {
+    auto it = cat_.tables.find(Catalog::key(s.names[i]));
+    if (it == cat_.tables.end()) throw SqlError("Table '" + s.names[i] + "' doesn't exist", 1146);
+    if (cat_.tables.count(Catalog::key(s.names[i + 1]))) throw SqlError("Table '" + s.names[i + 1] + "' already exists", 1050);
+    auto t = it->second;
+    cat_.tables.erase(it);
+    t->name = plainName(s.names[i + 1]);
+    t->db = dbOf(s.names[i + 1]);
+    cat_.tables[Catalog::key(s.names[i + 1])] = t;
+  }
+  return okResult(0);
+}
+
+std::string Engine::showCreate(const Table& t) {
+  std::string r = "CREATE " + std::string(t.reference ? "REFERENCE " : "") + "TABLE `" + t.name + "` (\n";
+  for (size_t i = 0; i < t.cols.size(); ++i) {
+    const ColumnMeta& c = t.cols[i];
+    r += "  `" + c.name + "` " + colTypeText(c);
+    if (c.notNull || (int)i == t.pk) r += " NOT NULL";
+    if (c.autoInc) r += " AUTO_INCREMENT";
+    if (c.hasDefault && !c.defText.empty()) r += " DEFAULT (" + c.defText + ")";
+    else if (c.hasDefault) r += " DEFAULT " + (c.def.kind == Value::STR && c.def.s != "CURRENT_TIMESTAMP" ? "'" + c.def.s + "'" : c.def.isNull() ? std::string("NULL") : c.def.toString());
+    if (c.vram) r += c.vram == 1 ? " VRAM=PIN" : " VRAM=NEVER";
+    r += ",\n";
+  }
+  auto names = [&](const std::vector<int>& cs) {
+    std::string x;
+    for (int c : cs) x += (x.empty() ? "`" : ", `") + t.cols[c].name + "`";
+    return x;
+  };
+  if (!t.pkCols.empty()) r += "  PRIMARY KEY (" + names(t.pkCols) + "),\n";
+  for (auto& ix : t.indexes)
+    if (ix.name != "PRIMARY")
+      r += std::string("  ") + (ix.unique ? "UNIQUE " : "") + (ix.vec ? "VECTOR " : "") + "KEY `" + ix.name + "` (" + names(ix.cols) + ")" +
+           (ix.vec && !ix.options.empty() ? " INDEX_OPTIONS '" + ix.options + "'" : "") + ",\n";
+  for (auto& f : t.fks) {
+    std::string lc, rc;
+    for (auto& c : f.cols) lc += (lc.empty() ? "`" : ", `") + c + "`";
+    for (auto& c : f.refCols) rc += (rc.empty() ? "`" : ", `") + c + "`";
+    r += "  CONSTRAINT `" + f.name + "` FOREIGN KEY (" + lc + ") REFERENCES `" + f.refTable + "` (" + rc + ") ON DELETE " + f.onDelete +
+         " ON UPDATE " + f.onUpdate + ",\n";
+  }
+  // SHARD KEY only when it isn't the default (the primary key; keyless without one), so MySQL tools
+  // reading SHOW CREATE TABLE see plain MySQL DDL.
+  if (!t.reference && t.shardKey != t.pkCols) r += "  SHARD KEY (" + names(t.shardKey) + "),\n";
+  if (t.sortKey >= 0) r += "  SORT KEY (`" + t.cols[t.sortKey].name + "`),\n";
+  r = r.substr(0, r.size() - 2) + "\n)";
+  if (t.vram) r += t.vram == 1 ? " VRAM=PIN" : " VRAM=NEVER";
+  return r;
+}
+
+// information_schema tables, generated from the catalog.
+ResultSet Engine::infoSchema(const std::string& table) {
+  ResultSet r;
+  r.isResult = true;
+  r.typed = true;
+  std::vector<std::shared_ptr<Table>> tabs;
+  std::map<std::string, std::string> views;
+  std::set<std::string> dbs;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (t->db != "__tmp") tabs.push_back(t);
+    views = cat_.views;
+    dbs = cat_.dbs;
+  }
+  if (tUserName() != "root") {  // only what the user may read (MySQL filters information_schema the same way)
+    std::lock_guard<std::mutex> ug(usersMu_);
+    tabs.erase(std::remove_if(tabs.begin(), tabs.end(), [&](const std::shared_ptr<Table>& t) {
+      return !hasPriv(tUserName(), "SELECT", lower(t->db), lower(t->name)) && !hasPriv(tUserName(), "SELECT", lower(t->db), "*");
+    }), tabs.end());
+  }
+  auto S = [](const std::string& x) { return Value::S(x); };
+  auto I = [](int64_t x) { return Value::I(x); };
+  const std::string tn = lower(table);
+  auto cols = [&](std::vector<std::string> names, std::vector<LType> types) {
+    r.names = std::move(names);
+    r.types = std::move(types);
+  };
+  const LType V = LType::VARCHAR, B = LType::BIGINT;
+  if (tn == "schemata") {
+    cols({"CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME", "SQL_PATH"}, {V, V, V, V, V});
+    dbs.insert("information_schema");
+    for (auto& d : dbs) r.vals.push_back({S("def"), S(d), S("utf8mb4"), S("utf8mb4_bin"), Value::Null()});
+  } else if (tn == "tables") {
+    cols({"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "VERSION", "ROW_FORMAT", "TABLE_ROWS",
+          "AVG_ROW_LENGTH", "DATA_LENGTH", "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT", "CREATE_TIME",
+          "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM", "CREATE_OPTIONS", "TABLE_COMMENT"},
+         {V, V, V, V, V, B, V, B, B, B, B, B, B, B, LType::DATETIME, LType::DATETIME, LType::DATETIME, V, B, V, V});
+    for (auto& t : tabs) {
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      r.vals.push_back({S("def"), S(t->db), S(t->name), S("BASE TABLE"), S("Columnstore"), I(10), S("Dynamic"), I(t->liveRows()),
+                        I(0), I(t->vramBytes()), I(0), I(0), I(0), t->autoIncCol >= 0 ? I(t->autoNext) : Value::Null(), Value::Null(),
+                        Value::Null(), Value::Null(), S("utf8mb4_bin"), Value::Null(), S(""), S("")});
+    }
+    for (auto& [k, sql] : views) {
+      size_t d = k.find('.');
+      std::vector<Value> row(21, Value::Null());
+      row[0] = S("def"), row[1] = S(k.substr(0, d)), row[2] = S(k.substr(d + 1)), row[3] = S("VIEW"), row[20] = S("VIEW");
+      r.vals.push_back(row);
+    }
+  } else if (tn == "columns") {
+    cols({"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE",
+          "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "CHARACTER_OCTET_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DATETIME_PRECISION",
+          "CHARACTER_SET_NAME", "COLLATION_NAME", "COLUMN_TYPE", "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT",
+          "GENERATION_EXPRESSION", "SRS_ID"},
+         {V, V, V, V, B, V, V, V, B, B, B, B, B, V, V, V, V, V, V, V, V, B});
+    for (auto& t : tabs)
+      for (size_t i = 0; i < t->cols.size(); ++i) {
+        const ColumnMeta& c = t->cols[i];
+        std::string ct = colTypeText(c), dt = lower(ct.substr(0, ct.find_first_of("( ")));
+        bool str = c.lt == LType::VARCHAR, num = c.lt == LType::INT || c.lt == LType::BIGINT || c.lt == LType::DOUBLE || c.lt == LType::DECIMAL;
+        std::string key = (int)i == t->pk || std::count(t->pkCols.begin(), t->pkCols.end(), (int)i) ? "PRI" : "";
+        for (auto& ix : t->indexes)
+          if (key.empty() && !ix.cols.empty() && ix.cols[0] == (int)i) key = ix.unique && ix.cols.size() == 1 ? "UNI" : "MUL";
+        // Declared length / precision from the type text: varchar(255), decimal(12,2), char(3)
+        int64_t n1 = -1, n2 = -1;
+        if (size_t lp = ct.find('('); lp != std::string::npos && (dt == "varchar" || dt == "char" || dt == "decimal" || dt == "numeric" ||
+                                                                    dt == "varbinary" || dt == "binary")) {
+          n1 = std::atoll(ct.c_str() + lp + 1);
+          if (size_t cm = ct.find(',', lp); cm != std::string::npos) n2 = std::atoll(ct.c_str() + cm + 1);
+        }
+        Value maxLen = Value::Null();
+        if (str) maxLen = I(n1 >= 0 ? n1 : dt == "tinytext" ? 255 : dt == "mediumtext" ? 16777215 : dt == "longtext" || dt == "json" ? 4294967295LL : 65535);
+        Value prec = Value::Null(), scl = Value::Null();
+        if (c.lt == LType::DECIMAL || dt == "decimal") prec = I(n1 >= 0 ? n1 : 10), scl = I(n2 >= 0 ? n2 : c.scale);
+        else if (num) prec = I(c.lt == LType::DOUBLE ? 22 : dt == "tinyint" ? 3 : dt == "smallint" ? 5 : dt == "mediumint" ? 7 : c.lt == LType::INT ? 10 : 19),
+                      scl = c.lt == LType::DOUBLE ? Value::Null() : I(0);
+        const bool nowDef = c.hasDefault && c.def.kind == Value::STR && c.def.s == "CURRENT_TIMESTAMP";
+        std::string extra = c.autoInc ? "auto_increment" : nowDef ? "DEFAULT_GENERATED" : "";
+        Value def = !c.hasDefault ? Value::Null() : c.def.isNull() ? Value::Null() : !c.defText.empty() ? S(c.defText) : S(c.def.toString());
+        r.vals.push_back({S("def"), S(t->db), S(t->name), S(c.name), I((int64_t)i + 1), def, S(c.notNull || (int)i == t->pk ? "NO" : "YES"), S(dt),
+                          maxLen, str ? Value::I(maxLen.i * 4) : Value::Null(), prec, scl,
+                          c.lt == LType::DATETIME ? I(0) : Value::Null(), str ? S("utf8mb4") : Value::Null(), str ? S("utf8mb4_bin") : Value::Null(),
+                          S(ct), S(key), S(extra), S("select,insert,update,references"), S(""), S(""), Value::Null()});
+      }
+  } else if (tn == "statistics") {
+    cols({"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE", "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX",
+          "COLUMN_NAME", "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE", "INDEX_TYPE", "COMMENT", "INDEX_COMMENT",
+          "IS_VISIBLE", "EXPRESSION"},
+         {V, V, V, B, V, V, B, V, V, B, B, V, V, V, V, V, V, V});
+    for (auto& t : tabs) {
+      auto nullable = [&](int c) { return S(t->cols[c].notNull || c == t->pk ? "" : "YES"); };
+      for (size_t k = 0; k < t->pkCols.size(); ++k)
+        r.vals.push_back({S("def"), S(t->db), S(t->name), I(0), S(t->db), S("PRIMARY"), I((int64_t)k + 1), S(t->cols[t->pkCols[k]].name),
+                          S("A"), I(t->liveRows()), Value::Null(), Value::Null(), S(""), S("BTREE"), S(""), S(""), S("YES"), Value::Null()});
+      for (auto& ix : t->indexes)
+        for (size_t k = 0; k < ix.cols.size(); ++k)
+          r.vals.push_back({S("def"), S(t->db), S(t->name), I(!ix.unique), S(t->db), S(ix.name), I((int64_t)k + 1),
+                            S(t->cols[ix.cols[k]].name), S("A"), Value::Null(), Value::Null(), Value::Null(), nullable(ix.cols[k]),
+                            S(ix.vec ? "VECTOR" : "BTREE"), S(""), S(""), S("YES"), Value::Null()});
+    }
+  } else if (tn == "key_column_usage") {
+    cols({"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME",
+          "COLUMN_NAME", "ORDINAL_POSITION", "POSITION_IN_UNIQUE_CONSTRAINT", "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME",
+          "REFERENCED_COLUMN_NAME"},
+         {V, V, V, V, V, V, V, B, B, V, V, V});
+    for (auto& t : tabs) {
+      for (size_t k = 0; k < t->pkCols.size(); ++k)
+        r.vals.push_back({S("def"), S(t->db), S("PRIMARY"), S("def"), S(t->db), S(t->name), S(t->cols[t->pkCols[k]].name),
+                          I((int64_t)k + 1), Value::Null(), Value::Null(), Value::Null(), Value::Null()});
+      for (auto& ix : t->indexes)
+        if (ix.unique && ix.name != "PRIMARY")
+          for (size_t k = 0; k < ix.cols.size(); ++k)
+            r.vals.push_back({S("def"), S(t->db), S(ix.name), S("def"), S(t->db), S(t->name), S(t->cols[ix.cols[k]].name),
+                              I((int64_t)k + 1), Value::Null(), Value::Null(), Value::Null(), Value::Null()});
+      for (auto& f : t->fks)
+        for (size_t k = 0; k < f.cols.size(); ++k) {
+          const std::string rdb = f.refTable.find('.') != std::string::npos ? f.refTable.substr(0, f.refTable.find('.')) : t->db;
+          const std::string rt = f.refTable.substr(f.refTable.find('.') == std::string::npos ? 0 : f.refTable.find('.') + 1);
+          r.vals.push_back({S("def"), S(t->db), S(f.name), S("def"), S(t->db), S(t->name), S(f.cols[k]), I((int64_t)k + 1), I((int64_t)k + 1),
+                            S(rdb), S(rt), k < f.refCols.size() ? S(f.refCols[k]) : Value::Null()});
+        }
+    }
+  } else if (tn == "referential_constraints") {
+    cols({"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "UNIQUE_CONSTRAINT_CATALOG", "UNIQUE_CONSTRAINT_SCHEMA",
+          "UNIQUE_CONSTRAINT_NAME", "MATCH_OPTION", "UPDATE_RULE", "DELETE_RULE", "TABLE_NAME", "REFERENCED_TABLE_NAME"},
+         {V, V, V, V, V, V, V, V, V, V, V});
+    for (auto& t : tabs)
+      for (auto& f : t->fks) {
+        const std::string rt = f.refTable.substr(f.refTable.find('.') == std::string::npos ? 0 : f.refTable.find('.') + 1);
+        r.vals.push_back({S("def"), S(t->db), S(f.name), S("def"), S(t->db), S("PRIMARY"), S("NONE"), S(f.onUpdate), S(f.onDelete),
+                          S(t->name), S(rt)});
+      }
+  } else if (tn == "check_constraints") {
+    cols({"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "CHECK_CLAUSE"}, {V, V, V, V});
+  } else if (tn == "views") {
+    cols({"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "VIEW_DEFINITION", "CHECK_OPTION", "IS_UPDATABLE", "DEFINER", "SECURITY_TYPE",
+          "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION"}, {V, V, V, V, V, V, V, V, V, V});
+    for (auto& [k, sql] : views) {
+      size_t d = k.find('.');
+      r.vals.push_back({S("def"), S(k.substr(0, d)), S(k.substr(d + 1)), S(sql), S("NONE"), S("NO"), S("root@%"), S("DEFINER"),
+                        S("utf8mb4"), S("utf8mb4_bin")});
+    }
+  } else if (tn == "table_constraints") {
+    cols({"CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME", "TABLE_SCHEMA", "TABLE_NAME", "CONSTRAINT_TYPE", "ENFORCED"},
+         {V, V, V, V, V, V, V});
+    for (auto& t : tabs) {
+      if (!t->pkCols.empty()) r.vals.push_back({S("def"), S(t->db), S("PRIMARY"), S(t->db), S(t->name), S("PRIMARY KEY"), S("YES")});
+      for (auto& ix : t->indexes)
+        if (ix.unique && ix.name != "PRIMARY") r.vals.push_back({S("def"), S(t->db), S(ix.name), S(t->db), S(t->name), S("UNIQUE"), S("YES")});
+      for (auto& f : t->fks) r.vals.push_back({S("def"), S(t->db), S(f.name), S(t->db), S(t->name), S("FOREIGN KEY"), S("NO")});
+    }
+  } else {  // the other information_schema tables: MySQL 8's columns (empty, or a few fixed rows)
+    static const std::map<std::string, std::vector<std::string>> layouts = {
+        {"routines", {"SPECIFIC_NAME", "ROUTINE_CATALOG", "ROUTINE_SCHEMA", "ROUTINE_NAME", "ROUTINE_TYPE", "DATA_TYPE",
+                      "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE", "DTD_IDENTIFIER", "ROUTINE_BODY",
+                      "ROUTINE_DEFINITION", "EXTERNAL_NAME", "EXTERNAL_LANGUAGE", "PARAMETER_STYLE", "IS_DETERMINISTIC",
+                      "SQL_DATA_ACCESS", "SQL_PATH", "SECURITY_TYPE", "CREATED", "LAST_ALTERED", "SQL_MODE", "ROUTINE_COMMENT",
+                      "DEFINER", "CHARACTER_SET_CLIENT", "COLLATION_CONNECTION", "DATABASE_COLLATION"}},
+        {"parameters", {"SPECIFIC_CATALOG", "SPECIFIC_SCHEMA", "SPECIFIC_NAME", "ORDINAL_POSITION", "PARAMETER_MODE",
+                        "PARAMETER_NAME", "DATA_TYPE", "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "NUMERIC_SCALE",
+                        "DTD_IDENTIFIER", "ROUTINE_TYPE"}},
+        {"triggers", {"TRIGGER_CATALOG", "TRIGGER_SCHEMA", "TRIGGER_NAME", "EVENT_MANIPULATION", "EVENT_OBJECT_CATALOG",
+                      "EVENT_OBJECT_SCHEMA", "EVENT_OBJECT_TABLE", "ACTION_ORDER", "ACTION_CONDITION", "ACTION_STATEMENT",
+                      "ACTION_ORIENTATION", "ACTION_TIMING", "CREATED", "SQL_MODE", "DEFINER", "CHARACTER_SET_CLIENT",
+                      "COLLATION_CONNECTION", "DATABASE_COLLATION"}},
+        {"events", {"EVENT_CATALOG", "EVENT_SCHEMA", "EVENT_NAME", "DEFINER", "TIME_ZONE", "EVENT_BODY", "EVENT_DEFINITION",
+                    "EVENT_TYPE", "EXECUTE_AT", "INTERVAL_VALUE", "INTERVAL_FIELD", "SQL_MODE", "STARTS", "ENDS", "STATUS",
+                    "ON_COMPLETION", "CREATED", "LAST_ALTERED", "LAST_EXECUTED", "EVENT_COMMENT"}},
+        {"partitions", {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "PARTITION_NAME", "SUBPARTITION_NAME",
+                        "PARTITION_ORDINAL_POSITION", "PARTITION_METHOD", "PARTITION_EXPRESSION", "PARTITION_DESCRIPTION",
+                        "TABLE_ROWS", "PARTITION_COMMENT"}},
+        {"character_sets", {"CHARACTER_SET_NAME", "DEFAULT_COLLATE_NAME", "DESCRIPTION", "MAXLEN"}},
+        {"collations", {"COLLATION_NAME", "CHARACTER_SET_NAME", "ID", "IS_DEFAULT", "IS_COMPILED", "SORTLEN", "PAD_ATTRIBUTE"}},
+        {"engines", {"ENGINE", "SUPPORT", "COMMENT", "TRANSACTIONS", "XA", "SAVEPOINTS"}},
+        {"user_privileges", {"GRANTEE", "TABLE_CATALOG", "PRIVILEGE_TYPE", "IS_GRANTABLE"}},
+        {"schema_privileges", {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "PRIVILEGE_TYPE", "IS_GRANTABLE"}},
+        {"table_privileges", {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"}},
+        {"column_privileges", {"GRANTEE", "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "PRIVILEGE_TYPE", "IS_GRANTABLE"}},
+        {"processlist", {"ID", "USER", "HOST", "DB", "COMMAND", "TIME", "STATE", "INFO"}},
+        {"keywords", {"WORD", "RESERVED"}},
+        {"plugins", {"PLUGIN_NAME", "PLUGIN_VERSION", "PLUGIN_STATUS", "PLUGIN_TYPE", "PLUGIN_LIBRARY", "PLUGIN_LICENSE"}},
+        {"global_variables", {"VARIABLE_NAME", "VARIABLE_VALUE"}},
+        {"session_variables", {"VARIABLE_NAME", "VARIABLE_VALUE"}},
+        {"innodb_tables", {"TABLE_ID", "NAME", "FLAG", "N_COLS", "SPACE", "ROW_FORMAT"}},
+        {"st_geometry_columns", {"TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "SRS_NAME", "SRS_ID", "GEOMETRY_TYPE_NAME"}},
+        {"resource_groups", {"RESOURCE_GROUP_NAME", "RESOURCE_GROUP_TYPE", "RESOURCE_GROUP_ENABLED", "VCPU_IDS", "THREAD_PRIORITY"}},
+    };
+    auto it = layouts.find(tn);
+    if (it == layouts.end()) throw SqlError("Unknown table '" + table + "' in information_schema", 1109);
+    cols(it->second, std::vector<LType>(it->second.size(), V));
+    auto row = [&](std::vector<std::string> v) {
+      std::vector<Value> out;
+      for (auto& x : v) out.push_back(S(x));
+      out.resize(r.names.size(), Value::Null());
+      r.vals.push_back(out);
+    };
+    if (tn == "character_sets") row({"utf8mb4", "utf8mb4_0900_ai_ci", "UTF-8 Unicode", "4"});
+    if (tn == "collations")
+      for (auto* c : {"utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_general_ci", "utf8mb4_unicode_ci"})
+        row({c, "utf8mb4", "0", std::string(c) == "utf8mb4_0900_ai_ci" ? "Yes" : "", "Yes", "1", "PAD SPACE"});
+    if (tn == "engines") {
+      row({"Columnstore", "DEFAULT", "gpu-db GPU columnstore with a row write buffer", "YES", "NO", "YES"});
+      row({"InnoDB", "YES", "Alias of the gpu-db columnstore", "YES", "NO", "YES"});
+    }
+    if (tn == "global_variables" || tn == "session_variables")
+      for (auto& [k, v] : systemVariables()) row({upper(k), v});
+    if (tn == "routines")
+      for (auto& d : routineDefs()) {
+        std::string u = upper(d.substr(0, 200));
+        const bool fn = u.find("FUNCTION") != std::string::npos && (u.find("PROCEDURE") == std::string::npos || u.find("FUNCTION") < u.find("PROCEDURE"));
+        size_t k = u.find(fn ? "FUNCTION" : "PROCEDURE") + (fn ? 8 : 9);
+        while (k < d.size() && isspace((unsigned char)d[k])) ++k;
+        size_t e = k;
+        while (e < d.size() && (isalnum((unsigned char)d[e]) || d[e] == '_' || d[e] == '.' || d[e] == '`')) ++e;
+        std::string name = d.substr(k, e - k);
+        name.erase(std::remove(name.begin(), name.end(), '`'), name.end());
+        std::string db = currentDb();
+        if (name.find('.') != std::string::npos) db = name.substr(0, name.find('.')), name = name.substr(name.find('.') + 1);
+        row({name, "def", db, name, fn ? "FUNCTION" : "PROCEDURE", "", "", "", "", "", "SQL", d, "", "SQL", "SQL", "NO",
+             "CONTAINS SQL", "", "DEFINER", "", "", "", "", "root@%", "utf8mb4", "utf8mb4_bin", "utf8mb4_bin"});
+      }
+  }
+  return r;
+}
+
+// System variables (SHOW VARIABLES, @@name): MySQL 8 defaults where gpu-db behaves the same, the
+// session's settings, and gpudb_* knobs.
+std::vector<std::pair<std::string, std::string>> systemVariables() {
+  const std::string iso = tIsoSnapshot ? "REPEATABLE-READ" : "READ-COMMITTED";
+  return {{"version", "8.0.32-gpudb"}, {"version_comment", "gpu-db (GPU-accelerated HTAP)"}, {"version_compile_os", "Linux"},
+          {"version_compile_machine", "x86_64"}, {"protocol_version", "10"}, {"license", "GPL"}, {"autocommit", "ON"},
+          {"character_set_client", "utf8mb4"}, {"character_set_connection", "utf8mb4"}, {"character_set_results", "utf8mb4"},
+          {"character_set_server", "utf8mb4"}, {"character_set_database", "utf8mb4"}, {"character_set_system", "utf8mb3"},
+          {"collation_connection", ciColl() ? "utf8mb4_0900_ai_ci" : "utf8mb4_bin"}, {"collation_server", "utf8mb4_0900_ai_ci"},
+          {"collation_database", "utf8mb4_0900_ai_ci"}, {"lower_case_table_names", "1"}, {"lower_case_file_system", "OFF"},
+          {"max_allowed_packet", "1073741824"}, {"net_buffer_length", "16384"}, {"sql_mode", ""}, {"time_zone", "SYSTEM"},
+          {"system_time_zone", "UTC"}, {"transaction_isolation", iso}, {"tx_isolation", iso}, {"transaction_read_only", "0"},
+          {"tx_read_only", "0"}, {"wait_timeout", "28800"}, {"interactive_timeout", "28800"}, {"net_write_timeout", "60"},
+          {"net_read_timeout", "30"}, {"connect_timeout", "10"}, {"max_connections", "1000"}, {"auto_increment_increment", "1"},
+          {"auto_increment_offset", "1"}, {"sql_auto_is_null", "0"}, {"sql_select_limit", "18446744073709551615"},
+          {"sql_safe_updates", "0"}, {"foreign_key_checks", "1"}, {"unique_checks", "1"}, {"explicit_defaults_for_timestamp", "ON"},
+          {"default_storage_engine", "InnoDB"}, {"default_authentication_plugin", "mysql_native_password"},
+          {"performance_schema", "OFF"}, {"have_ssl", "YES"}, {"have_openssl", "YES"}, {"query_cache_size", "0"},
+          {"query_cache_type", "OFF"}, {"init_connect", ""}, {"lc_messages", "en_US"}, {"lc_time_names", "en_US"},
+          {"default_week_format", "0"}, {"div_precision_increment", "4"}, {"group_concat_max_len", "1048576"},
+          {"innodb_version", "8.0.32"}, {"warning_count", "0"}, {"error_count", "0"}, {"session_track_gtids", "OFF"},
+          {"last_insert_id", std::to_string(tLastInsertId)}, {"identity", std::to_string(tLastInsertId)}, {"hostname", "localhost"},
+          {"port", "3306"}, {"socket", "/tmp/mysql.sock"}, {"datadir", "/var/lib/gpudb/"}, {"basedir", "/usr/"},
+          {"tmpdir", "/tmp"}, {"server_id", "1"}, {"log_bin", "OFF"}, {"binlog_format", "ROW"}, {"gtid_mode", "OFF"},
+          {"read_only", "0"}, {"super_read_only", "0"}, {"max_execution_time", "0"}, {"innodb_lock_wait_timeout", "50"},
+          {"lock_wait_timeout", "31536000"}, {"max_join_size", "18446744073709551615"}, {"sql_big_selects", "1"},
+          {"local_infile", "ON"}, {"secure_file_priv", ""}, {"skip_name_resolve", "ON"}, {"require_secure_transport", "OFF"},
+          {"default_collation_for_utf8mb4", "utf8mb4_0900_ai_ci"}, {"information_schema_stats_expiry", "86400"},
+          {"gpudb_sync_durability", tSyncDurability < 0 ? "DEFAULT" : tSyncDurability ? "ON" : "OFF"},
+          {"gpudb_codegen", jitMode() == JIT_OFF ? "OFF" : jitMode() == JIT_SYNC ? "SYNC" : "ON"},
+          {"gpudb_dense_groupby", tDense ? "ON" : "OFF"}, {"gpudb_join_filters", tJoinFilters ? "ON" : "OFF"},
+          {"gpudb_join_filter_rows", std::to_string(tLazyRows)}, {"gpudb_gpu", gpuDescribe()}};
+}
+Value sysVarValue(const std::string& name) {
+  const std::string n = lower(name);
+  for (auto& [k, v] : systemVariables())
+    if (k == n) {
+      if (v == "ON" || v == "OFF") return n == "autocommit" ? Value::I(v == "ON") : Value::S(v);
+      char* end = nullptr;
+      long long x = std::strtoll(v.c_str(), &end, 10);
+      if (!v.empty() && end && *end == 0 && v.size() < 19) return Value::I(x);
+      return Value::S(v);
+    }
+  return Value::Null();
+}
+
+ResultSet Engine::doShowMisc(Stmt& s) {
+  const std::string k = s.setName;
+  ResultSet r = table({"Variable_name", "Value"}, {LType::VARCHAR, LType::VARCHAR});
+  if (k == "CREATE TABLE") {
+    if (auto t = cat_.find(s.table)) {
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      r = table({"Table", "Create Table"}, {LType::VARCHAR, LType::VARCHAR});
+      r.rows.push_back({t->name, showCreate(*t)});
+      return r;
+    }
+    k == "CREATE TABLE" ? void() : void();
+  }
+  if (k == "CREATE TABLE" || k == "CREATE VIEW") {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    auto it = cat_.views.find(Catalog::key(s.table));
+    if (it == cat_.views.end()) throw SqlError("Table '" + s.table + "' doesn't exist", 1146);
+    r = table({"View", "Create View", "character_set_client", "collation_connection"}, {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR});
+    r.rows.push_back({plainName(s.table), "CREATE VIEW `" + plainName(s.table) + "` AS " + it->second, "utf8mb4", "utf8mb4_bin"});
+    return r;
+  }
+  if (k == "CREATE DATABASE") {
+    r = table({"Database", "Create Database"}, {LType::VARCHAR, LType::VARCHAR});
+    r.rows.push_back({s.table, "CREATE DATABASE `" + s.table + "`"});
+    return r;
+  }
+  if (k == "INDEX") {
+    r = table({"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name", "Collation", "Cardinality", "Sub_part",
+               "Packed", "Null", "Index_type", "Comment"},
+              {LType::VARCHAR, LType::BIGINT, LType::VARCHAR, LType::BIGINT, LType::VARCHAR, LType::VARCHAR, LType::BIGINT,
+               LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR});
+    auto t = cat_.get(s.table);
+    for (size_t i = 0; i < t->pkCols.size(); ++i)
+      r.rows.push_back({t->name, "0", "PRIMARY", std::to_string(i + 1), t->cols[t->pkCols[i]].name, "A", std::to_string(t->liveRows()),
+                        kNullCell, kNullCell, "", "HASH", ""});
+    for (auto& ix : t->indexes)
+      for (size_t i = 0; i < ix.cols.size(); ++i)
+        r.rows.push_back({t->name, ix.unique ? "0" : "1", ix.name, std::to_string(i + 1), t->cols[ix.cols[i]].name, "A",
+                          kNullCell, kNullCell, kNullCell, "YES", "HASH", ""});
+    if (!t->shardKey.empty())
+      for (size_t i = 0; i < t->shardKey.size(); ++i)
+        r.rows.push_back({t->name, "1", "__SHARDKEY", std::to_string(i + 1), t->cols[t->shardKey[i]].name, kNullCell,
+                          kNullCell, kNullCell, kNullCell, "", "METADATA_ONLY", ""});
+    return r;
+  }
+  if (k == "VARIABLES" || k == "STATUS") {
+    std::vector<std::pair<std::string, std::string>> vars;
+    if (k == "VARIABLES")
+      vars = systemVariables();
+    else
+      vars = {{"Uptime", "1"}, {"Threads_connected", "1"}, {"Queries", "0"}};
+    for (auto& [n, v] : vars)
+      if (likeCI(n, s.path)) r.rows.push_back({n, v});
+    return r;
+  }
+  if (k == "TABLE STATUS") {
+    r = table({"Name", "Engine", "Version", "Row_format", "Rows", "Avg_row_length", "Data_length", "Max_data_length",
+               "Index_length", "Data_free", "Auto_increment", "Create_time", "Update_time", "Check_time", "Collation",
+               "Checksum", "Create_options", "Comment"},
+              std::vector<LType>(18, LType::VARCHAR));
+    std::vector<std::shared_ptr<Table>> tabs;
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      const std::string db = s.table.empty() ? currentDb() : s.table;
+      for (auto& [key, t] : cat_.tables)
+        if (lower(t->db) == lower(db)) tabs.push_back(t);
+    }
+    for (auto& t : tabs)
+      if (likeCI(t->name, s.path))
+        r.rows.push_back({t->name, "Columnstore", "10", "Dynamic", std::to_string(t->liveRows()), "0", std::to_string(t->vramBytes()),
+                          "0", "0", "0", t->autoIncCol >= 0 ? std::to_string(t->autoNext) : kNullCell, kNullCell, kNullCell,
+                          kNullCell, "utf8mb4_bin", kNullCell, "", ""});
+    return r;
+  }
+  if (k == "ENGINES") {
+    r = table({"Engine", "Support", "Comment", "Transactions", "XA", "Savepoints"}, std::vector<LType>(6, LType::VARCHAR));
+    r.rows.push_back({"Columnstore", "DEFAULT", "GPU-resident columnstore with a CPU write buffer", "YES", "NO", "NO"});
+    return r;
+  }
+  if (k == "COLLATION") {
+    r = table({"Collation", "Charset", "Id", "Default", "Compiled", "Sortlen"}, std::vector<LType>(6, LType::VARCHAR));
+    r.rows.push_back({"utf8mb4_bin", "utf8mb4", "46", "Yes", "Yes", "1"});
+    return r;
+  }
+  if (k == "CHARSET") {
+    r = table({"Charset", "Description", "Default collation", "Maxlen"}, std::vector<LType>(4, LType::VARCHAR));
+    r.rows.push_back({"utf8mb4", "UTF-8 Unicode", "utf8mb4_bin", "4"});
+    return r;
+  }
+  if (k == "VRAM") {  // SHOW VRAM: where each column's segments live (VRAM cache / hints)
+    r = table({"Database", "Table", "Column", "Hint", "VRAM_MB", "Host_MB", "Heat"},
+              {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::DOUBLE, LType::DOUBLE, LType::DOUBLE});
+    std::vector<std::shared_ptr<Table>> tabs;
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      for (auto& [key, t] : cat_.tables) tabs.push_back(t);
+    }
+    std::sort(tabs.begin(), tabs.end(), [](auto& a, auto& b) { return a->db + "." + a->name < b->db + "." + b->name; });
+    for (auto& t : tabs) {
+      if (t->db == "__tmp") continue;
+      if (sessionUser() != "root") {
+        std::lock_guard<std::mutex> ug(usersMu_);
+        if (!hasPriv(sessionUser(), "SELECT", lower(t->db), lower(t->name)) && !hasPriv(sessionUser(), "SELECT", lower(t->db), "*")) continue;
+      }
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      for (size_t c = 0; c < t->cols.size(); ++c) {
+        double vram = 0, host = 0, heat = 0;
+        for (auto& sp : t->segs) {
+          if (c >= sp->dev.size() || !sp->dev[c]) continue;
+          const double mb = (double)(sp->enc[c] ? sp->encHost[c].size() : sp->host[c].size()) / 1048576.0;
+          (sp->mapped[c] ? host : vram) += mb;
+          if (c < sp->heat.size()) heat += sp->heat[c];
+        }
+        const int h = t->vramHint((int)c);
+        auto f2 = [](double x) { char b[32]; snprintf(b, sizeof b, "%.2f", x); return std::string(b); };
+        r.rows.push_back({t->db, t->name, t->cols[c].name, h == 1 ? "PIN" : h == 2 ? "NEVER" : "AUTO", f2(vram), f2(host), f2(heat)});
+      }
+    }
+    return r;
+  }
+  if (k == "PROCESSLIST") {
+    r = table({"Id", "User", "Host", "db", "Command", "Time", "State", "Info"}, std::vector<LType>(8, LType::VARCHAR));
+    r.rows.push_back({"1", "root", "localhost", currentDb(), "Query", "0", "executing", "SHOW PROCESSLIST"});
+    return r;
+  }
+  if (k == "GRANTS") {
+    r = table({"Grants for root@%"}, {LType::VARCHAR});
+    std::lock_guard<std::mutex> g(usersMu_);
+    if (sessionUser() == "root") r.rows.push_back({"GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'"});
+    for (auto& e : grants_[sessionUser()]) {
+      if (e[0] == '@') r.rows.push_back({"GRANT '" + e.substr(1) + "' TO '" + sessionUser() + "'@'%'"});
+      else r.rows.push_back({"GRANT " + e.substr(0, e.find('|')) + " ON " + e.substr(e.find('|') + 1) + " TO '" + sessionUser() + "'@'%'"});
+    }
+    return r;
+  }
+  if (k == "WARNINGS" || k == "ERRORS") {
+    r = table({"Level", "Code", "Message"}, {LType::VARCHAR, LType::BIGINT, LType::VARCHAR});
+    return r;
+  }
+  r = table({"Name", "Value"}, {LType::VARCHAR, LType::VARCHAR});  // TRIGGERS, EVENTS, PLUGINS, ..: empty
+  return r;
+}
+
+
+ResultSet Engine::doInsert(Stmt& s) {
+  std::vector<std::vector<Value>> rows;
+  if (s.select) {  // INSERT .. SELECT: run the query first (it may read the target table)
+    QueryCtx q;
+    ResultSet r;
+    try {
+      r = query(*s.select, q, false, true);
+    } catch (...) {
+      dropTemps(q);
+      throw;
+    }
+    dropTemps(q);
+    rows = std::move(r.vals);
+  }
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  if (hasUniqueKey(*t)) waitTxnFree(*t, lk);  // another open transaction may hold a row with the same key
+  std::vector<int> map;
+  if (s.insertCols.empty()) {
+    for (size_t i = 0; i < t->cols.size(); ++i) map.push_back((int)i);
+  } else {
+    for (auto& c : s.insertCols) {
+      int i = t->colIndex(c);
+      if (i < 0) throw SqlError("Unknown column '" + c + "' in 'field list'", 1054);
+      map.push_back(i);
+    }
+  }
+  if (!s.select) {
+    BindCtx bc;
+    PostCtx pc;
+    for (auto& row : s.rows) {
+      if (row.empty() && s.insertCols.empty()) { rows.push_back({}); continue; }  // VALUES (): all defaults
+      if (row.size() != map.size())
+        throw SqlError("Column count doesn't match value count at row " + std::to_string(rows.size() + 1), 1136);
+      std::vector<Value> vals;
+      for (auto& x : row) {
+        if (x->kind == Expr::COL && upper(x->name) == "DEFAULT" && x->table.empty()) { vals.push_back(Value::S("\x01DEFAULT")); continue; }
+        bind(x, bc);
+        vals.push_back(evalPost(x, pc));
+      }
+      rows.push_back(std::move(vals));
+    }
+  }
+  int64_t n = insertRows(*t, map, rows, s);
+  ResultSet r = okResult(n);
+  r.lastInsertId = t->autoIncCol >= 0 ? t->lastInsertId : 0;
+  if (r.lastInsertId) tLastInsertId = r.lastInsertId;
+  return r;
+}
+
+// Appends rows (values for the columns in `map`), handling INSERT IGNORE, REPLACE and
+// ON DUPLICATE KEY UPDATE against the PRIMARY KEY. Caller holds the table's exclusive lock.
+int64_t Engine::insertRows(Table& t, const std::vector<int>& map, std::vector<std::vector<Value>>& rows, const Stmt& s) {
+  int64_t affected = 0;
+  BindCtx bc;
+  bc.tabs = {cat_.get(t.db + "." + t.name)};
+  bc.aliases = {t.name};
+  std::vector<ExprP> dupExprs;
+  std::vector<int> dupCols;
+  for (auto& [name, e] : s.onDup) {
+    int ci = t.colIndex(name);
+    if (ci < 0) throw SqlError("Unknown column '" + name + "' in 'field list'", 1054);
+    dupCols.push_back(ci);
+    dupExprs.push_back(e);
+  }
+  for (auto& in : rows) {
+    std::vector<Value> vals = defaultRow(t);
+    if (!in.empty() && in.size() != map.size()) throw SqlError("Column count doesn't match value count", 1136);
+    for (size_t i = 0; i < in.size(); ++i)
+      if (!(in[i].kind == Value::STR && in[i].s == "\x01DEFAULT")) vals[map[i]] = in[i];
+    // A conflict with an existing row (PRIMARY KEY or UNIQUE key): IGNORE skips the new row, REPLACE
+    // deletes the old one, ON DUPLICATE KEY UPDATE updates it. True: the new row is consumed.
+    auto onConflict = [&](Loc old, const std::string& err) -> bool {
+      if (s.insertIgnore) return true;
+      if (s.replaceInto) {
+        t.deleteAt(old);
+        affected += 1;
+        return false;
+      }
+      if (s.onDup.empty()) throw SqlError(err, 1062);
+      std::vector<Value> cur;
+      for (size_t c = 0; c < t.cols.size(); ++c) cur.push_back(cellValue(t, old, (int)c));
+      PostCtx pc;
+      pc.row = &cur;
+      pc.colSlot = [](int, int c) { return c; };
+      std::vector<Value> upd = cur;
+      std::function<ExprP(const ExprP&)> subst = [&](const ExprP& x) -> ExprP {  // VALUES(col): the new value
+        if (x->kind == Expr::FUNC && x->op == "VALUES" && x->args.size() == 1 && x->args[0]->kind == Expr::COL) {
+          int ci = t.colIndex(x->args[0]->name);
+          if (ci < 0) throw SqlError("Unknown column '" + x->args[0]->name + "' in 'field list'", 1054);
+          return mkLit(vals[ci]);
+        }
+        auto y = std::make_shared<Expr>(*x);
+        y->bound = false;
+        for (auto& a : y->args) a = subst(a);
+        return y;
+      };
+      for (size_t k = 0; k < dupExprs.size(); ++k) {
+        ExprP e = subst(dupExprs[k]);
+        bind(e, bc);
+        upd[dupCols[k]] = evalPost(e, pc);
+      }
+      bool same = true;
+      for (size_t c = 0; c < upd.size(); ++c) same = same && cmpVal(upd[c], cur[c]) == 0 && upd[c].isNull() == cur[c].isNull();
+      if (same) return true;  // MySQL: 0 rows affected when nothing changes
+      t.deleteAt(old);
+      t.appendRow(upd);
+      affected += 2;
+      return true;
+    };
+    if (t.pk >= 0 && !vals[t.pk].isNull()) {
+      auto it = t.pkIndex.find((int64_t)numOf(vals[t.pk]));
+      if (it != t.pkIndex.end() && onConflict(it->second, "Duplicate entry '" + vals[t.pk].toString() + "' for key 'PRIMARY'")) continue;
+    }
+    for (int tries = 0;; ++tries) {
+      try {
+        t.appendRow(vals);
+        ++affected;
+        break;
+      } catch (SqlError& e) {  // UNIQUE key (or composite PRIMARY KEY) conflict
+        if (e.code != 1062 || t.lastDup.seg == INT32_MIN || tries > 16 || (!s.insertIgnore && !s.replaceInto && s.onDup.empty())) throw;
+        if (onConflict(t.lastDup, e.what())) break;
+      }
+    }
+  }
+  return affected;
+}
+
+ResultSet Engine::doLoad(Stmt& s) {
+  if (s.setValue != "FS" && !s.setValue.empty())
+    throw SqlError("LOAD DATA " + s.setValue + " is not supported in this PoC (use a local path / FS)", 1235);
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  waitTxnFree(*t, lk);  // another session's open transaction changed this table
+  auto t0 = Clock::now();
+  std::vector<int> srcOf;
+  if (!s.insertCols.empty()) {  // (col, @skip, ..): which field feeds which column
+    srcOf.assign(t->cols.size(), -1);
+    for (size_t i = 0; i < s.insertCols.size(); ++i) {
+      if (s.insertCols[i].rfind("@", 0) == 0) continue;
+      int c = t->colIndex(s.insertCols[i]);
+      if (c < 0) throw SqlError("Unknown column '" + s.insertCols[i] + "' in 'field list'", 1054);
+      srcOf[c] = (int)i;
+    }
+  }
+  if (replaying_) replayedLoads_.insert(s.path);
+  // The exclusive lock is released briefly every 256K rows so queries are not stalled by a long load
+  // (they see the rows loaded so far, like other uncommitted writes).
+  int64_t n = t->loadFile(s.path, s.delim, s.skipLines, srcOf, [&] {
+    lk.unlock();
+    std::this_thread::yield();
+    lk.lock();
+  }, s.escape);
+  lk.unlock();
+  warmDicts(t);
+  char info[128];
+  snprintf(info, sizeof info, "Records: %lld  Loaded in %.1f s", (long long)n, msSince(t0) / 1000);
+  return okResult(n, info);
+}
+
+ResultSet Engine::doOptimize(Stmt& s) {
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  int64_t n = t->bufferRows();
+  t->flush(true);
+  for (auto& ix : t->indexes)
+    if (ix.vec) t->buildIndex(ix);  // retrain vector indexes on the current data
+  lk.unlock();
+  warmDicts(t);
+  ResultSet r;
+  r.isResult = true;
+  r.names = {"Table", "Op", "Msg_type", "Msg_text"};
+  r.types = {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR};
+  r.rows = {{t->name, "optimize", "status", "flushed " + std::to_string(n) + " buffered rows to GPU segments"}};
+  return r;
+}
+
+ResultSet Engine::doShowTables(Stmt& s) {
+  const std::string db = s.table.empty() ? currentDb() : s.table;
+  ResultSet r;
+  r.isResult = true;
+  r.names = {"Tables_in_" + db};
+  r.types = {LType::VARCHAR};
+  if (s.setName == "FULL") {
+    r.names.push_back("Table_type");
+    r.types.push_back(LType::VARCHAR);
+  }
+  std::lock_guard<std::mutex> g(cat_.mu);
+  std::vector<std::pair<std::string, std::string>> out;
+  for (auto& [k, t] : cat_.tables)
+    if (lower(t->db) == lower(db) && likeCI(t->name, s.path)) out.push_back({t->name, "BASE TABLE"});
+  for (auto& [k, v] : cat_.views)
+    if (k.substr(0, k.find('.')) == lower(db) && likeCI(k.substr(k.find('.') + 1), s.path)) out.push_back({k.substr(k.find('.') + 1), "VIEW"});
+  std::sort(out.begin(), out.end());
+  for (auto& [n, ty] : out) r.rows.push_back(s.setName == "FULL" ? std::vector<std::string>{n, ty} : std::vector<std::string>{n});
+  return r;
+}
+
+ResultSet Engine::doDescribe(Stmt& s) {
+  auto t = cat_.get(s.table);
+  ResultSet r;
+  r.isResult = true;
+  r.names = {"Field", "Type", "Null", "Key", "Default", "Extra"};
+  r.types.assign(6, LType::VARCHAR);
+  for (size_t i = 0; i < t->cols.size(); ++i) {
+    const ColumnMeta& c = t->cols[i];
+    std::string key = (int)i == t->pk || std::count(t->pkCols.begin(), t->pkCols.end(), (int)i) ? "PRI" : "";
+    for (auto& ix : t->indexes)
+      if (key.empty() && !ix.cols.empty() && ix.cols[0] == (int)i) key = ix.unique ? "UNI" : "MUL";
+    r.rows.push_back({c.name, colTypeText(c), c.notNull || (int)i == t->pk ? "NO" : "YES", key,
+                      c.hasDefault ? (c.def.isNull() ? kNullCell : c.def.toString()) : kNullCell, c.autoInc ? "auto_increment" : ""});
+  }
+  return r;
+}
+
+ResultSet Engine::doShowSegments(Stmt& s) {
+  auto t = cat_.get(s.table);
+  std::shared_lock<FairSharedMutex> lk(t->mu);
+  ResultSet r;
+  r.isResult = true;
+  r.names = {"partition", "segment", "tier", "rows", "deleted", "vram_bytes", "sort_key_min", "sort_key_max"};
+  r.types = {LType::BIGINT, LType::BIGINT, LType::VARCHAR, LType::BIGINT, LType::BIGINT, LType::BIGINT, LType::VARCHAR, LType::VARCHAR};
+  auto fmtKey = [&](double v) {
+    if (t->sortKey < 0) return kNullCell;
+    return typedVal(v, t->cols[t->sortKey].lt, t->dicts[t->sortKey].get()).toString();
+  };
+  int64_t rowBytes = 0;
+  for (size_t c = 0; c < t->cols.size(); ++c) rowBytes += t->colBytes((int)c);
+  for (int p = 0; p < t->nparts; ++p) {
+    for (size_t i = 0; i < t->segs.size(); ++i) {
+      auto& sg = *t->segs[i];
+      if (sg.part != p) continue;
+      bool host = std::any_of(sg.mapped.begin(), sg.mapped.end(), [](uint8_t m) { return m != 0; });
+      r.rows.push_back({std::to_string(p), std::to_string(i), host ? "host-columnstore (PCIe)" : "gpu-columnstore",
+                        std::to_string(sg.n), std::to_string(sg.ndel),
+                        std::to_string(sg.n * rowBytes + (sg.n + 31) / 32 * 4),
+                        t->sortKey >= 0 ? fmtKey(sg.mn[t->sortKey]) : kNullCell,
+                        t->sortKey >= 0 ? fmtKey(sg.mx[t->sortKey]) : kNullCell});
+    }
+    const WriteBuffer& b = *t->bufs[p];
+    if (b.n > 0)
+      r.rows.push_back({std::to_string(p), "-1", "cpu-write-buffer", std::to_string(b.n), std::to_string(b.ndel), "0", kNullCell, kNullCell});
+  }
+  return r;
+}
+
+// ------------------------------------------------------------------ DELETE / UPDATE
+
+// UPDATE / DELETE with joins (UPDATE a JOIN b .. SET, DELETE a FROM a JOIN b ..), correlated
+// subqueries, ORDER BY / LIMIT: the rows to change (and their new values) come from a SELECT over
+// the same FROM / WHERE, then the target rows with exactly those column values are modified (rows
+// identical in every column are interchangeable, so matching by value is exact).
+ResultSet Engine::modifyViaSelect(Stmt& s) {
+  auto t = cat_.get(s.table);
+  Stmt sel;
+  sel.type = Stmt::SELECT;
+  sel.from = s.from;
+  if (sel.from.empty()) sel.from = {TableRef{s.table, plainName(s.table), nullptr, 0, nullptr}};
+  sel.joinConds = s.joinConds;
+  sel.where = s.where;
+  sel.orderBy = s.orderBy;
+  sel.limit = s.limit;
+  const std::string alias = s.targetAlias.empty() ? sel.from[0].alias : s.targetAlias;
+  for (auto& c : t->cols) sel.items.push_back({mkCol(alias, c.name), "__c" + std::to_string(sel.items.size())});
+  std::vector<int> setCols;
+  for (auto& [name, e] : s.sets) {
+    const int c = t->colIndex(name);
+    if (c < 0) throw SqlError("Unknown column '" + name + "' in 'field list'", 1054);
+    setCols.push_back(c);
+    sel.items.push_back({cloneExpr(e), "__s" + std::to_string(sel.items.size())});
+  }
+  QueryCtx q;
+  ResultSet r;
+  try {
+    r = query(sel, q, false, true);
+  } catch (...) {
+    dropTemps(q);
+    throw;
+  }
+  dropTemps(q);
+  const size_t nc = t->cols.size();
+  auto keyOf = [&](const std::vector<Value>& row) {
+    std::string k;
+    for (size_t c = 0; c < nc; ++c) {
+      const Value& v = row[c];
+      if (v.isNull()) { k += "\x02\x1f"; continue; }
+      if (v.kind == Value::DBL) {
+        char b[40];
+        snprintf(b, sizeof b, "%.15g", v.d);
+        k += b;
+      } else if (v.kind == Value::STR) {
+        k += v.s;
+      } else {
+        k += std::to_string(v.i);
+      }
+      k += '\x1f';
+    }
+    return k;
+  };
+  std::unordered_map<std::string, size_t> want;  // row values -> result row (its SET values)
+  for (size_t i = 0; i < r.vals.size(); ++i) want.emplace(keyOf(r.vals[i]), i);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  std::vector<Loc> matched;
+  std::vector<std::vector<Value>> newRows;
+  std::unordered_map<std::string, int64_t> budget;  // LIMIT: how many rows with these values may change
+  if (s.limit >= 0)
+    for (auto& row : r.vals) ++budget[keyOf(row)];
+  forEachLiveRow(*t, [&](Loc l) {
+    std::vector<Value> cur;
+    for (size_t c = 0; c < nc; ++c) cur.push_back(cellValue(*t, l, (int)c));
+    const std::string k = keyOf(cur);
+    auto it = want.find(k);
+    if (it == want.end()) return;
+    if (s.limit >= 0 && budget[k]-- <= 0) return;
+    matched.push_back(l);
+    if (s.type == Stmt::UPDATE) {
+      std::vector<Value> row = cur;
+      for (size_t j = 0; j < setCols.size(); ++j) {
+        Value v = r.vals[it->second][nc + j];
+        if (!v.isNull() && t->cols[setCols[j]].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+        row[setCols[j]] = v;
+      }
+      newRows.push_back(std::move(row));
+    }
+  });
+  if (rowsPending(*t, matched)) {  // another open transaction changed some of these rows: wait, then redo
+    waitTxnFree(*t, lk);
+    lk.unlock();
+    return modifyViaSelect(s);
+  }
+  return applyModify(*t, matched, newRows);
+}
+
+ResultSet Engine::doModify(Stmt& s) {
+  std::function<bool(const ExprP&)> hasSub = [&](const ExprP& e) {
+    if (!e) return false;
+    if (e->sub || e->kind == Expr::SUBQUERY) return true;
+    for (auto& a : e->args)
+      if (hasSub(a)) return true;
+    return false;
+  };
+  bool viaSelect = s.from.size() > 1 || !s.joinConds.empty() || s.limit >= 0 || hasSub(s.where) ||
+                   (s.from.size() == 1 && (s.from[0].sub || strcasecmp(s.from[0].alias.c_str(), plainName(s.from[0].name).c_str()) != 0));
+  for (auto& [n, e] : s.sets) viaSelect = viaSelect || hasSub(e);
+  if (viaSelect) return modifyViaSelect(s);
+  // Subqueries in WHERE / SET run first (they may read this table).
+  QueryCtx q;
+  {
+    Stmt tmp;
+    tmp.where = s.where;
+    for (auto& [n, e] : s.sets) tmp.items.push_back({e, n});
+    try {
+      resolveSubqueries(tmp, q);
+    } catch (...) {
+      dropTemps(q);
+      throw;
+    }
+    s.where = tmp.where;
+    for (size_t i = 0; i < s.sets.size(); ++i) s.sets[i].second = tmp.items[i].e;
+    dropTemps(q);
+  }
+  auto t = cat_.get(s.table);
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  BindCtx ctx;
+  ctx.tabs = {t};
+  ctx.aliases = {t->name};
+  if (s.where) bind(s.where, ctx);
+  std::vector<std::pair<int, ExprP>> sets;
+  for (auto& [name, e] : s.sets) {
+    int c = t->colIndex(name);
+    if (c < 0) throw SqlError("Unknown column '" + name + "' in 'field list'", 1054);
+    bind(e, ctx);
+    sets.push_back({c, e});
+  }
+  std::vector<ExprP> conj;
+  flattenAnd(s.where, conj);
+  Compiler comp(&ctx);
+  Prog wp;
+  if (s.where) wp = comp.compile(s.where);
+
+  ExprEnv henv = comp.hostEnv();
+  auto hostCols = [&](int seg) {
+    for (size_t k = 0; k < comp.slotCols.size(); ++k) {
+      int c = comp.slotCols[k].second;
+      henv.cols[k] = comp.env.cols[k];
+      henv.cols[k].p = t->colData(Loc{(int32_t)seg, 0}, c).data();
+      henv.cols[k].enc = 0;  // host mirror is raw
+    }
+  };
+
+  std::vector<Loc> matched;
+  int64_t key;
+  bool ixFound = false;
+  const IndexMeta* ixm = nullptr;
+  if (findPkEq(conj, *t, 0, key)) {
+    auto it = t->pkIndex.find(key);
+    if (it != t->pkIndex.end()) {
+      hostCols(it->second.seg);
+      if (!s.where || truthy(evalProg(henv, wp, it->second.row))) matched.push_back(it->second);
+    }
+  } else if ((ixm = findIndexEq(conj, *t, 0, key, ixFound))) {
+    auto it = ixFound ? ixm->map.find(key) : ixm->map.end();
+    if (it != ixm->map.end())
+      for (const Loc& l : it->second) {
+        hostCols(l.seg);
+        if (!s.where || truthy(evalProg(henv, wp, l.row))) matched.push_back(l);
+      }
+  } else {
+    comp.uploadSets();
+    std::vector<int> parts = partsToScan(*t, 0, conj);
+    std::vector<bool> inParts(t->nparts, false);
+    for (int p : parts) inParts[p] = true;
+    for (size_t si = 0; si < t->segs.size(); ++si) {
+      Segment& sg = *t->segs[si];
+      if (!inParts[sg.part] || !segMayMatch(sg, conj)) continue;
+      const BatchRef br{sg.part, sg.n, &sg.dev, sg.delDev, &sg.enc, 0};
+      for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
+      DevVec<int32_t> idx(sg.n);
+      int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sg.delDev, idx.p);
+      for (int32_t r : idx.download(m)) matched.push_back(Loc{(int32_t)si, r});
+    }
+    for (int p : parts) {
+      const WriteBuffer& b = *t->bufs[p];
+      hostCols(bufLoc(p, 0).seg);
+      for (int64_t r = 0; r < b.n; ++r) {
+        if ((b.del[r >> 5] >> (r & 31)) & 1u) continue;
+        if (s.where && evalProg(henv, wp, r) == 0) continue;
+        matched.push_back(bufLoc(p, r));
+      }
+    }
+  }
+
+  if (rowsPending(*t, matched)) {  // row-level conflict with another open transaction: wait, then redo
+    waitTxnFree(*t, lk);
+    lk.unlock();
+    return doModify(s);
+  }
+  // UPDATE = delete + re-insert of the modified row (like SingleStore's columnstore updates).
+  std::vector<std::vector<Value>> newRows;
+  if (s.type == Stmt::UPDATE) {
+    for (const Loc& l : matched) {  // SET expressions are evaluated on the host against the old row
+      std::vector<Value> cur;
+      for (size_t c = 0; c < t->cols.size(); ++c) cur.push_back(cellValue(*t, l, (int)c));
+      PostCtx pc;
+      pc.row = &cur;
+      pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+      std::vector<Value> row = cur;
+      for (auto& [c, e] : sets) {
+        Value v = evalPost(e, pc);
+        if (!v.isNull() && t->cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+        row[c] = v;
+      }
+      newRows.push_back(std::move(row));
+    }
+  }
+  return applyModify(*t, matched, newRows);
+}
+
+// Deletes the matched rows (and inserts their new versions, for UPDATE). Holds the table lock.
+ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const std::vector<std::vector<Value>>& newRows) {
+  Table* t = &tt;
+  std::set<int> touched;
+  for (const Loc& l : matched) {
+    if (undoLog()) {
+      undoLog()->push_back({t, false, t->rowValues(l)});
+      t->txnNoteDelete(l);
+    }
+    if (t->pk >= 0) t->pkIndex.erase(t->pkValue(l));
+    if (!t->indexes.empty()) t->indexRemove(l);
+    if (l.seg < 0) {
+      WriteBuffer& b = *t->bufs[bufPart(l)];
+      b.del[l.row >> 5] |= 1u << (l.row & 31);
+      ++b.ndel;
+      ++b.version;
+    } else {
+      Segment& sg = *t->segs[l.seg];
+      sg.delHost[l.row >> 5] |= 1u << (l.row & 31);
+      ++sg.ndel;
+      touched.insert(l.seg);
+    }
+  }
+  for (int si : touched) h2d(t->segs[si]->delDev, t->segs[si]->delHost.data(), t->segs[si]->delHost.size() * 4);
+  for (auto& row : newRows) t->appendRow(row);
+  return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
+}
+
+// ------------------------------------------------------------------ SELECT
+
+ResultSet Engine::doSelect(Stmt& s, bool explain) {
+  auto t0 = Clock::now();
+  std::vector<std::string> notes;
+  BindCtx ctx;
+  for (auto& f : s.from) {
+    ctx.tabs.push_back(cat_.get(f.name));
+    ctx.aliases.push_back(f.alias);
+    ctx.usingCols.push_back(f.usingCols);
+  }
+  // Shared locks in a stable order (writers only ever take one table lock).
+  std::vector<std::shared_ptr<Table>> lockOrder = ctx.tabs;
+  std::sort(lockOrder.begin(), lockOrder.end());
+  lockOrder.erase(std::unique(lockOrder.begin(), lockOrder.end()), lockOrder.end());
+  // A PRIMARY KEY point lookup holds the lock for microseconds: it may pass writers waiting behind
+  // long analytic queries instead of queueing with them.
+  FairSharedMutex::barge = false;
+  if (ctx.tabs.size() == 1 && ctx.tabs[0]->pk >= 0 && s.where && s.groupBy.empty() && !s.unionNext) {
+    const std::string& pkName = ctx.tabs[0]->cols[ctx.tabs[0]->pk].name;
+    std::function<bool(const ExprP&)> pkEq = [&](const ExprP& e) {
+      if (e->kind == Expr::BIN && e->op == "AND") return pkEq(e->args[0]) || pkEq(e->args[1]);
+      if (e->kind != Expr::BIN || e->op != "=") return false;
+      const ExprP& a = e->args[0];
+      const ExprP& b = e->args[1];
+      return (a->kind == Expr::COL && b->kind == Expr::LIT && strcasecmp(a->name.c_str(), pkName.c_str()) == 0) ||
+             (b->kind == Expr::COL && a->kind == Expr::LIT && strcasecmp(b->name.c_str(), pkName.c_str()) == 0);
+    };
+    FairSharedMutex::barge = pkEq(s.where);
+  }
+  std::vector<std::shared_lock<FairSharedMutex>> locks;
+  for (auto& t : lockOrder) locks.emplace_back(t->mu);
+  FairSharedMutex::barge = false;
+
+  // Expand * and bind the select list.
+  std::vector<SelectItem> items;
+  for (auto& it : s.items) {
+    if (it.e->kind == Expr::STAR) {
+      if (ctx.tabs.empty()) throw SqlError("No tables used", 1096);
+      for (size_t ti = 0; ti < ctx.tabs.size(); ++ti) {
+        if (!it.e->table.empty() && strcasecmp(it.e->table.c_str(), ctx.aliases[ti].c_str()) != 0) continue;
+        for (auto& c : ctx.tabs[ti]->cols) items.push_back({mkCol(ctx.aliases[ti], c.name), c.name});
+      }
+    } else {
+      items.push_back(it);
+    }
+  }
+  // Result column names of unaliased items, from the expressions as written (binding rewrites them).
+  std::vector<std::string> itemNames;
+  for (auto& it : items)
+    itemNames.push_back(it.e->kind == Expr::COL || (it.e->kind == Expr::LIT && !it.e->name.empty()) ? it.e->name : it.e->str());
+  auto resolveAlias = [&](ExprP e) -> ExprP {
+    if (e->kind == Expr::LIT && e->lit.kind == Value::INT) {
+      if (e->lit.i < 1 || e->lit.i > (int64_t)items.size()) throw SqlError("Unknown column '" + e->str() + "' in 'order clause'", 1054);
+      return items[e->lit.i - 1].e;
+    }
+    if (e->kind == Expr::COL && e->table.empty())
+      for (auto& it : items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), e->name.c_str()) == 0) return it.e;
+    return e;
+  };
+  std::function<void(ExprP&)> substAliases = [&](ExprP& e) {
+    if (e->kind == Expr::COL && e->table.empty()) {
+      for (auto& it : items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), e->name.c_str()) == 0) { e = it.e; return; }
+    }
+    for (auto& a : e->args) substAliases(a);
+  };
+  {
+    bool plain = s.groupBy.empty() && !s.distinct && s.orderBy.empty() && !s.having && s.limit >= 0 && s.offset + s.limit <= 100000;
+    for (auto& it : items) plain = plain && !hasAgg(it.e);
+    ctx.lazyStr = plain;
+    for (auto& it : items) bind(it.e, ctx);
+    ctx.lazyStr = false;
+  }
+  std::vector<ExprP> groupBy;
+  for (auto& g : s.groupBy) {
+    ExprP e = resolveAlias(g);
+    bind(e, ctx);
+    groupBy.push_back(e);
+  }
+  ExprP having = s.having;
+  if (having) { substAliases(having); bind(having, ctx); }
+  std::vector<OrderItem> orderBy;
+  for (auto& o : s.orderBy) {
+    OrderItem oi{resolveAlias(o.e), o.desc};
+    bind(oi.e, ctx);
+    orderBy.push_back(oi);
+  }
+  ExprP where = s.where;
+  if (where) bind(where, ctx);
+  std::vector<ExprP> conj;
+  flattenAnd(where, conj);
+  for (auto& jc : s.joinConds) {
+    bind(jc, ctx);
+    flattenAnd(jc, conj);
+  }
+  // Outer joins: which tables can come out NULL-extended; ON conditions are bound per table.
+  bool anyOuter = false;
+  for (size_t i = 0; i < s.from.size(); ++i) {
+    const int j = s.from[i].join;
+    if (j == 1) ctx.outerTabs.insert((int)i);
+    else if (j == 2) for (size_t k = 0; k < i; ++k) ctx.outerTabs.insert((int)k);
+    else if (j == 3) for (size_t k = 0; k <= i; ++k) ctx.outerTabs.insert((int)k);
+    anyOuter |= j != 0;
+    if (s.from[i].on) bind(s.from[i].on, ctx);
+  }
+  bool aggQuery = !groupBy.empty() || (having && hasAgg(having));
+  for (auto& it : items) aggQuery |= hasAgg(it.e);
+  for (auto& o : orderBy) aggQuery |= hasAgg(o.e);
+  if (s.distinct && !aggQuery) {
+    for (auto& it : items) groupBy.push_back(it.e);
+    aggQuery = true;
+  }
+  if (groupBy.size() > (size_t)kMaxKeys) throw SqlError("at most 8 GROUP BY expressions are supported", 1235);
+  // Case-insensitive collation: string group keys whose dictionary has case variants are grouped
+  // by a canonical code ('Bob' and 'bob' form one group), everywhere the key appears.
+  if (ciColl()) {
+    for (auto& g : groupBy) {
+      Dict* d = g->ty == LType::VARCHAR ? ctx.dict(*g) : nullptr;
+      if (!d) continue;
+      auto cmap = ciCanon(*d);
+      if (!cmap) continue;
+      const std::string orig = canon(g);
+      ExprP m = boundNode(Expr::FUNC, "#MAP", {g}, LType::VARCHAR);
+      m->aux = cmap;
+      ctx.exprDict[m.get()] = d;
+      std::function<void(ExprP&)> sub = [&](ExprP& e) {
+        if (!e || e == m) return;
+        if (isAgg(e)) return;
+        if (canon(e) == orig) { e = m; return; }
+        for (auto& a : e->args) sub(a);
+      };
+      for (auto& it : items) sub(it.e);
+      if (having) sub(having);
+      for (auto& o : orderBy) sub(o.e);
+      g = m;
+    }
+  }
+
+  ResultSet res;
+  res.isResult = true;
+  for (size_t ii = 0; ii < items.size(); ++ii) {
+    auto& it = items[ii];
+    // information_schema columns keep their upper-case names (MySQL 8 returns TABLE_NAME for `select table_name`)
+    const bool isCol = it.e->kind == Expr::COL && it.e->bt >= 0 && it.e->bt < (int)ctx.tabs.size();
+    const bool isI_S = isCol && ctx.tabs[it.e->bt]->name.rfind("__tmp", 0) == 0 && ctx.tabs[it.e->bt]->name.find("_is_") != std::string::npos;
+    res.jsonCols.push_back(isJsonExpr(it.e, &ctx));
+    res.names.push_back(!it.alias.empty() ? it.alias : isI_S ? ctx.tabs[it.e->bt]->cols[it.e->bc].name
+                        : ii < itemNames.size() ? itemNames[ii] : it.e->kind == Expr::COL ? it.e->name : it.e->str());
+    res.types.push_back(it.e->ty);
+  }
+  if (tDescribeOnly) return res;  // COM_STMT_PREPARE: the result columns only
+  auto finish = [&](std::vector<std::vector<Value>>& rows, std::vector<std::vector<Value>>& sortKeys) {
+    if (!orderBy.empty()) {
+      std::vector<size_t> perm(rows.size());
+      for (size_t i = 0; i < perm.size(); ++i) perm[i] = i;
+      std::stable_sort(perm.begin(), perm.end(), [&](size_t a, size_t b) {
+        for (size_t k = 0; k < orderBy.size(); ++k) {
+          int c = cmpVal(sortKeys[a][k], sortKeys[b][k]);
+          if (c) return orderBy[k].desc ? c > 0 : c < 0;
+        }
+        return false;
+      });
+      std::vector<std::vector<Value>> sorted;
+      sorted.reserve(rows.size());
+      for (size_t i : perm) sorted.push_back(std::move(rows[i]));
+      rows.swap(sorted);
+    }
+    int64_t start = std::min<int64_t>(s.offset, (int64_t)rows.size());
+    int64_t end = s.limit < 0 ? (int64_t)rows.size() : std::min<int64_t>((int64_t)rows.size(), start + s.limit);
+    for (int64_t i = start; i < end; ++i) {
+      if (tWantVals) {
+        res.vals.push_back(std::move(rows[i]));
+        continue;
+      }
+      std::vector<std::string> out;
+      for (auto& v : rows[i]) out.push_back(cell(v));
+      res.rows.push_back(std::move(out));
+    }
+    res.typed = tWantVals;
+  };
+  auto explainResult = [&]() {
+    ResultSet r;
+    r.isResult = true;
+    r.names = {"plan"};
+    r.types = {LType::VARCHAR};
+    for (auto& n : notes) r.rows.push_back({n});
+    return r;
+  };
+
+  // ---- No FROM: constant expressions.
+  if (ctx.tabs.empty()) {
+    PostCtx pc;
+    std::vector<std::vector<Value>> rows(1), keys(1);
+    for (auto& it : items) rows[0].push_back(evalPost(it.e, pc));
+    finish(rows, keys);
+    return res;
+  }
+
+  // ---- Route 1: primary-key point lookup on the CPU (no GPU launch, microseconds).
+  int64_t pkKey;
+  if (ctx.tabs.size() == 1 && !aggQuery && !foreignPending(*ctx.tabs[0]) && findPkEq(conj, *ctx.tabs[0], 0, pkKey)) {
+    Table& t = *ctx.tabs[0];
+    notes.push_back("CPU point lookup via PRIMARY KEY hash index on " + t.name + "." + t.cols[t.pk].name + " = " +
+                    std::to_string(pkKey));
+    if (explain) return explainResult();
+    std::vector<std::vector<Value>> rows, keys;
+    auto f = t.pkIndex.find(pkKey);
+    if (f != t.pkIndex.end()) {
+      Loc l = f->second;
+      std::vector<Value> vals;
+      for (size_t c = 0; c < t.cols.size(); ++c) vals.push_back(cellValue(t, l, (int)c));
+      PostCtx pc;
+      pc.row = &vals;
+      pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+      if (!where || isTrue(evalPost(where, pc))) {
+        std::vector<Value> row;
+        for (auto& it : items) row.push_back(evalPost(it.e, pc));
+        rows.push_back(row);
+        keys.push_back({});
+      }
+    }
+    finish(rows, keys);
+    res.info = "cpu-point-lookup";
+    return res;
+  }
+
+  // ---- Route 1b: equality on a secondary index (CPU hash lookup, no GPU scan).
+  int64_t ixKey;
+  bool ixFound = false;
+  const IndexMeta* ixm = nullptr;
+  if (ctx.tabs.size() == 1 && !aggQuery && !anyOuter && !foreignPending(*ctx.tabs[0]) &&
+      (ixm = findIndexEq(conj, *ctx.tabs[0], 0, ixKey, ixFound))) {
+    Table& t = *ctx.tabs[0];
+    notes.push_back("CPU lookup via secondary index " + ixm->name + " on " + t.name + "." + t.cols[ixm->cols[0]].name);
+    if (explain) return explainResult();
+    ProfStage pl("index lookup");
+    std::vector<std::vector<Value>> rows, keys;
+    auto it = ixFound ? ixm->map.find(ixKey) : ixm->map.end();
+    if (it != ixm->map.end()) {
+      for (const Loc& l : it->second) {
+        std::vector<Value> vals;
+        for (size_t c = 0; c < t.cols.size(); ++c) vals.push_back(cellValue(t, l, (int)c));
+        PostCtx pc;
+        pc.row = &vals;
+        pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+        if (where && !isTrue(evalPost(where, pc))) continue;
+        std::vector<Value> row, key;
+        for (auto& itm : items) row.push_back(evalPost(itm.e, pc));
+        for (auto& o : orderBy) key.push_back(evalPost(o.e, pc));
+        rows.push_back(std::move(row));
+        keys.push_back(std::move(key));
+      }
+    }
+    finish(rows, keys);
+    pl.done((int64_t)res.rows.size() + (int64_t)res.vals.size(), ixm->name);
+    res.info = "cpu-index-lookup";
+    return res;
+  }
+
+  // ---- Route 1c: ORDER BY v <*> q DESC / v <-> q LIMIT k on a VECTOR INDEX: probe the nprobe
+  // nearest IVF lists on the CPU, score only their vectors, then evaluate the select list for the best.
+  if (ctx.tabs.size() == 1 && !aggQuery && !anyOuter && orderBy.size() == 1 && s.limit >= 0 && s.limit <= 100000 &&
+      orderBy[0].e->kind == Expr::FUNC && (orderBy[0].e->op == "#VDOT" || orderBy[0].e->op == "#VEUC") &&
+      orderBy[0].e->args[0]->kind == Expr::COL && (orderBy[0].e->op == "#VDOT") == orderBy[0].desc && tAnn &&
+      !foreignPending(*ctx.tabs[0])) {
+    Table& t = *ctx.tabs[0];
+    const ExprP& oe = orderBy[0].e;
+    const IndexMeta* vix = nullptr;
+    for (auto& ix : t.indexes)
+      if (ix.vec && ix.nlist > 0 && ix.cols[0] == oe->args[0]->bc) vix = &ix;
+    if (vix) {
+      const bool dot = oe->op == "#VDOT";
+      const int d = vix->dim;
+      const std::vector<double>& q = *oe->aux;
+      if ((int)q.size() == d) {
+        int nprobe = tNprobe > 0 ? tNprobe : vix->nprobe > 0 ? vix->nprobe : std::max(8, vix->nlist / 32);
+        nprobe = std::min(nprobe, vix->nlist);
+        notes.push_back("ANN via VECTOR INDEX " + vix->name + " (IVF, " + std::to_string(vix->nlist) + " lists, nprobe " +
+                        std::to_string(nprobe) + ") on " + t.name + "." + t.cols[vix->cols[0]].name);
+        if (explain) return explainResult();
+        ProfStage pl("vector index");
+        auto score = [&](const float* v) {
+          double acc = 0;
+          for (int i = 0; i < d; ++i) acc += dot ? v[i] * q[i] : (v[i] - q[i]) * (v[i] - q[i]);
+          return dot ? -acc : acc;  // lower is better
+        };
+        std::vector<std::pair<double, int>> cs(vix->nlist);
+        for (int c = 0; c < vix->nlist; ++c) cs[c] = {score(vix->cent.data() + (size_t)c * d), c};
+        std::partial_sort(cs.begin(), cs.begin() + nprobe, cs.end());
+        std::vector<std::pair<double, Loc>> cand;
+        for (int i = 0; i < nprobe; ++i) {
+          auto it = vix->map.find(cs[i].second);
+          if (it == vix->map.end()) continue;
+          for (const Loc& l : it->second)
+            cand.push_back({score((const float*)t.colData(l, vix->cols[0]).data() + (size_t)l.row * d), l});
+        }
+        // Rows not yet assigned to the trained lists (key 0 before training) are covered by the lists.
+        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        std::vector<std::vector<Value>> rows, keys;
+        const size_t want = (size_t)(s.limit + s.offset);
+        for (auto& [sc, l] : cand) {
+          if (rows.size() >= want) break;
+          std::vector<Value> vals;
+          for (size_t c = 0; c < t.cols.size(); ++c) vals.push_back(cellValue(t, l, (int)c));
+          PostCtx pc;
+          pc.row = &vals;
+          pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+          if (where && !isTrue(evalPost(where, pc))) continue;
+          std::vector<Value> row;
+          for (auto& itm : items) row.push_back(evalPost(itm.e, pc));
+          rows.push_back(std::move(row));
+          keys.push_back({Value::D(dot ? -sc : std::sqrt(sc))});
+        }
+        finish(rows, keys);
+        pl.done((int64_t)cand.size(), vix->name);
+        res.info = "ann-ivf";
+        return res;
+      }
+    }
+  }
+
+  // ---- Split predicates: per-table pushdown, equi-join edges, residual.
+  std::vector<std::vector<ExprP>> pushdown(ctx.tabs.size());
+  struct Edge { int at, ac, bt, bc; ExprP e; };
+  std::vector<Edge> edges;
+  std::vector<ExprP> residual;
+  for (auto& p : conj) {
+    std::set<int> ts;
+    tablesOf(p, ts);
+    bool touchesOuter = false;
+    for (int t : ts) touchesOuter |= ctx.outerTabs.count(t) > 0;
+    if (touchesOuter) {  // WHERE on a NULL-extended table filters after the outer join
+      residual.push_back(p);
+    } else if (ts.size() <= 1) {
+      pushdown[ts.empty() ? 0 : *ts.begin()].push_back(p);
+    } else if (ts.size() == 2 && p->kind == Expr::BIN && p->op == "=" && p->args[0]->kind == Expr::COL &&
+               p->args[1]->kind == Expr::COL &&
+               (p->args[0]->ty != LType::VARCHAR || (p->args[1]->ty == LType::VARCHAR && ctx.dict(*p->args[0]) && ctx.dict(*p->args[1])))) {
+      edges.push_back({p->args[0]->bt, p->args[0]->bc, p->args[1]->bt, p->args[1]->bc, p});
+    } else {
+      residual.push_back(p);
+    }
+  }
+
+  // Aggregate slots: slot 0 is a hidden COUNT(*) used for COUNT/AVG and empty-group detection.
+  std::map<std::string, AggRef> aggs;
+  AggPlan plan;
+  std::vector<ExprP> aggArgs;  // per slot (null for COUNT)
+  plan.naggs = 1;
+  plan.ops[0] = AGG_COUNT;
+  aggArgs.push_back(nullptr);
+  std::map<std::string, int> slotByCanon;
+  // Slot counting the non-NULL rows of an aggregate argument (0 = COUNT(*) when it can't be NULL).
+  auto countSlot = [&](const ExprP& x) -> int {
+    if (x->kind == Expr::STAR || !nullable(x, ctx)) return 0;
+    std::string sk = "cnt" + canon(x);
+    auto it = slotByCanon.find(sk);
+    if (it != slotByCanon.end()) return it->second;
+    if (plan.naggs >= kMaxAggs) throw SqlError("too many aggregates", 1105);
+    plan.ops[plan.naggs] = AGG_SUM;
+    aggArgs.push_back(boundNode(Expr::FUNC, "ISNOTNULL", {x}, LType::INT));
+    slotByCanon.emplace(sk, plan.naggs);
+    return plan.naggs++;
+  };
+  ExprP distX;  // COUNT(DISTINCT x): computed by the two-phase GPU path below
+  bool anyDistinct = false;  // (grouped by x in its first phase, so BIGINT sums split as with GROUP BY)
+  std::function<void(const ExprP&)> findDistinct = [&](const ExprP& e) {
+    if (!e) return;
+    if (isAgg(e) && e->distinct) anyDistinct = true;
+    for (auto& a : e->args) findDistinct(a);
+  };
+  for (auto& it : items) findDistinct(it.e);
+  findDistinct(having);
+  for (auto& o : orderBy) findDistinct(o.e);
+  std::function<void(const ExprP&)> collectAggs = [&](const ExprP& e) {
+    if (isAgg(e)) {
+      if (e->distinct) {
+        if (distX && canon(distX) != canon(e->args[0])) throw SqlError("internal: several DISTINCT arguments", 1105);
+        distX = e->args[0];
+      }
+      std::string k = canon(e);
+      if (aggs.count(k)) return;
+      AggRef r;
+      r.distinct = e->distinct;
+      r.fn = e->op;
+      r.argTy = e->args[0]->ty;
+      r.dict = ctx.dict(*e);
+      if (auto u = ctx.unrank.find(e.get()); u != ctx.unrank.end()) r.unrank = u->second;
+      if (r.dict) r.argTy = LType::VARCHAR;
+      r.scale = e->scale;
+      r.cntSlot = countSlot(e->args[0]);
+      if (r.fn == "COUNT") r.slot = r.cntSlot;
+      if (r.fn != "COUNT") {
+        uint8_t op = r.fn == "MIN" ? AGG_MIN : r.fn == "MAX" ? AGG_MAX : AGG_SUM;
+        const ExprP& arg = e->args[0];
+        const bool rawDec = op == AGG_SUM && arg->kind == Expr::COL && arg->ty == LType::DECIMAL;
+        if (rawDec) r.decScale = arg->scale;
+        std::string sk = std::to_string(op) + (rawDec ? "raw" : "") + canon(e->args[0]);
+        auto it = slotByCanon.find(sk);
+        if (it == slotByCanon.end()) {
+          if (plan.naggs >= kMaxAggs) throw SqlError("too many aggregates", 1105);
+          plan.ops[plan.naggs] = op;
+          aggArgs.push_back(rawDec ? boundNode(Expr::FUNC, "#RAW", {arg}, LType::BIGINT) : e->args[0]);
+          it = slotByCanon.emplace(sk, plan.naggs++).first;
+          // Grouped SUM of a 64-bit integer column: exact as two int64 sums of its 32-bit halves.
+          if (op == AGG_SUM && (!groupBy.empty() || anyDistinct) && arg->kind == Expr::COL && (arg->ty == LType::BIGINT || arg->ty == LType::DATETIME)) {
+            if (plan.naggs >= kMaxAggs) throw SqlError("too many aggregates", 1105);
+            plan.ops[plan.naggs] = AGG_SUM;
+            plan.aggPart[it->second] = 1;
+            plan.aggPart[plan.naggs] = 2;
+            aggArgs.push_back(arg);
+            slotByCanon.emplace(sk + "#hi", plan.naggs++);
+          }
+        }
+        r.slot = it->second;
+        if (auto h = slotByCanon.find(sk + "#hi"); h != slotByCanon.end()) r.hiSlot = h->second;
+      }
+      aggs[k] = r;
+      return;
+    }
+    for (auto& a : e->args) collectAggs(a);
+  };
+
+  // Columns needed per table (for materialization paths).
+  std::set<std::pair<int, int>> needed;
+  for (auto& it : items) colsOf(it.e, needed);
+  for (auto& g : groupBy) colsOf(g, needed);
+  for (auto& o : orderBy) colsOf(o.e, needed);
+  if (having) colsOf(having, needed);
+  for (auto& r : residual) colsOf(r, needed);
+  for (auto& e : edges) colsOf(e.e, needed);
+  for (auto& f : s.from)
+    if (f.on) colsOf(f.on, needed);
+  auto needOf = [&](int bt) {
+    std::set<int> c;
+    for (auto& [t, col] : needed)
+      if (t == bt) c.insert(col);
+    if (c.empty()) c.insert(0);
+    return c;
+  };
+
+  // Build the joined relation (multi-table). Small tables are filtered up front. Big ones are
+  // scanned only when the join order reaches them, with join filters: exact bitmaps of the join
+  // keys already in the joined relation, applied inside the big table's scan (sideways
+  // information passing), so rows that cannot match are never gathered or joined.
+  // With outer joins the tables are joined in FROM order (join order matters for their semantics).
+  // Equality between expressions of the two sides (a.x = b.y + 1, a.d = DATE(b.ts), ..): both key
+  // expressions evaluated on the GPU into temporary key columns, then a hash join on them.
+  auto exprEquiCond = [&](const std::set<int>& lt, const std::set<int>& rt, const std::vector<ExprP>& conds, ExprP& le, ExprP& re) {
+    for (auto& c : conds) {
+      if (c->kind != Expr::BIN || c->op != "=" || hasAgg(c)) continue;
+      std::set<int> t0, t1;
+      tablesOf(c->args[0], t0);
+      tablesOf(c->args[1], t1);
+      if (t0.empty() || t1.empty()) continue;
+      auto within = [](const std::set<int>& a, const std::set<int>& b) { return std::includes(b.begin(), b.end(), a.begin(), a.end()); };
+      if (c->args[0]->ty == LType::VARCHAR || c->args[1]->ty == LType::VARCHAR) continue;
+      if (within(t0, lt) && within(t1, rt)) { le = c->args[0], re = c->args[1]; return true; }
+      if (within(t1, lt) && within(t0, rt)) { le = c->args[1], re = c->args[0]; return true; }
+    }
+    return false;
+  };
+  auto addKeyCol = [&](Rel& r, const ExprP& e, int tag, bool integral) {
+    Compiler comp(&ctx);
+    Prog pr = comp.compile(e);
+    comp.uploadSets();
+    bindRelCols(comp, r);
+    DevVec<double> v(std::max<int64_t>(r.n, 1));
+    gpuEvalAt(comp.env, pr, nullptr, r.n, v.p);
+    std::vector<double> h = v.download(r.n);
+    std::vector<int64_t> k(r.n);
+    for (int64_t i = 0; i < r.n; ++i) {
+      double d = h[i];
+      if (d != d) { k[i] = kNullI64; continue; }
+      if (integral) { k[i] = std::llround(d); continue; }
+      if (d == 0) d = 0;  // -0.0 = 0.0
+      memcpy(&k[i], &d, 8);
+    }
+    RelCol c{tag, 0, PType::I64, DevVec<uint8_t>(std::max<int64_t>(r.n, 1) * 8), 8};
+    if (r.n) h2d(c.data.p, k.data(), r.n * 8);
+    r.cols.push_back(std::move(c));
+  };
+  auto exprEquiJoin = [&](Rel& left, Rel& right, const std::vector<ExprP>& conds, Rel& out) {
+    ExprP le, re;
+    if (!exprEquiCond(left.tabs, right.tabs, conds, le, re)) return false;
+    const int kA = -2000, kB = -2001;
+    auto intTy = [](LType t) { return t == LType::INT || t == LType::BIGINT || t == LType::DATE || t == LType::DATETIME; };
+    const bool integral = intTy(le->ty) && intTy(re->ty);  // else both as float64 bit patterns
+    addKeyCol(left, le, kA, integral);
+    addKeyCol(right, re, kB, integral);
+    out = hashJoin(left, right, kA, 0, kB, 0, notes);
+    for (auto* r : {&out, &left, &right})
+      r->cols.erase(std::remove_if(r->cols.begin(), r->cols.end(), [&](const RelCol& c) { return c.bt == kA || c.bt == kB; }), r->cols.end());
+    notes.push_back("    (hash join on expression keys: " + le->str() + " = " + re->str() + ")");
+    return true;
+  };
+
+  // Joins tables [from, end) onto cur in FROM order (outer joins: the order matters).
+  auto buildOrdered = [&](Rel cur, size_t from, std::vector<bool> edgeUsed) -> Rel {
+    for (size_t i = from; i < ctx.tabs.size(); ++i) {
+      const TableRef& ref = s.from[i];
+      if (ref.join == 0) {
+        Rel ri = materialize(ctx, (int)i, pushdown[i], needOf((int)i), -1, notes);
+        int ei = -1;
+        for (size_t k = 0; k < edges.size() && ei < 0; ++k) {
+          auto& e = edges[k];
+          if (!edgeUsed[k] && ((cur.tabs.count(e.at) && e.bt == (int)i) || (cur.tabs.count(e.bt) && e.at == (int)i))) ei = (int)k;
+        }
+        if (ei < 0) {
+          Rel j;
+          if (exprEquiJoin(cur, ri, residual, j)) cur = std::move(j);
+          else cur = crossJoin(cur, ri, notes);
+        } else {
+          edgeUsed[ei] = true;
+          auto& e = edges[ei];
+          const Dict* da = ctx.tabs[e.at]->cols[e.ac].lt == LType::VARCHAR ? ctx.tabs[e.at]->dicts[e.ac].get() : nullptr;
+          const Dict* db = ctx.tabs[e.bt]->cols[e.bc].lt == LType::VARCHAR ? ctx.tabs[e.bt]->dicts[e.bc].get() : nullptr;
+          cur = cur.tabs.count(e.at) ? hashJoin(cur, ri, e.at, e.ac, e.bt, e.bc, notes, da, db) : hashJoin(cur, ri, e.bt, e.bc, e.at, e.ac, notes, db, da);
+        }
+        continue;
+      }
+      std::vector<ExprP> on, rightOnly, other;
+      flattenAnd(ref.on, on);
+      int ct = -1, cc = -1, rc = -1;
+      for (auto& c : on) {
+        std::set<int> ts;
+        tablesOf(c, ts);
+        if (ct < 0 && c->kind == Expr::BIN && c->op == "=" && c->args[0]->kind == Expr::COL && c->args[1]->kind == Expr::COL &&
+            (c->args[0]->ty == LType::VARCHAR) == (c->args[1]->ty == LType::VARCHAR) &&
+            c->args[0]->ty != LType::DOUBLE && c->args[1]->ty != LType::DOUBLE) {  // (DOUBLE keys: the general path)
+          const ExprP &a = c->args[0], &b = c->args[1];
+          if (cur.tabs.count(a->bt) && b->bt == (int)i) { ct = a->bt; cc = a->bc; rc = b->bc; continue; }
+          if (cur.tabs.count(b->bt) && a->bt == (int)i) { ct = b->bt; cc = b->bc; rc = a->bc; continue; }
+        }
+        if (ts.size() == 1 && *ts.begin() == (int)i) rightOnly.push_back(c);
+        else other.push_back(c);
+      }
+      if (ct < 0 || !other.empty() || (ref.join != 1 && !rightOnly.empty())) {
+        // General ON (no equality, or conditions beyond one equality plus right-side filters): inner
+        // join on the equality (else cross join), the rest of ON as a GPU filter over the pairs, then
+        // the preserved side's unmatched rows NULL-extended.
+        std::vector<ExprP> rest = other;
+        rest.insert(rest.end(), rightOnly.begin(), rightOnly.end());
+        Rel ri = materialize(ctx, (int)i, {}, needOf((int)i), -1, notes);
+        const int kIdA = -1000, kIdB = -1001;
+        auto addId = [](Rel& r, int tag) {
+          std::vector<int32_t> seq((size_t)r.n);
+          for (int64_t k = 0; k < r.n; ++k) seq[k] = (int32_t)k;
+          RelCol c{tag, 0, PType::I32, DevVec<uint8_t>(std::max<int64_t>(r.n, 1) * 4), 4};
+          if (r.n) h2d(c.data.p, seq.data(), r.n * 4);
+          r.cols.push_back(std::move(c));
+        };
+        addId(cur, kIdA);
+        addId(ri, kIdB);
+        Rel inner;
+        if (ct >= 0) {
+          const Dict* dl = ctx.tabs[ct]->cols[cc].lt == LType::VARCHAR ? ctx.tabs[ct]->dicts[cc].get() : nullptr;
+          const Dict* dr = ctx.tabs[i]->cols[rc].lt == LType::VARCHAR ? ctx.tabs[i]->dicts[rc].get() : nullptr;
+          inner = hashJoin(cur, ri, ct, cc, (int)i, rc, notes, dl, dr);
+        } else if (exprEquiJoin(cur, ri, rest, inner)) {
+        } else {
+          if ((double)cur.n * (double)ri.n > 4e8)
+            throw SqlError("outer join without an equality would compare " + std::to_string(cur.n) + " x " + std::to_string(ri.n) + " rows; add an equality to ON", 1235);
+          inner = crossJoin(cur, ri, notes);
+        }
+        std::vector<int32_t> pa, pb;  // matching (left row, right row) pairs
+        {
+          DevVec<int32_t> sel;
+          int64_t m = inner.n;
+          if (!rest.empty() && inner.n > 0) {
+            Compiler comp(&ctx);
+            Prog fp = comp.compile(andAll(rest));
+            comp.uploadSets();
+            bindRelCols(comp, inner);
+            sel = DevVec<int32_t>(inner.n);
+            m = gpuSelect(comp.env, true, fp, inner.n, nullptr, sel.p);
+          }
+          const std::pair<int, std::vector<int32_t>*> idCols[] = {{kIdA, &pa}, {kIdB, &pb}};
+          for (auto [tag, out] : idCols) {
+            const RelCol& c = inner.cols[inner.find(tag, 0)];
+            if (sel.p) {
+              DevVec<int32_t> g(std::max<int64_t>(m, 1));
+              gpuGather(c.data.p, PType::I32, sel.p, m, g.p);
+              *out = g.download(m);
+            } else {
+              out->resize(m);
+              if (m) d2h(out->data(), c.data.p, m * 4);
+            }
+          }
+        }
+        std::vector<uint8_t> hitA(cur.n, 0), hitB(ri.n, 0);
+        for (size_t k = 0; k < pa.size(); ++k) hitA[pa[k]] = hitB[pb[k]] = 1;
+        std::vector<int32_t> fa = pa, fb = pb;
+        if (ref.join == 1 || ref.join == 3)
+          for (int64_t k = 0; k < cur.n; ++k)
+            if (!hitA[k]) fa.push_back((int32_t)k), fb.push_back(-1);
+        if (ref.join == 2 || ref.join == 3)
+          for (int64_t k = 0; k < ri.n; ++k)
+            if (!hitB[k]) fa.push_back(-1), fb.push_back((int32_t)k);
+        const int64_t m = (int64_t)fa.size();
+        DevVec<int32_t> da(std::max<int64_t>(m, 1)), db(std::max<int64_t>(m, 1));
+        if (m) h2d(da.p, fa.data(), m * 4), h2d(db.p, fb.data(), m * 4);
+        Rel out;
+        out.n = m;
+        out.tabs = cur.tabs;
+        out.tabs.insert(ri.tabs.begin(), ri.tabs.end());
+        for (auto* side : {&cur, &ri})
+          for (auto& c : side->cols) {
+            if (c.bt <= kIdA) continue;
+            RelCol rc2{c.bt, c.bc, c.pt, DevVec<uint8_t>(std::max<int64_t>(m, 1) * c.esize), c.esize};
+            gatherCol(c.data.p, c.pt, c.esize, side == &cur ? da.p : db.p, m, rc2.data.p, true);
+            out.cols.push_back(std::move(rc2));
+          }
+        static const char* kind[] = {"", "LEFT", "RIGHT", "FULL"};
+        notes.push_back(std::string("  GPU ") + kind[ref.join] + " OUTER join on a general ON condition: " + std::to_string(pa.size()) +
+                        " matching pairs -> " + std::to_string(m) + " rows");
+        cur = std::move(out);
+        continue;
+      }
+      Rel ri = materialize(ctx, (int)i, ref.join == 1 ? rightOnly : std::vector<ExprP>{}, needOf((int)i), -1, notes);
+      const Dict* dl = ctx.tabs[ct]->cols[cc].lt == LType::VARCHAR ? ctx.tabs[ct]->dicts[cc].get() : nullptr;
+      const Dict* dr = ctx.tabs[i]->cols[rc].lt == LType::VARCHAR ? ctx.tabs[i]->dicts[rc].get() : nullptr;
+      cur = outerJoin(cur, ri, ct, cc, (int)i, rc, ref.join, notes, dl, dr);
+    }
+    for (size_t k = 0; k < edges.size(); ++k)
+      if (!edgeUsed[k]) residual.push_back(edges[k].e);
+    return cur;
+  };
+
+  auto buildJoin = [&]() -> Rel {
+    // With outer joins only at the end of FROM (e.g. decorrelated subqueries), the inner-join prefix
+    // is ordered by cost and the outer joins follow in order; other outer joins: FROM order.
+    size_t prefixN = ctx.tabs.size();
+    if (anyOuter) {
+      size_t k = 0;
+      while (k < s.from.size() && s.from[k].join == 0) ++k;
+      bool trailing = k >= 2;
+      for (size_t i = k; i < s.from.size(); ++i) trailing = trailing && s.from[i].join != 0;
+      if (!trailing) return buildOrdered(materialize(ctx, 0, pushdown[0], needOf(0), -1, notes), 1, std::vector<bool>(edges.size(), false));
+      prefixN = k;
+    }
+    const size_t nt = ctx.tabs.size();
+    std::vector<Rel> rels(nt);
+    std::vector<bool> mat(nt, false);
+    for (size_t i = 0; i < prefixN; ++i)
+      if (!tJoinFilters || ctx.tabs[i]->liveRows() < tLazyRows) {
+        rels[i] = materialize(ctx, (int)i, pushdown[i], needOf((int)i), -1, notes);
+        mat[i] = true;
+      }
+    if (std::find(mat.begin(), mat.end(), true) == mat.end()) {
+      size_t sm = 0;
+      for (size_t i = 1; i < prefixN; ++i)
+        if (ctx.tabs[i]->liveRows() < ctx.tabs[sm]->liveRows()) sm = i;
+      rels[sm] = materialize(ctx, (int)sm, pushdown[sm], needOf((int)sm), -1, notes);
+      mat[sm] = true;
+    }
+    auto est = [&](size_t i) { return mat[i] ? (double)rels[i].n : (double)ctx.tabs[i]->liveRows(); };
+    // Greedy left-deep join order. Start from the smallest relation; at each step pick the edge
+    // with the smallest estimated output, using PRIMARY KEY uniqueness to recognise FK->PK joins
+    // (which never grow the input). Build side is always the smaller input.
+    std::vector<bool> used(nt, false);
+    for (size_t i = prefixN; i < nt; ++i) used[i] = true;  // (joined afterwards, in order)
+    size_t start = nt;
+    for (size_t i = 0; i < nt; ++i)
+      if (mat[i] && (start == nt || rels[i].n < rels[start].n)) start = i;
+    Rel cur = std::move(rels[start]);
+    used[start] = true;
+    std::set<std::pair<int, int>> uniq;  // columns known to be unique in `cur`
+    if (ctx.tabs[start]->pk >= 0) uniq.insert({(int)start, ctx.tabs[start]->pk});
+    std::vector<bool> edgeUsed(edges.size(), false);
+    for (size_t step = 1; step < prefixN; ++step) {
+      int best = -1, bestEdge = -1;
+      double bestEst = 0;
+      for (size_t ei = 0; ei < edges.size(); ++ei) {
+        auto& e = edges[ei];
+        int other = cur.tabs.count(e.at) && !cur.tabs.count(e.bt) ? e.bt : cur.tabs.count(e.bt) && !cur.tabs.count(e.at) ? e.at : -1;
+        if (other < 0 || used[other]) continue;
+        bool aIsCur = other == e.bt;
+        std::pair<int, int> curCol = aIsCur ? std::make_pair(e.at, e.ac) : std::make_pair(e.bt, e.bc);
+        int otherCol = aIsCur ? e.bc : e.ac;
+        // Without key information: rows x rows / the larger number of distinct join values (from
+        // dictionary sizes / value ranges; a many-to-many join on a low-cardinality column is huge).
+        auto ndv = [&](int bt, int bc, double rows) {
+          int64_t lo, hi;
+          double n = colRange(*ctx.tabs[bt], bc, lo, hi) ? (double)(hi - lo + 1) : rows;
+          return std::max(1.0, std::min(n, rows));
+        };
+        const double nd = std::max(ndv(curCol.first, curCol.second, (double)cur.n), ndv(other, otherCol, (double)ctx.tabs[other]->liveRows()));
+        double est1 = otherCol == ctx.tabs[other]->pk ? (double)cur.n
+                    : uniq.count(curCol) ? est(other) : (double)cur.n * est(other) / nd;
+        if (best < 0 || est1 < bestEst || (est1 == bestEst && est(other) < est(best)))
+          best = other, bestEdge = (int)ei, bestEst = est1;
+      }
+      if (best < 0) {  // no column equality to any remaining table: an expression equality, else a cross join
+        ExprP le, re;
+        for (size_t i = 0; i < nt && best < 0; ++i)
+          if (!used[i] && exprEquiCond(cur.tabs, std::set<int>{(int)i}, residual, le, re)) best = (int)i;
+        if (best < 0)
+          for (size_t i = 0; i < nt; ++i)
+            if (!used[i] && (best < 0 || est(i) < est(best))) best = (int)i;
+        if (!mat[best]) {
+          rels[best] = materialize(ctx, best, pushdown[best], needOf(best), -1, notes);
+          mat[best] = true;
+        }
+        Rel j;
+        if (exprEquiJoin(cur, rels[best], residual, j)) cur = std::move(j);
+        else cur = crossJoin(cur, rels[best], notes);
+        used[best] = true;
+        rels[best] = Rel();
+        uniq.clear();
+        continue;
+      }
+      if (!mat[best]) {
+        std::vector<JoinFilter> jfs;
+        std::vector<DevVec<uint32_t>> bitmaps;
+        bitmaps.reserve(edges.size());
+        for (auto& e : edges) {
+          const bool aCur = cur.tabs.count(e.at) && e.bt == best, bCur = cur.tabs.count(e.bt) && e.at == best;
+          if (!aCur && !bCur) continue;
+          const int ct = aCur ? e.at : e.bt, cc = aCur ? e.ac : e.bc, oc = aCur ? e.bc : e.ac;
+          // Only worth it when the keys feeding the filter were already reduced (by filters or
+          // joins) to under half of their table; a filter built from every key removes nothing.
+          if ((double)cur.n > 0.5 * (double)ctx.tabs[ct]->liveRows()) continue;
+          const int ri = cur.find(ct, cc);
+          int64_t lo, hi;
+          if (ri < 0 || cur.cols[ri].pt == PType::F64 || ctx.tabs[best]->cols[oc].pt == PType::F64 ||
+              ctx.tabs[ct]->cols[cc].lt == LType::VARCHAR ||  // dictionary codes differ per table
+              !colRange(*ctx.tabs[ct], cc, lo, hi) || hi - lo + 1 > (int64_t)1 << 30)
+            continue;
+          const int64_t nbits = hi - lo + 1;
+          bitmaps.emplace_back((nbits + 31) / 32);
+          gpuKeyBitmap(viewOf(cur.cols[ri].data.p, cur.cols[ri].pt), cur.n, lo, nbits, bitmaps.back().p);
+          jfs.push_back({oc, lo, nbits, bitmaps.back().p,
+                         ctx.tabs[best]->cols[oc].name + " IN (" + std::to_string(cur.n) + " keys of " +
+                             ctx.tabs[ct]->cols[cc].name + ", " + std::to_string((nbits + 7) / 8 / 1024) + " KiB bitmap)"});
+        }
+        rels[best] = materialize(ctx, best, pushdown[best], needOf(best), -1, notes, jfs);
+        mat[best] = true;
+      }
+      auto& e = edges[bestEdge];
+      edgeUsed[bestEdge] = true;
+      bool curHasA = cur.tabs.count(e.at) > 0;
+      {
+        std::pair<int, int> curCol = curHasA ? std::make_pair(e.at, e.ac) : std::make_pair(e.bt, e.bc);
+        int otherCol = curHasA ? e.bc : e.ac;
+        bool newUnique = otherCol == ctx.tabs[best]->pk, curUnique = uniq.count(curCol) > 0;
+        std::set<std::pair<int, int>> nu;
+        if (newUnique) nu = uniq;
+        if (curUnique && ctx.tabs[best]->pk >= 0) nu.insert({best, ctx.tabs[best]->pk});
+        uniq.swap(nu);
+      }
+      const Dict* da = ctx.tabs[e.at]->cols[e.ac].lt == LType::VARCHAR ? ctx.tabs[e.at]->dicts[e.ac].get() : nullptr;
+      const Dict* db = ctx.tabs[e.bt]->cols[e.bc].lt == LType::VARCHAR ? ctx.tabs[e.bt]->dicts[e.bc].get() : nullptr;
+      cur = curHasA ? hashJoin(cur, rels[best], e.at, e.ac, e.bt, e.bc, notes, da, db)
+                    : hashJoin(cur, rels[best], e.bt, e.bc, e.at, e.ac, notes, db, da);
+      used[best] = true;
+      rels[best] = Rel();
+    }
+    if (prefixN < nt) return buildOrdered(std::move(cur), prefixN, edgeUsed);
+    for (size_t ei = 0; ei < edges.size(); ++ei)
+      if (!edgeUsed[ei]) residual.push_back(edges[ei].e);
+    return cur;
+  };
+
+  // ================= Aggregation queries
+  if (aggQuery) {
+    for (auto& it : items) collectAggs(it.e);
+    if (having) collectAggs(having);
+    for (auto& o : orderBy) collectAggs(o.e);
+    for (auto& g : groupBy)
+      if (hasAgg(g)) throw SqlError("Can't group on aggregate", 1056);
+    plan.nkeys = (int)groupBy.size();
+    for (auto& g : groupBy)
+      if (g->ty == LType::VARCHAR && !ctx.dict(*g))
+        throw SqlError("GROUP BY on this string expression is not supported (it combines several columns)", 1235);
+    if (distX) {  // only COUNT(DISTINCT x) aggregates: each is the count of distinct x per group (slot 0)
+      if (distX->ty == LType::VARCHAR && !ctx.dict(*distX))
+        throw SqlError("GROUP BY on this string expression is not supported (it combines several columns)", 1235);
+      if (ctx.tabs.size() != 1) throw SqlError("internal: COUNT(DISTINCT) GPU path needs one table", 1105);
+      if (ciColl() && distX->ty == LType::VARCHAR) {  // case variants are one value
+        Dict* d = ctx.dict(*distX);
+        if (auto cmap = d ? ciCanon(*d) : nullptr) {
+          ExprP m = boundNode(Expr::FUNC, "#MAP", {distX}, LType::VARCHAR);
+          m->aux = cmap;
+          ctx.exprDict[m.get()] = d;
+          distX = m;
+        }
+      }
+      // COUNT(DISTINCT x) reads the extra slot phase 2 adds after the ordinary aggregates.
+      for (auto& [k, r] : aggs)
+        if (r.distinct) {
+          r.fn = "COUNT";
+          r.slot = plan.naggs;
+          r.cntSlot = 0;
+        }
+    }
+
+    bool single = ctx.tabs.size() == 1;
+    Rel joined;
+    if (!single) {
+      notes.push_back("GPU join pipeline (EXPLAIN runs the joins to report the actual strategy):");
+      joined = buildJoin();
+      if (explain) return explainResult();
+    }
+    ExprP filter = single ? where : andAll(residual);
+    Compiler comp(&ctx);
+    plan.hasWhere = (bool)filter;
+    if (filter) plan.where = comp.compile(filter);
+    for (int k = 0; k < plan.nkeys; ++k) {
+      plan.keys[k] = comp.compile(groupBy[k]);
+      plan.keyInt[k] = groupBy[k]->ty != LType::DOUBLE && groupBy[k]->ty != LType::DECIMAL && progIsInt(comp.env, plan.keys[k]);
+    }
+    for (int a = 1; a < plan.naggs; ++a) plan.aggs[a] = comp.compile(aggArgs[a]);
+    Prog distProg;
+    bool distInt = false;
+    if (distX) {
+      distProg = comp.compile(distX);
+      distInt = distX->ty != LType::DOUBLE && distX->ty != LType::DECIMAL && progIsInt(comp.env, distProg);
+    }
+    comp.uploadSets();
+    plan.aggInt[0] = 1;
+    for (int a = 1; a < plan.naggs; ++a) {
+      plan.aggInt[a] = plan.ops[a] != AGG_COUNT && progIsInt(comp.env, plan.aggs[a]);
+      plan.aggNull[a] = 0;
+      if (plan.ops[a] != AGG_COUNT && plan.aggs[a].len == 1 && comp.env.code[plan.aggs[a].start].op == OP_COL) {
+        const uint8_t t = comp.env.cols[comp.env.code[plan.aggs[a].start].arg].t;
+        if (t == 3 || t == 4) plan.aggNull[a] = t, plan.aggInt[a] = 1;  // nullable int column: exact, NULLs skipped
+      }
+      // GROUP BY over 64-bit integer columns: exact int64 results as bits (a SUM as its two halves,
+      // see aggPart). Without GROUP BY integer sums are 128-bit and exact anyway.
+      plan.aggBits[a] = 0;
+      if ((plan.nkeys || distX) && plan.aggInt[a] && aggArgs[a] && aggArgs[a]->kind == Expr::COL &&
+          (aggArgs[a]->ty == LType::BIGINT || aggArgs[a]->ty == LType::DATETIME) &&
+          (plan.ops[a] == AGG_MIN || plan.ops[a] == AGG_MAX || plan.aggPart[a]))
+        plan.aggBits[a] = 1;
+    }
+    for (int a = 1; a < plan.naggs; ++a)  // both halves exact, or neither (then the low slot sums whole values)
+      if (plan.aggPart[a] == 1 && plan.aggBits[a] != plan.aggBits[a + 1]) plan.aggBits[a] = plan.aggBits[a + 1] = 0;
+    bool anyBits = false;
+    for (int a = 1; a < plan.naggs; ++a) anyBits |= plan.aggBits[a] != 0;
+    const int ncols = (int)comp.slotCols.size();
+
+    std::vector<double> keys, accs;
+    int64_t groups = 0;
+    // Size the GPU hash table from statistics: dictionary sizes and segment min/max ranges give
+    // an upper bound on the number of groups; fall back to the input row count.
+    int64_t rowsIn = single ? ctx.tabs[0]->liveRows() : joined.n;
+    double bound = 1;
+    for (auto& g : groupBy) {
+      if (g->kind != Expr::COL || g->ty == LType::DOUBLE) { bound = 1e18; break; }
+      Table& gt = *ctx.tabs[g->bt];
+      if (g->ty == LType::VARCHAR) { bound *= std::max<size_t>(gt.dicts[g->bc]->strs.size(), 1); continue; }
+      double mn = INFINITY, mx = -INFINITY;
+      for (auto& sp : gt.segs) mn = std::min(mn, sp->mn[g->bc]), mx = std::max(mx, sp->mx[g->bc]);
+      bound *= mx >= mn ? mx - mn + 1 : 1;
+      bound += (double)gt.bufferTotal();
+    }
+    double est = std::min<double>(bound, (double)std::max<int64_t>(rowsIn, 1));
+
+    // Dense ("encoded") GROUP BY when every key is an integer-like column with a small known range:
+    // dictionary codes, small ints, dates. Ranges come from dictionary sizes, segment min/max and
+    // the write buffers.
+    DenseSpec dspec;
+    if (plan.nkeys && tDense) {
+      int64_t G = 1;
+      bool ok = true;
+      for (int k = 0; k < plan.nkeys && ok; ++k) {
+        const ExprP& g = groupBy[k];
+        if (g->kind != Expr::COL || g->ty == LType::DOUBLE) { ok = false; break; }
+        int64_t lo, hi;
+        if (ctx.tabs[g->bt]->hasNull[g->bc] || ctx.outerTabs.count(g->bt) || !colRange(*ctx.tabs[g->bt], g->bc, lo, hi)) {
+          ok = false;
+          break;
+        }
+        const int64_t range = hi - lo + 1;
+        if (range <= 0 || G > (int64_t)(1ll << 26) / range) { ok = false; break; }
+        dspec.kmin[k] = lo;
+        dspec.range[k] = range;
+        dspec.stride[k] = G;
+        G *= range;
+      }
+      if (ok) {
+        int off = 0;
+        for (int a = 0; a < plan.naggs; ++a) {
+          const uint8_t op = plan.ops[a];
+          const bool in = plan.aggInt[a];
+          dspec.kind[a] = op == AGG_COUNT ? DK_COUNT
+                        : op == AGG_SUM   ? (in ? DK_SUM_I : DK_SUM_D)
+                        : op == AGG_MIN   ? (in ? DK_MIN_I : DK_MIN_D)
+                                          : (in ? DK_MAX_I : DK_MAX_D);
+          dspec.slotOff[a] = off;
+          int64_t bytes = G * (dspec.kind[a] == DK_COUNT ? 4 : 8);
+          off += (int)std::min<int64_t>((bytes + 7) / 8 * 8, 1 << 30);
+        }
+        const int64_t copyBytes = off;
+        // Shared-memory atomics on a handful of hot groups serialize, and FP64 atomics are
+        // compare-and-swap loops on consumer GPUs: with few groups and floating-point sums the
+        // warp-sort hash path (no atomics per row) is faster (Q1: 13 ms vs 42 ms).
+        bool intOnly = true;
+        for (int a = 0; a < plan.naggs; ++a)
+          intOnly &= dspec.kind[a] == DK_COUNT || dspec.kind[a] == DK_SUM_I || dspec.kind[a] == DK_MIN_I ||
+                     dspec.kind[a] == DK_MAX_I;
+        if (G * plan.naggs <= 88) {  // 88 x 8 B x 128 threads = 88 KB, leaving room for static shared memory
+          // Few groups: per-thread private accumulators (no atomics per row, see aggDensePrivBody).
+          dspec.priv = 1;
+          dspec.G = G;
+        } else if (copyBytes <= 48 * 1024 && G < 64 && !intOnly) {
+          // leave dspec.G = 0: hash aggregation
+        } else if (copyBytes <= 48 * 1024) {
+          dspec.copies = (int)std::min<int64_t>(8, (48 * 1024) / copyBytes);
+          dspec.copyBytes = (int)copyBytes;
+          dspec.G = G;
+        } else if (G <= std::max<int64_t>(4 * rowsIn, 1 << 16) &&
+                   G * (8 + 8 * plan.nkeys + 8 * plan.naggs) <= (int64_t)512 << 20) {
+          dspec.copies = 0;  // straight to global memory (still no hashing)
+          dspec.G = G;
+        }
+      }
+    }
+    int64_t cap = 1;
+    if (plan.nkeys) {
+      cap = 1024;
+      int64_t maxCap = (1ll << 30) / (8 + 8 * plan.nkeys + 8 * plan.naggs);  // keep the table <= 1 GiB
+      while (cap < est * 2 && cap * 2 <= maxCap) cap <<= 1;
+    }
+    // HAVING / ORDER BY .. LIMIT over many groups: evaluate on the GPU over the compacted groups
+    // and download only the surviving (top-N) groups. The host code below then re-checks and
+    // orders that small set exactly. Returns false (host fallback) for anything it can't compile.
+    auto gpuPostAggregate = [&](GpuAggregator& agg, std::vector<double>& hk, std::vector<double>& ha, int64_t& out) -> bool {
+      std::vector<std::string> keyCanon;
+      for (auto& g : groupBy) keyCanon.push_back(canon(g));
+      Compiler pc(&ctx);
+      const int nk = plan.nkeys;
+      pc.hook = [&](const ExprP& e) {
+        std::string c = canon(e);
+        for (int k = 0; k < nk; ++k)
+          if (keyCanon[k] == c) { pc.emit(OP_COL, k, 1); return true; }
+        if (e->kind == Expr::FUNC && isAggName(e->op)) {
+          const AggRef& r = aggs.at(c);
+          if (r.fn == "COUNT") pc.emit(OP_COL, nk + r.slot, 1);
+          else if (r.fn == "AVG") { pc.emit(OP_COL, nk + r.slot, 1); pc.emit(OP_COL, nk + r.cntSlot, 1); pc.emit(OP_DIV, 0, -1); }
+          else if (r.argTy == LType::VARCHAR && !r.dict) throw SqlError("string aggregate", 1235);
+          else {
+            pc.emit(OP_COL, nk + r.slot, 1);
+            if (r.decScale >= 0) {
+              pc.emit(OP_CONST, pc.constant(pow10i(r.decScale)), 1);
+              pc.emit(OP_DIV, 0, -1);
+            }
+          }
+          return true;
+        }
+        if (e->kind == Expr::COL) throw SqlError("not a group key", 1055);
+        return false;
+      };
+      Prog hp;
+      std::vector<Prog> ops;
+      bool topN = !orderBy.empty() && s.limit >= 0;
+      try {
+        if (having) hp = pc.compile(having);
+        if (topN)
+          for (auto& o : orderBy) {
+            if (o.e->ty == LType::VARCHAR && !ctx.dict(*o.e)) return false;
+            ops.push_back(pc.compile(o.e));
+          }
+      } catch (const SqlError&) {
+        return false;
+      }
+      DevVec<double> dk, da;
+      const int64_t g = agg.compact(dk, da);
+      std::vector<DevVec<double>> keyConv;  // integer keys (stored as int64 bits) as doubles for evaluation
+      for (int k = 0; k < nk; ++k) {
+        if (plan.keyInt[k]) {
+          keyConv.emplace_back(std::max<int64_t>(g, 1));
+          gpuBitsToDouble(dk.p + (int64_t)k * g, g, keyConv.back().p);
+          pc.env.cols[k] = viewOf(keyConv.back().p, PType::F64);
+        } else {
+          pc.env.cols[k] = viewOf(dk.p + (int64_t)k * g, PType::F64);
+        }
+      }
+      for (int a = 0; a < plan.naggs; ++a) pc.env.cols[nk + a] = viewOf(da.p + (int64_t)a * g, PType::F64);
+      pc.uploadSets();
+      DevVec<int32_t> sel;
+      int64_t m = g;
+      if (having) {
+        sel = DevVec<int32_t>(std::max<int64_t>(g, 1));
+        m = gpuSelect(pc.env, true, hp, g, nullptr, sel.p);
+      }
+      DevVec<int32_t> cand;
+      int64_t mc = m;
+      if (topN && m > 0) {
+        mc = std::min<int64_t>(m, s.offset + s.limit);
+        std::vector<DevVec<double>> bufs;
+        std::vector<std::shared_ptr<DevVec<int32_t>>> ranks;
+        std::vector<std::pair<const double*, bool>> sk;
+        for (size_t k = 0; k < orderBy.size(); ++k) {
+          bufs.emplace_back(m);
+          gpuEvalAt(pc.env, ops[k], having ? sel.p : nullptr, m, bufs.back().p);
+          if (orderBy[k].e->ty == LType::VARCHAR) {
+            ranks.push_back(dictRankDev(*ctx.dict(*orderBy[k].e)));
+            gpuMapRank(bufs.back().p, ranks.back()->p, m);
+          }
+          sk.push_back({bufs.back().p, orderBy[k].desc});
+        }
+        DevVec<int32_t> perm = gpuSortPerm(sk, m);
+        cand = DevVec<int32_t>(std::max<int64_t>(mc, 1));
+        if (having) gpuGather(sel.p, PType::I32, perm.p, mc, cand.p);
+        else d2d(cand.p, perm.p, mc * 4);
+      } else {
+        cand = std::move(sel);
+      }
+      // Download the candidate groups in one transfer, then lay them out row-major like fetch().
+      const int W = nk + plan.naggs;
+      DevVec<double> tmp(std::max<int64_t>(mc * W, 1));
+      for (int c = 0; c < W; ++c)
+        gpuGather((c < nk ? dk.p + (int64_t)c * g : da.p + (int64_t)(c - nk) * g), PType::F64, cand.p, mc, tmp.p + (int64_t)c * mc);
+      const std::vector<double> all = tmp.download(mc * W);
+      hk.assign((size_t)mc * nk, 0.0);
+      ha.assign((size_t)mc * plan.naggs, 0.0);
+      for (int c = 0; c < W; ++c)
+        for (int64_t i = 0; i < mc; ++i) {
+          const double v = all[(size_t)c * mc + i];
+          if (c < nk) hk[(size_t)i * nk + c] = v;
+          else ha[(size_t)i * plan.naggs + (c - nk)] = v;
+        }
+      out = mc;
+      notes.push_back("  GPU post-aggregation: " + std::to_string(g) + " groups -> " + std::to_string(mc) + " sent to host");
+      return true;
+    };
+    const std::string method =
+        !plan.nkeys ? "no GROUP BY"
+        : dspec.G   ? "dense GROUP BY on encoded keys (" + std::to_string(dspec.G) + " slots, " +
+                        (dspec.priv ? std::string("per-thread accumulators") : dspec.copies ? std::to_string(dspec.copies) + " shared-memory copies per block" : "global arrays") + ")"
+                    : "hash GROUP BY";
+    const JitProgram* jit = nullptr;
+    std::string codegen = jitEnabled() ? "compiled" : "interpreted (SET gpudb_codegen = OFF)";
+    if (!explain && !distX) {
+      ProfStage pcg("codegen");
+      const JitFn fn = !plan.nkeys ? JF_NOKEYS : dspec.G ? JF_DENSE : JF_GROUPED;
+      plan.densePriv = dspec.G ? (dspec.priv ? 1 : 2) : 0;
+      // Plans beyond the interpreter's limits must be compiled before they can run.
+      const bool mustCompile = plan.naggs > kInterpAggs || plan.nkeys > kInterpKeys;
+      const JitMode savedMode = jitMode();
+      if (mustCompile && savedMode != JIT_SYNC) jitSetMode(JIT_SYNC);
+      jit = jitGet(comp.env, ncols, plan, fn,
+                   !plan.nkeys ? "aggregate (no group by)" : dspec.G ? "aggregate (dense group by)" : "aggregate (hash group by)");
+      if (mustCompile && savedMode != JIT_SYNC) jitSetMode(savedMode);
+      if (jit) codegen = "compiled plan #" + std::to_string(jit->id);
+      else if (jitEnabled()) codegen = "interpreted while the plan compiles in the background";
+      pcg.done(-1, codegen);
+    }
+    ScanStats st;
+    // COUNT(DISTINCT x): phase 1 groups by (keys, x) on the GPU, phase 2 aggregates the compacted
+    // distinct pairs by the keys (COUNT, skipping NULL x), still on the GPU.
+    std::unique_ptr<GpuAggregator> agg2;
+    std::vector<uint8_t> sumBits;  // slots holding exact sums as bits (no GROUP BY)
+    std::vector<int64_t> sumHi;    // their high 64 bits
+    DevVec<double> distKeys, distAccs;
+    if (distX && !explain) {
+      AggPlan plan1 = plan;  // every ordinary aggregate as a partial per (keys, x)
+      plan1.nkeys = plan.nkeys + 1;
+      plan1.keys[plan.nkeys] = distProg;
+      plan1.keyInt[plan.nkeys] = distInt;
+      plan1.densePriv = 0;
+      if (plan.naggs + 1 > kInterpAggs) throw SqlError("too many aggregates next to COUNT(DISTINCT)", 1235);
+      if (plan1.nkeys > kMaxKeys) throw SqlError("too many GROUP BY expressions", 1235);
+      const JitProgram* jit1 = nullptr;
+      {
+        ProfStage pcg("codegen");
+        jit1 = jitGet(comp.env, ncols, plan1, JF_GROUPED, "aggregate (distinct pairs)");
+        pcg.done(-1, jit1 ? "compiled plan #" + std::to_string(jit1->id) : "interpreted");
+      }
+      int64_t cap1 = 1024;
+      while (cap1 < std::min<int64_t>(std::max<int64_t>(rowsIn, 1), 1 << 22)) cap1 <<= 1;
+      for (;;) {
+        GpuAggregator a1(plan1, cap1, nullptr);
+        ProfStage p1("scan+distinct pairs " + ctx.tabs[0]->name);
+        st = ScanStats();
+        forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
+          a1.addBatch(env, ncols, n, del);
+          return true;
+        });
+        a1.run(comp.env, jit1);
+        if (a1.overflowed()) {
+          int64_t want = std::max<int64_t>(cap1 * 4, a1.groupCount() * 4);
+          cap1 = 1;
+          while (cap1 < want) cap1 <<= 1;
+          continue;
+        }
+        const int64_t g1 = a1.compact(distKeys, distAccs);
+        p1.done(a1.rowsIn(), std::to_string(g1) + " distinct (group, value) pairs, hash GROUP BY");
+        ProfStage p2("count distinct");
+        const int nk = plan.nkeys;
+        ExprEnv env2{};
+        int nc = 0;
+        for (int k = 0; k <= nk; ++k) {
+          const bool in = k < nk ? plan.keyInt[k] != 0 : distInt;
+          env2.cols[k] = ColView{distKeys.p + (int64_t)k * g1, (uint8_t)(in ? 1 : 2)};
+          env2.code[nc++] = Instr{OP_COL, (uint8_t)in, (uint16_t)k};
+        }
+        AggPlan plan2{};
+        plan2.nkeys = nk;
+        for (int k = 0; k < nk; ++k) {
+          plan2.keys[k] = Prog{(int16_t)k, 1};
+          plan2.keyInt[k] = plan.keyInt[k];
+        }
+        // Combine the partials: COUNT and SUM by SUM, MIN by MIN, MAX by MAX; the extra slot counts
+        // the pairs whose x is not NULL (= COUNT(DISTINCT x) per group).
+        const int na = plan1.naggs;
+        for (int a = 0; a < na; ++a) {
+          // (exact int64 partials, AggPlan::aggBits, are read as int64 and merged exactly)
+          env2.cols[nk + 1 + a] = ColView{distAccs.p + (int64_t)a * g1, (uint8_t)(plan1.aggBits[a] ? 1 : 2)};
+          plan2.aggs[a] = Prog{(int16_t)nc, 1};
+          env2.code[nc++] = Instr{OP_COL, 0, (uint16_t)(nk + 1 + a)};
+          plan2.ops[a] = plan1.ops[a] == AGG_COUNT ? AGG_SUM : plan1.ops[a];
+          plan2.aggInt[a] = plan2.aggBits[a] = plan1.aggBits[a];
+          plan2.aggPart[a] = 0;
+        }
+        plan2.aggs[na] = Prog{(int16_t)nc, distInt ? (int16_t)1 : (int16_t)3};
+        if (distInt) {
+          env2.code[nc++] = Instr{OP_CONST, 0, 0};
+          env2.consts[0] = 1.0;
+        } else {
+          env2.code[nc++] = Instr{OP_COL, 0, (uint16_t)nk};
+          env2.code[nc++] = Instr{OP_ISNULL, 0, 0};
+          env2.code[nc++] = Instr{OP_NOT, 0, 0};
+        }
+        plan2.ops[na] = AGG_SUM;
+        plan2.aggInt[na] = 0;
+        plan2.naggs = na + 1;
+        int64_t cap2 = 1024;
+        while (cap2 < 2 * g1) cap2 <<= 1;
+        agg2 = std::make_unique<GpuAggregator>(plan2, cap2, nullptr);
+        agg2->addBatch(env2, nk + 1 + na, g1, nullptr);
+        agg2->run(env2, nullptr);
+        agg2->overflowed();
+        p2.done(g1, "second GPU aggregation over the distinct pairs");
+        break;
+      }
+      plan.naggs += 1;  // the result layout is plan2's: ordinary slots + the distinct count
+      ProfStage ppost("post-aggregate");
+      if (!(plan.nkeys && (having || (!orderBy.empty() && s.limit >= 0)) && gpuPostAggregate(*agg2, keys, accs, groups)))
+        groups = agg2->fetch(keys, accs);
+      sumBits = agg2->sumBitsSlots();
+      sumHi = agg2->sumHigh();
+      ppost.done(groups, plan.nkeys ? "groups sent to host" : "");
+    }
+    for (;;) {
+      if (distX) break;
+      GpuAggregator agg(plan, cap, dspec.G ? &dspec : nullptr);
+      ProfStage pscan(single ? "scan+aggregate " + ctx.tabs[0]->name : "aggregate join result");
+      if (single) {
+        st = ScanStats();
+        if (explain) {
+          forEachBatch(ctx, 0, comp, conj, st, nullptr, true);
+        } else {
+          forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
+            agg.addBatch(env, ncols, n, del);
+            return true;
+          });
+        }
+      } else {
+        bindRelCols(comp, joined);
+        agg.addBatch(comp.env, ncols, joined.n, nullptr);
+      }
+      if (explain) break;
+      agg.run(comp.env, jit);
+      const bool overflow = agg.overflowed();
+      pscan.done(agg.rowsIn(), std::to_string(agg.batches()) + " batches in 1 launch, " + method + ", " + codegen +
+                                   (overflow ? ", hash table overflowed: retrying bigger" : ""));
+      if (overflow) {
+        int64_t want = std::max<int64_t>(cap * 4, agg.groupCount() * 4);
+        cap = 1;
+        while (cap < want) cap <<= 1;
+        continue;
+      }
+      ProfStage ppost("post-aggregate");
+      // A derived table's GROUP BY whose items are keys and plain aggregates: built on the GPU from the
+      // compacted groups, never leaving VRAM (makeTemp takes the columns over).
+      if (tColumnar && plan.nkeys && !having && orderBy.empty() && s.limit < 0 && s.offset == 0 && !explain) {
+        std::vector<TempColSpec> specs;
+        std::vector<std::shared_ptr<Dict>> dicts(items.size());
+        bool ok = true;
+        for (size_t i = 0; i < items.size() && ok; ++i) {
+          const ExprP& e = items[i].e;
+          TempColSpec sp;
+          const LType ty = e->ty == LType::DECIMAL ? LType::DOUBLE : e->ty;
+          if (ty == LType::VECTOR) { ok = false; break; }
+          sp.out = ty == LType::DOUBLE ? 2 : physOf(ty) == PType::I64 ? 1 : 0;
+          const std::string k = canon(e);
+          int key = -1;
+          for (int g = 0; g < plan.nkeys; ++g)
+            if (canon(groupBy[g]) == k) key = g;
+          if (key >= 0) {
+            if (ty == LType::VARCHAR) {
+              const Dict* d = ctx.dict(*e);
+              if (!d || d->strs.size() > (1u << 20)) { ok = false; break; }
+              dicts[i] = std::make_shared<Dict>(*d);
+            }
+            sp.src = 0;
+            sp.idx = key;
+            sp.keyInt = plan.keyInt[key];
+          } else if ((e->kind == Expr::FUNC && isAggName(e->op) && ty != LType::VARCHAR) ||
+                     (e->kind == Expr::BIN && e->op == "*" && ty == LType::DOUBLE &&
+                      ((e->args[0]->kind == Expr::LIT && e->args[1]->kind == Expr::FUNC && isAggName(e->args[1]->op)) ||
+                       (e->args[1]->kind == Expr::LIT && e->args[0]->kind == Expr::FUNC && isAggName(e->args[0]->op))))) {
+            ExprP ag = e;
+            if (e->kind == Expr::BIN) {  // constant * aggregate
+              const bool litFirst = e->args[0]->kind == Expr::LIT;
+              const Value& lv = e->args[litFirst ? 0 : 1]->lit;
+              if (lv.isNull() || lv.kind == Value::STR) { ok = false; break; }
+              sp.mul = lv.num();
+              ag = e->args[litFirst ? 1 : 0];
+            }
+            auto it = aggs.find(canon(ag));
+            if (it == aggs.end() || it->second.unrank || it->second.distinct || it->second.dict) { ok = false; break; }
+            const AggRef& r = it->second;
+            const bool bits = plan.aggBits[r.slot];
+            sp.src = 1;
+            sp.idx = r.slot;
+            sp.cnt = r.fn == "COUNT" ? -1 : r.cntSlot;
+            sp.div = r.decScale >= 0 ? pow10i(r.decScale) : 1.0;
+            if (r.fn == "COUNT") sp.kind = 3;
+            else if (r.fn == "AVG") sp.kind = 4, sp.sumBits = bits, sp.hi = bits ? r.hiSlot : -1;
+            else if (bits) sp.kind = r.hiSlot >= 0 ? 2 : 1, sp.hi = r.hiSlot;
+            else sp.kind = 0;
+          } else {
+            ok = false;
+          }
+          specs.push_back(sp);
+        }
+        if (ok) {
+          DevVec<double> dk, da;
+          const int64_t g = agg.compact(dk, da);
+          for (auto& sp : specs) {
+            auto col = std::make_shared<ResultSet::DevColumn>();
+            col->p = gpuTempColumn(dk.p, plan.nkeys, da.p, plan.naggs, g, sp, col->mn, col->mx);
+            res.devCols.push_back(col);
+          }
+          res.devRows = g;
+          res.colDicts = dicts;
+          for (auto& t : res.types)
+            if (t == LType::DECIMAL) t = LType::DOUBLE;
+          res.isResult = true;
+          res.typed = true;
+          ppost.done(g, "derived table built on the GPU");
+          res.info = single ? "gpu-aggregate" : "gpu-join-aggregate";
+          return res;
+        }
+      }
+      if (!(plan.nkeys && !anyBits && (having || (!orderBy.empty() && s.limit >= 0)) &&
+            gpuPostAggregate(agg, keys, accs, groups)))
+        groups = agg.fetch(keys, accs);
+      sumBits = agg.sumBitsSlots();
+      sumHi = agg.sumHigh();
+      ppost.done(groups, plan.nkeys ? "groups sent to host" : "");
+      break;
+    }
+    notes.insert(notes.begin(), std::string(single ? "GPU fused scan+filter+aggregate" : "GPU aggregate") + ": " + method +
+                                    ", " + std::to_string(plan.naggs) + " agg slots, codegen " +
+                                    (jitEnabled() ? "on" : "off"));
+    if (single) {
+      notes.insert(notes.begin() + 1, "  " + scanDesc(*ctx.tabs[0], st));
+      if (where) notes.insert(notes.begin() + 2, "  filter: " + where->str());
+    }
+    if (explain) return explainResult();
+    ProfStage phost("host finalize");
+
+    // Non-NULL counts (SUM(ISNOTNULL x) slots) are read as plain doubles everywhere: convert their exact bits.
+    for (size_t a = 1; a < sumBits.size() && a < aggArgs.size() && a < accs.size(); ++a)
+      if (sumBits[a] && aggArgs[a] && aggArgs[a]->kind == Expr::FUNC && aggArgs[a]->op == "ISNOTNULL")
+        accs[a] = (double)bitsOf(accs[a]), sumBits[a] = 0;
+    PostCtx pc;
+    pc.bc = &ctx;
+    pc.aggs = &aggs;
+    if (!sumBits.empty()) pc.accBits = sumBits.data();
+    if (!sumHi.empty() && !plan.nkeys) pc.accHi = sumHi.data();
+    for (int k = 0; k < plan.nkeys; ++k) pc.keyInt.push_back(plan.keyInt[k]);
+    for (auto& g : groupBy) {
+      pc.keyCanon.push_back(canon(g));
+      pc.keyTy.push_back(g->ty);
+      pc.keyDict.push_back(ctx.dict(*g));
+      pc.keyScale.push_back(g->scale);
+    }
+    // Filter groups, compute ORDER BY keys, pick the top rows, and only then evaluate the
+    // select list (keeps large GROUP BY ... ORDER BY .. LIMIT cheap on the host).
+    // On all cores (millions of groups when a GROUP BY feeds a derived table): each chunk with its
+    // own evaluation context, results concatenated in group order.
+    std::vector<int64_t> keep;
+    std::vector<std::vector<Value>> sortKeys;
+    // Every fetched group is kept and in order (no HAVING / ORDER BY, compacted groups): no index arrays.
+    bool identity = !having && orderBy.empty() && plan.nkeys;
+    for (int64_t gi = 0; identity && gi < groups; gi += std::max<int64_t>(1, groups / 64))
+      identity = accs[gi * plan.naggs] != 0;
+    // ORDER BY a string GROUP BY key: compare its rank in the sorted dictionary, not the strings.
+    std::vector<std::shared_ptr<std::vector<double>>> rankOf(orderBy.size());
+    std::vector<int> rankKey(orderBy.size(), -1);
+    for (size_t k = 0; k < orderBy.size(); ++k) {
+      const ExprP& oe = orderBy[k].e;
+      if (oe->ty != LType::VARCHAR || !ctx.dict(*oe)) continue;
+      const std::string oc = canon(oe);
+      for (int g = 0; g < plan.nkeys; ++g)
+        if (pc.keyCanon[g] == oc && plan.keyInt[g]) {
+          rankKey[k] = g;
+          rankOf[k] = sortedDict(*ctx.dict(*oe)).second;
+        }
+    }
+    if (!identity) {
+      const size_t nchunks = std::max<size_t>(1, std::min<size_t>(64, (size_t)groups / 16384));
+      std::vector<std::vector<int64_t>> keepC(nchunks);
+      std::vector<std::vector<std::vector<Value>>> skC(nchunks);
+      std::exception_ptr err;
+      std::mutex errMu;
+      parallelFor(nchunks, [&](size_t cb, size_t ce) {
+        for (size_t ch = cb; ch < ce; ++ch) {
+          try {
+            PostCtx tpc = pc;
+            const int64_t lo = (int64_t)(groups * ch / nchunks), hi = (int64_t)(groups * (ch + 1) / nchunks);
+            for (int64_t gi = lo; gi < hi; ++gi) {
+              tpc.keys = keys.data() + gi * plan.nkeys;
+              tpc.accs = accs.data() + gi * plan.naggs;
+              if (plan.nkeys && tpc.accs[0] == 0) continue;
+              if (having && !isTrue(evalPost(having, tpc))) continue;
+              keepC[ch].push_back(gi);
+              if (!orderBy.empty()) {
+                std::vector<Value> sk;
+                for (size_t k = 0; k < orderBy.size(); ++k) {
+                  if (rankOf[k]) {
+                    const long long code = bitsOf(tpc.keys[rankKey[k]]);
+                    sk.push_back(code < 0 || code >= (long long)rankOf[k]->size() ? Value::Null() : Value::D((*rankOf[k])[code]));
+                    continue;
+                  }
+                  sk.push_back(evalPost(orderBy[k].e, tpc));
+                }
+                skC[ch].push_back(std::move(sk));
+              }
+            }
+          } catch (...) {
+            std::lock_guard<std::mutex> g(errMu);
+            err = std::current_exception();
+          }
+        }
+      }, 1);
+      if (err) std::rethrow_exception(err);
+      for (size_t ch = 0; ch < nchunks; ++ch) {
+        keep.insert(keep.end(), keepC[ch].begin(), keepC[ch].end());
+        for (auto& k : skC[ch]) sortKeys.push_back(std::move(k));
+      }
+    }
+    // (identity: verify the sampled assumption on all cores, falling back to the index arrays)
+    if (identity) {
+      std::atomic<bool> empty{false};
+      parallelFor((size_t)groups, [&](size_t b, size_t e) {
+        for (size_t gi = b; gi < e && !empty; ++gi)
+          if (accs[gi * plan.naggs] == 0) empty = true;
+      });
+      if (empty) {
+        identity = false;
+        for (int64_t gi = 0; gi < groups; ++gi)
+          if (accs[gi * plan.naggs] != 0) keep.push_back(gi);
+      }
+    }
+    const size_t nkeep = identity ? (size_t)groups : keep.size();
+    // A VARCHAR GROUP BY key can be a column of dictionary codes in the columnar result (its dictionary,
+    // when small, is copied into the temp table).
+    auto codeKey = [&](const ExprP& e) {
+      if (e->ty != LType::VARCHAR) return false;
+      const Dict* d = ctx.dict(*e);
+      if (!d || d->strs.size() > (1u << 20)) return false;
+      const std::string k = canon(e);
+      for (auto& kc : pc.keyCanon)
+        if (kc == k) return true;
+      return false;
+    };
+    bool columnarOk = tColumnar && s.limit < 0 && s.offset == 0;  // (the condition of the columnar result below)
+    for (auto& it : items) columnarOk = columnarOk && (it.e->ty != LType::VARCHAR || codeKey(it.e)) && it.e->ty != LType::VECTOR;
+    if (identity && !columnarOk) {  // the general paths below index through keep
+      keep.resize(nkeep);
+      for (size_t i = 0; i < nkeep; ++i) keep[i] = (int64_t)i;
+      identity = false;
+    }
+    std::vector<size_t> order(identity ? 0 : keep.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    size_t want = s.limit < 0 ? nkeep : std::min<size_t>(nkeep, (size_t)(s.offset + s.limit));
+    if (!orderBy.empty()) {
+      auto less = [&](size_t a, size_t b) {
+        for (size_t k = 0; k < orderBy.size(); ++k) {
+          int c = cmpVal(sortKeys[a][k], sortKeys[b][k]);
+          if (c) return orderBy[k].desc ? c > 0 : c < 0;
+        }
+        return a < b;
+      };
+      std::partial_sort(order.begin(), order.begin() + want, order.end(), less);
+    }
+    std::vector<std::vector<Value>> rows, noKeys;
+    bool allNumeric = tColumnar && orderBy.empty() && !having && s.limit < 0 && s.offset == 0;
+    for (auto& it : items) allNumeric = allNumeric && (it.e->ty != LType::VARCHAR || codeKey(it.e)) && it.e->ty != LType::VECTOR;
+    if (allNumeric) {  // a derived table's GROUP BY: numeric columns, no row objects
+      const size_t nr = want;
+      res.numCols.resize(items.size());
+      parallelFor(items.size(), [&](size_t b, size_t e) {  // (zero-filling 10s of MB: one column per core)
+        for (size_t i = b; i < e; ++i) res.numCols[i].resize(nr);
+      }, 1);
+      // Items that are just a GROUP BY key or a plain aggregate read the result arrays directly.
+      std::vector<int> keyOf(items.size(), -1);
+      std::vector<const AggRef*> aggOf(items.size(), nullptr);
+      for (size_t i = 0; i < items.size(); ++i) {
+        const std::string k = canon(items[i].e);
+        for (size_t g = 0; g < pc.keyCanon.size(); ++g)
+          if (pc.keyCanon[g] == k) keyOf[i] = (int)g;
+        if (keyOf[i] < 0 && items[i].e->kind == Expr::FUNC && isAggName(items[i].e->op)) {
+          auto it = aggs.find(k);
+          if (it != aggs.end() && !it->second.unrank && !it->second.distinct) aggOf[i] = &it->second;
+        }
+      }
+      std::exception_ptr err;
+      std::mutex errMu;
+      parallelFor(nr, [&](size_t b, size_t e) {
+        try {
+          PostCtx tpc = pc;
+          for (size_t j = b; j < e; ++j) {
+            const int64_t g = identity ? (int64_t)j : keep[order[j]];
+            tpc.keys = keys.data() + g * plan.nkeys;
+            tpc.accs = accs.data() + g * plan.naggs;
+            for (size_t i = 0; i < items.size(); ++i) {
+              if (keyOf[i] >= 0) {
+                const double kv = tpc.keys[keyOf[i]];
+                res.numCols[i][j] = (size_t)keyOf[i] < pc.keyInt.size() && pc.keyInt[keyOf[i]] ? (double)bitsOf(kv) : kv;  // (NULL keys: the sentinel round-trips)
+                continue;
+              }
+              if (const AggRef* r = aggOf[i]) {
+                if (r->fn == "COUNT") { res.numCols[i][j] = tpc.accs[r->slot]; continue; }
+                const double cnt = tpc.accs[r->cntSlot];
+                double v = tpc.accs[r->slot];
+                if (pc.accBits && pc.accBits[r->slot]) {  // exact int64 bits (a BIGINT SUM: two 32-bit halves)
+                  v = r->hiSlot >= 0 && pc.accBits[r->hiSlot] ? (double)bitsOf(tpc.accs[r->hiSlot]) * 4294967296.0 + (double)bitsOf(v)
+                    : pc.accHi && (r->fn == "SUM" || r->fn == "AVG") ? (double)(((__int128)pc.accHi[r->slot] << 64) | (uint64_t)bitsOf(v))
+                                                                    : (double)bitsOf(v);
+                }
+                if (r->decScale >= 0) v /= pow10i(r->decScale);
+                res.numCols[i][j] = cnt == 0 ? nullv() : r->fn == "AVG" ? v / cnt : v;
+                continue;
+              }
+              const Value v = evalPost(items[i].e, tpc);
+              res.numCols[i][j] = v.isNull() ? nullv() : v.kind == Value::DBL ? v.d : (double)v.i;
+            }
+          }
+        } catch (...) {
+          std::lock_guard<std::mutex> g(errMu);
+          err = std::current_exception();
+        }
+      }, 16384);
+      if (err) std::rethrow_exception(err);
+      res.typed = true;
+      for (auto& t : res.types)  // (a DECIMAL expression's double value: a DOUBLE column of the temp table)
+        if (t == LType::DECIMAL) t = LType::DOUBLE;
+      res.colDicts.assign(items.size(), nullptr);
+      for (size_t i = 0; i < items.size(); ++i)
+        if (items[i].e->ty == LType::VARCHAR) res.colDicts[i] = std::make_shared<Dict>(*ctx.dict(*items[i].e));
+      phost.done((int64_t)nr, "columnar result for a derived table");
+      res.info = single ? "gpu-aggregate" : "gpu-join-aggregate";
+      return res;
+    }
+    {
+      const size_t first = std::min<size_t>(s.offset, want), nr = want - first;
+      rows.resize(nr);
+      std::exception_ptr err;
+      std::mutex errMu;
+      parallelFor(nr, [&](size_t b, size_t e) {
+        try {
+          PostCtx tpc = pc;
+          for (size_t j = b; j < e; ++j) {
+            const size_t i = first + j;
+            tpc.keys = keys.data() + keep[order[i]] * plan.nkeys;
+            tpc.accs = accs.data() + keep[order[i]] * plan.naggs;
+            rows[j].reserve(items.size());
+            for (auto& it : items) rows[j].push_back(evalPost(it.e, tpc));
+          }
+        } catch (...) {
+          std::lock_guard<std::mutex> g(errMu);
+          err = std::current_exception();
+        }
+      }, 16384);
+      if (err) std::rethrow_exception(err);
+    }
+    orderBy.clear();
+    s.offset = 0;
+    s.limit = -1;
+    sortKeys.clear();
+    finish(rows, noKeys);
+    phost.done((int64_t)res.rows.size(), "HAVING / ORDER BY / LIMIT on the candidate groups, formatting");
+    res.info = single ? "gpu-aggregate" : "gpu-join-aggregate";
+    if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
+    return res;
+  }
+
+  // ================= Plain projections (optionally joined / ordered / limited)
+  // Predicates and expressions the GPU can't evaluate (host-only functions over several columns)
+  // run on the host over the rows the GPU filters produce.
+  std::vector<ExprP> hostFilt;
+  for (auto& pd : pushdown) {
+    std::vector<ExprP> keep;
+    for (auto& p : pd) (gpuCompilable(p, ctx) ? keep : hostFilt).push_back(p);
+    pd.swap(keep);
+  }
+  {
+    std::vector<ExprP> keep;
+    for (auto& p : residual) (gpuCompilable(p, ctx) ? keep : hostFilt).push_back(p);
+    residual.swap(keep);
+  }
+  bool hostMode = !hostFilt.empty();
+  for (auto& it : items) hostMode = hostMode || !gpuCompilable(it.e, ctx);
+  for (auto& o : orderBy) hostMode = hostMode || !gpuCompilable(o.e, ctx);
+  if (hostMode) {
+    for (auto& f : hostFilt) colsOf(f, needed);
+    notes.push_back("host evaluation of: " + [&] {
+      std::string r;
+      for (auto& f : hostFilt) r += (r.empty() ? "" : ", ") + f->str();
+      for (auto& it : items) if (!gpuCompilable(it.e, ctx)) r += (r.empty() ? "" : ", ") + it.e->str();
+      return r;
+    }());
+  }
+  Rel rel;
+  if (ctx.tabs.size() == 1) {
+    int64_t maxRows = orderBy.empty() && s.limit >= 0 && hostFilt.empty() ? s.offset + s.limit : -1;
+    notes.push_back("GPU filter + gather (late materialization)" + std::string(maxRows >= 0 ? ", early stop at LIMIT" : ""));
+    if (explain) return explainResult();
+    rel = materialize(ctx, 0, pushdown[0], needOf(0), maxRows, notes);
+  } else {
+    notes.push_back("GPU join pipeline (EXPLAIN runs the joins to report the actual strategy):");
+    rel = buildJoin();
+    if (explain) return explainResult();
+  }
+  Compiler comp(&ctx);
+  ExprP filter = ctx.tabs.size() == 1 ? nullptr : andAll(residual);
+  Prog fp;
+  if (filter) fp = comp.compile(filter);
+  std::vector<Prog> projs, ords;
+  std::vector<std::pair<int, int>> hostCols;
+  std::vector<Prog> hostProgs;
+  if (hostMode) {
+    std::set<std::pair<int, int>> hc;
+    for (auto& it : items) colsOf(it.e, hc);
+    for (auto& o : orderBy) colsOf(o.e, hc);
+    for (auto& f : hostFilt) colsOf(f, hc);
+    for (auto& pr : hc) {
+      hostCols.push_back(pr);
+      const bool vec = ctx.tabs[pr.first]->cols[pr.second].pt == PType::VEC;
+      hostProgs.push_back(vec ? Prog{} : comp.compile(boundCol(ctx, pr.first, pr.second)));
+    }
+  } else {
+    for (auto& it : items) projs.push_back(comp.compile(it.e));
+    for (auto& o : orderBy) ords.push_back(comp.compile(o.e));
+  }
+  comp.uploadSets();
+  bindRelCols(comp, rel);
+  DevVec<int32_t> sel;
+  int64_t m = rel.n;
+  if (filter) {
+    ProfStage pf("residual filter");
+    sel = DevVec<int32_t>(rel.n);
+    m = gpuSelect(comp.env, true, fp, rel.n, nullptr, sel.p);
+    pf.done(m, filter->str());
+  }
+  if (hostMode) {
+    if (m > 20'000'000) throw SqlError("too many rows for host evaluation (" + std::to_string(m) + "); add filters", 1105);
+    ProfStage ph("host evaluation");
+    std::vector<std::vector<double>> cv;
+    std::vector<std::vector<uint8_t>> vecBytes(hostCols.size());
+    for (size_t i = 0; i < hostProgs.size(); ++i) {
+      const Table& tb = *ctx.tabs[hostCols[i].first];
+      if (tb.cols[hostCols[i].second].pt == PType::VEC) {  // raw float32 vectors straight from the relation
+        const int ri = rel.find(hostCols[i].first, hostCols[i].second);
+        const int es = rel.cols[ri].esize;
+        DevVec<uint8_t> tmp(std::max<int64_t>(m, 1) * es);
+        if (filter) gpuGatherBytes(rel.cols[ri].data.p, es, sel.p, m, tmp.p, false);
+        else if (m) d2d(tmp.p, rel.cols[ri].data.p, m * es);
+        vecBytes[i] = tmp.download(m * es);
+        cv.emplace_back();
+        continue;
+      }
+      DevVec<double> out(std::max<int64_t>(m, 1));
+      gpuEvalAt(comp.env, hostProgs[i], filter ? sel.p : nullptr, m, out.p);
+      cv.push_back(out.download(m));
+    }
+    std::vector<Value> rowVals(hostCols.size());
+    PostCtx pc;
+    pc.row = &rowVals;
+    pc.colSlot = [&](int bt, int bc) {
+      for (size_t i = 0; i < hostCols.size(); ++i)
+        if (hostCols[i].first == bt && hostCols[i].second == bc) return (int)i;
+      return -1;
+    };
+    std::vector<std::vector<Value>> rows, keys;
+    for (int64_t r = 0; r < m; ++r) {
+      for (size_t i = 0; i < hostCols.size(); ++i) {
+        const Table& tb = *ctx.tabs[hostCols[i].first];
+        const ColumnMeta& cm = tb.cols[hostCols[i].second];
+        if (cm.pt == PType::VEC) {
+          const float* f = (const float*)vecBytes[i].data() + r * cm.vecDim;
+          rowVals[i] = f[0] != f[0] ? Value::Null() : Value::S(formatVector(f, cm.vecDim));
+          continue;
+        }
+        rowVals[i] = typedVal(cv[i][r], cm.lt, tb.dicts[hostCols[i].second].get(), cm.scale);
+      }
+      bool keep = true;
+      for (auto& f : hostFilt) keep = keep && isTrue(evalPost(f, pc));
+      if (!keep) continue;
+      std::vector<Value> row, key;
+      for (auto& it : items) row.push_back(evalPost(it.e, pc));
+      for (auto& o : orderBy) key.push_back(evalPost(o.e, pc));
+      rows.push_back(std::move(row));
+      keys.push_back(std::move(key));
+    }
+    finish(rows, keys);
+    ph.done((int64_t)res.rows.size(), std::to_string(m) + " rows from the GPU");
+    res.info = "gpu-scan+host";
+    return res;
+  }
+  DevVec<int32_t> finalIdx;
+  int64_t start = std::min<int64_t>(s.offset, m);
+  int64_t cnt = s.limit < 0 ? m - start : std::min<int64_t>(m - start, s.limit);
+  if (cnt > 20'000'000) throw SqlError("result set too large for this PoC (" + std::to_string(cnt) + " rows); add a LIMIT", 1105);
+  ProfStage psort(orderBy.empty() ? "limit" : "GPU sort");
+  if (!orderBy.empty() && m > 0) {
+    std::vector<DevVec<double>> keyBufs;
+    std::vector<std::shared_ptr<DevVec<int32_t>>> ranks;
+    std::vector<std::pair<const double*, bool>> keys;
+    for (size_t k = 0; k < orderBy.size(); ++k) {
+      keyBufs.emplace_back(m);
+      gpuEvalAt(comp.env, ords[k], filter ? sel.p : nullptr, m, keyBufs.back().p);
+      if (orderBy[k].e->ty == LType::VARCHAR) {
+        ranks.push_back(dictRankDev(*ctx.dict(*orderBy[k].e)));
+        gpuMapRank(keyBufs.back().p, ranks.back()->p, m);
+      }
+      keys.push_back({keyBufs.back().p, orderBy[k].desc});
+    }
+    DevVec<int32_t> perm = gpuSortPerm(keys, m);
+    finalIdx = DevVec<int32_t>(std::max<int64_t>(cnt, 1));
+    if (filter) gpuGather(sel.p, PType::I32, perm.p + start, cnt, finalIdx.p);
+    else d2d(finalIdx.p, perm.p + start, cnt * 4);
+    notes.push_back("  GPU sort of " + std::to_string(m) + " rows");
+  } else if (cnt > 0) {
+    finalIdx = DevVec<int32_t>(cnt);
+    if (filter) d2d(finalIdx.p, sel.p + start, cnt * 4);
+    else {
+      std::vector<int32_t> seq(cnt);
+      for (int64_t i = 0; i < cnt; ++i) seq[i] = (int32_t)(start + i);
+      h2d(finalIdx.p, seq.data(), cnt * 4);
+    }
+  }
+  psort.done(cnt, std::to_string(m) + " rows in");
+  ProfStage pproj("project + format");
+  // IN (SELECT int_col ..): only the distinct values matter: deduplicated on the GPU through a bitmap
+  // over the column's value range, so only those come back.
+  if (tRawNumber && projs.size() == 1 && items[0].e->kind == Expr::COL && items[0].e->ty != LType::VARCHAR &&
+      items[0].e->ty != LType::DOUBLE && items[0].e->ty != LType::DECIMAL && items[0].e->ty != LType::VECTOR && cnt > 4096) {
+    int64_t lo, hi;
+    const ExprP& ce = items[0].e;
+    if (colRange(*ctx.tabs[ce->bt], ce->bc, lo, hi) && hi - lo < (int64_t)(1ll << 31)) {
+      std::vector<int64_t> d = gpuDistinctInts(comp.env, projs[0], finalIdx.p, cnt, lo, hi - lo + 1);
+      auto nc = std::make_shared<std::vector<double>>(d.begin(), d.end());
+      res.numCol = nc;
+      res.typed = true;
+      pproj.done(cnt, std::to_string(d.size()) + " distinct values (GPU bitmap)");
+      res.info = "gpu-scan";
+      return res;
+    }
+  }
+  std::vector<std::vector<double>> cols;
+  std::vector<std::vector<int64_t>> icols(projs.size());  // exact 64-bit integer columns
+  for (size_t i = 0; i < projs.size(); ++i) {
+    const ExprP& e = items[i].e;
+    if ((e->kind == Expr::COL || e->kind == Expr::BIN || e->kind == Expr::UNARY) && (e->ty == LType::BIGINT || e->ty == LType::DATETIME)) {
+      DevVec<int64_t> out(std::max<int64_t>(cnt, 1));
+      gpuEvalAtInt(comp.env, projs[i], finalIdx.p, cnt, out.p);
+      icols[i] = out.download(std::max<int64_t>(cnt, 0));
+      cols.emplace_back();
+      continue;
+    }
+    DevVec<double> out(std::max<int64_t>(cnt, 1));
+    gpuEvalAt(comp.env, projs[i], finalIdx.p, cnt, out.p);
+    cols.push_back(out.download(std::max<int64_t>(cnt, 0)));
+  }
+  if (tRawNumber && projs.size() == 1 && items[0].e->ty != LType::VARCHAR && items[0].e->ty != LType::VECTOR) {
+    auto nc = std::make_shared<std::vector<double>>();
+    if (!icols[0].empty()) {
+      nc->reserve(icols[0].size());
+      for (int64_t v : icols[0]) nc->push_back(v == kNullI64 ? nullv() : (double)v);
+    } else {
+      *nc = std::move(cols[0]);
+    }
+    res.numCol = nc;
+    res.typed = true;
+    pproj.done(cnt);
+    res.info = "gpu-scan";
+    return res;
+  }
+  auto valueAt = [&](size_t i, int64_t r) {
+    if (!icols[i].empty()) {
+      const int64_t v = icols[i][r];
+      if (v == kNullI64) return Value::Null();
+      return items[i].e->ty == LType::DATETIME ? Value::Ts(v) : Value::I(v);
+    }
+    return typedVal(cols[i][r], items[i].e->ty, ctx.dict(*items[i].e), items[i].e->scale);
+  };
+  res.typed = tWantVals;
+  // Rows are built on all cores (big results: formatting dominates the GPU work).
+  if (tWantVals) res.vals.resize(std::max<int64_t>(cnt, 0));
+  else res.rows.resize(std::max<int64_t>(cnt, 0));
+  const bool wantVals = tWantVals;
+  parallelFor((size_t)std::max<int64_t>(cnt, 0), [&](size_t b, size_t e) {
+    for (size_t r = b; r < e; ++r) {
+      if (wantVals) {
+        std::vector<Value>& row = res.vals[r];
+        row.reserve(items.size());
+        for (size_t i = 0; i < items.size(); ++i) row.push_back(valueAt(i, (int64_t)r));
+      } else {
+        std::vector<std::string>& row = res.rows[r];
+        row.reserve(items.size());
+        for (size_t i = 0; i < items.size(); ++i) row.push_back(cell(valueAt(i, (int64_t)r)));
+      }
+    }
+  }, 4096);
+  pproj.done(cnt);
+  res.info = ctx.tabs.size() == 1 ? "gpu-scan" : "gpu-join";
+  if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
+  return res;
+}
+
+// ================================================================== query layer
+// CTEs, derived tables, subqueries, UNION and COUNT(DISTINCT) on top of doSelect: inner queries run
+// first and their results become query-scoped GPU temp tables (or literals / value sets).
+
+
+ExprP cloneExpr(const ExprP& e) {
+  if (!e) return e;
+  auto y = std::make_shared<Expr>(*e);
+  y->bound = false;
+  y->bt = y->bc = -1;
+  for (auto& a : y->args) a = cloneExpr(a);
+  for (auto& a : y->partBy) a = cloneExpr(a);
+  for (auto& o : y->winOrder) o.first = cloneExpr(o.first);
+  if (e->sub) y->sub = std::make_shared<Stmt>(*e->sub);  // statements are cloned again before use
+  return y;
+}
+
+Stmt cloneStmt(const Stmt& s) {
+  Stmt c = s;
+  for (auto& it : c.items) it.e = cloneExpr(it.e);
+  for (auto& f : c.from) {
+    f.on = cloneExpr(f.on);
+    if (f.sub) f.sub = std::make_shared<Stmt>(cloneStmt(*f.sub));
+  }
+  for (auto& j : c.joinConds) j = cloneExpr(j);
+  c.where = cloneExpr(c.where);
+  c.having = cloneExpr(c.having);
+  for (auto& g : c.groupBy) g = cloneExpr(g);
+  for (auto& o : c.orderBy) o.e = cloneExpr(o.e);
+  if (c.unionNext) c.unionNext = std::make_shared<Stmt>(cloneStmt(*c.unionNext));
+  for (auto& [n, q] : c.ctes) q = std::make_shared<Stmt>(cloneStmt(*q));
+  return c;
+}
+
+void walkStmtExprs(Stmt& s, const std::function<void(ExprP&)>& fn) {
+  for (auto& it : s.items) fn(it.e);
+  if (s.where) fn(s.where);
+  if (s.having) fn(s.having);
+  for (auto& j : s.joinConds) fn(j);
+  for (auto& f : s.from)
+    if (f.on) fn(f.on);
+  for (auto& g : s.groupBy) fn(g);
+  for (auto& o : s.orderBy) fn(o.e);
+}
+
+void formatRows(ResultSet& r) {
+  if (!r.typed) return;
+  for (auto& v : r.vals) {
+    std::vector<std::string> row;
+    for (auto& x : v) row.push_back(cell(x));
+    r.rows.push_back(std::move(row));
+  }
+  r.vals.clear();
+  r.typed = false;
+}
+
+std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string& hint) {
+  static std::atomic<int> seq{0};
+  std::string name = "__tmp" + std::to_string(++seq) + "_" + hint;
+  std::vector<ColumnMeta> cols;
+  std::set<std::string> seen;
+  for (size_t i = 0; i < r.names.size(); ++i) {
+    std::string n = r.names[i];
+    for (int k = 2; seen.count(lower(n)); ++k) n = r.names[i] + "_" + std::to_string(k);
+    seen.insert(lower(n));
+    ColumnMeta m;
+    m.name = n;
+    m.lt = i < r.types.size() ? r.types[i] : LType::VARCHAR;
+    if (m.lt == LType::DECIMAL) {  // the scale travels with the values (Value::scale); none known: DOUBLE
+      int sc = -1;
+      for (auto& row : r.vals)
+        if (i < row.size() && !row[i].isNull() && row[i].scale >= 0) sc = std::max(sc, (int)row[i].scale);
+      if (sc < 0) m.lt = LType::DOUBLE;
+      else m.scale = sc;
+    }
+    m.pt = physOf(m.lt);
+    cols.push_back(m);
+  }
+  if (cols.empty()) throw SqlError("derived table has no columns", 1105);
+  auto t = std::make_shared<Table>(name, cols, -1, -1, std::vector<int>{}, std::vector<int>{}, 1, false);
+  t->db = "__tmp";  // (before the rows: temporary tables stay out of the session's transaction)
+  if (!r.devCols.empty()) {  // built on the GPU: the columns become the table's one segment (no host copy)
+    const int64_t n = r.devRows;
+    const size_t nc = cols.size();
+    auto seg = std::make_unique<Segment>();
+    seg->part = 0;
+    seg->n = n;
+    seg->host.resize(nc);  // (filled on demand: Table::colData)
+    seg->dev.resize(nc, nullptr);
+    seg->mapped.assign(nc, 0);
+    seg->enc.assign(nc, 0);
+    seg->encHost.resize(nc);
+    seg->mn.resize(nc);
+    seg->mx.resize(nc);
+    for (size_t c = 0; c < nc; ++c) {
+      seg->dev[c] = r.devCols[c]->p;
+      r.devCols[c]->p = nullptr;
+      seg->mn[c] = r.devCols[c]->mn;
+      seg->mx[c] = r.devCols[c]->mx;
+      seg->devBytes += n * t->colBytes((int)c);
+      if (cols[c].lt == LType::VARCHAR) *t->dicts[c] = *r.colDicts[c];
+      t->hasNull[c] = 1;
+    }
+    seg->delHost.assign((size_t)(n + 31) / 32, 0);
+    seg->delDev = (uint32_t*)devAlloc(std::max<size_t>(4, seg->delHost.size() * 4));
+    if (!seg->delHost.empty()) h2d(seg->delDev, seg->delHost.data(), seg->delHost.size() * 4);
+    if (n > 0) t->segs.push_back(std::move(seg));
+    std::lock_guard<std::mutex> g(cat_.mu);
+    cat_.tables["__tmp." + lower(name)] = t;
+    q.temps.push_back("__tmp." + lower(name));
+    return "__tmp." + name;
+  }
+  if (!r.numCols.empty()) {  // numeric columns (a GROUP BY result): straight into the write buffer
+    const size_t n = r.numCols[0].size();
+    WriteBuffer& b = *t->bufs[0];
+    for (size_t c = 0; c < cols.size(); ++c) {
+      const ColumnMeta& m = cols[c];
+      if (m.lt == LType::VARCHAR) {  // dictionary codes: the column takes a copy of their dictionary
+        if (c >= r.colDicts.size() || !r.colDicts[c]) throw SqlError("internal: string column without a dictionary", 1105);
+        *t->dicts[c] = *r.colDicts[c];
+      }
+      const int sz = t->colBytes((int)c);
+      std::vector<uint8_t> bytes(n * sz);
+      std::atomic<bool> nul{false};
+      parallelFor(n, [&](size_t lo, size_t hi) {
+        for (size_t i = lo; i < hi; ++i) {
+          const double d = r.numCols[c][i];
+          if (m.pt == PType::F64) { memcpy(&bytes[i * 8], &d, 8); if (d != d) nul = true; continue; }
+          int64_t x = d != d ? (m.pt == PType::I64 ? kNullI64 : kNullI32) : std::llround(d);
+          if (d != d) nul = true;
+          if (m.pt == PType::I64) memcpy(&bytes[i * 8], &x, 8);
+          else { const int32_t y = (int32_t)x; memcpy(&bytes[i * 4], &y, 4); }
+        }
+      });
+      if (nul) t->hasNull[c] = 1;
+      b.cols[c] = std::move(bytes);
+    }
+    b.n = (int64_t)n;
+    b.del.assign((n + 31) / 32, 0);
+    ++b.version;
+    ++b.gen;
+    t->flush(true);
+    std::lock_guard<std::mutex> g(cat_.mu);
+    cat_.tables["__tmp." + lower(name)] = t;
+    q.temps.push_back("__tmp." + lower(name));
+    return "__tmp." + name;
+  }
+  bool bulk = true;
+  for (auto& c : cols) bulk = bulk && c.pt != PType::VEC;
+  if (bulk) {  // column by column straight into the write buffer (on all cores), then one flush
+    const size_t n = r.vals.size(), nc = cols.size();
+    WriteBuffer& b = *t->bufs[0];
+    for (size_t c = 0; c < nc; ++c) {
+      const ColumnMeta& m = cols[c];
+      const int sz = t->colBytes((int)c);
+      std::vector<uint8_t> bytes(n * sz);
+      std::atomic<bool> nul{false};
+      if (m.lt == LType::VARCHAR) {
+        Dict& d = *t->dicts[c];
+        for (size_t i = 0; i < n; ++i) {
+          const Value& v = r.vals[i][c];
+          int32_t code = kNullI32;
+          if (v.isNull()) nul = true;
+          else code = d.getOrAdd(v.kind == Value::STR ? v.s : v.toString());
+          memcpy(&bytes[i * 4], &code, 4);
+        }
+      } else {
+        const double unscale = m.lt == LType::DECIMAL ? pow10i(m.scale) : 1.0;
+        parallelFor(n, [&](size_t lo, size_t hi) {
+          for (size_t i = lo; i < hi; ++i) {
+            const Value& v = r.vals[i][c];
+            if (m.pt == PType::F64) {
+              const double d = v.isNull() ? nullv() : v.kind == Value::STR ? std::strtod(v.s.c_str(), nullptr) : v.num();
+              if (v.isNull()) nul = true;
+              memcpy(&bytes[i * 8], &d, 8);
+              continue;
+            }
+            int64_t x;
+            if (v.isNull()) {
+              nul = true;
+              x = m.pt == PType::I64 ? kNullI64 : kNullI32;
+            } else if (m.lt == LType::DECIMAL) {
+              x = std::llround(v.num() * unscale);
+            } else if (m.lt == LType::DATE && v.kind == Value::DATETIME) {
+              x = floorDiv(v.i, kUsPerDay);
+            } else if (m.lt == LType::DATETIME && v.kind == Value::DATE) {
+              x = v.i * kUsPerDay;
+            } else if (v.kind == Value::STR) {
+              x = std::strtoll(v.s.c_str(), nullptr, 10);
+            } else {
+              x = v.kind == Value::DBL ? std::llround(v.d) : v.i;
+            }
+            if (m.pt == PType::I64) memcpy(&bytes[i * 8], &x, 8);
+            else { const int32_t y = (int32_t)x; memcpy(&bytes[i * 4], &y, 4); }
+          }
+        });
+      }
+      if (nul) t->hasNull[c] = 1;
+      b.cols[c] = std::move(bytes);
+    }
+    b.n = (int64_t)n;
+    b.del.assign((n + 31) / 32, 0);
+    ++b.version;
+    ++b.gen;
+  } else {
+    for (auto& row : r.vals) t->appendRow(row);
+  }
+  t->flush(true);
+  std::lock_guard<std::mutex> g(cat_.mu);
+  cat_.tables["__tmp." + lower(name)] = t;
+  q.temps.push_back("__tmp." + lower(name));
+  return "__tmp." + name;
+}
+
+void Engine::dropTemps(QueryCtx& q) {
+  std::lock_guard<std::mutex> g(cat_.mu);
+  for (auto& k : q.temps) cat_.tables.erase(k);
+  q.temps.clear();
+}
+
+namespace {
+// Column names of a FROM entry (catalog tables only; derived tables unknown here).
+bool fromHasColumn(Catalog& cat, const Stmt& s, const std::string& col) {
+  for (auto& f : s.from) {
+    if (f.sub) continue;
+    std::shared_ptr<Table> t;
+    {
+      std::lock_guard<std::mutex> g(cat.mu);
+      auto it = cat.tables.find(Catalog::key(f.name));
+      if (it != cat.tables.end()) t = it->second;
+    }
+    if (t && t->colIndex(col) >= 0) return true;
+  }
+  return false;
+}
+bool fromHasAlias(const Stmt& s, const std::string& a) {
+  for (auto& f : s.from)
+    if (strcasecmp(f.alias.c_str(), a.c_str()) == 0 || strcasecmp(f.name.c_str(), a.c_str()) == 0) return true;
+  return false;
+}
+}  // namespace
+
+// Is alias a defined anywhere in s, including its derived tables and subqueries in FROM?
+static bool fromHasAliasDeep(const Stmt& s, const std::string& a) {
+  if (fromHasAlias(s, a)) return true;
+  for (auto& f : s.from)
+    if (f.sub && fromHasAliasDeep(*f.sub, a)) return true;
+  return s.unionNext && fromHasAliasDeep(*s.unionNext, a);
+}
+// Expressions of s and of the derived tables in its FROM (correlated references may sit in there).
+void walkStmtExprsDeep(Stmt& s, const std::function<void(ExprP&)>& fn) {
+  walkStmtExprs(s, fn);
+  for (auto& f : s.from)
+    if (f.sub) walkStmtExprsDeep(*f.sub, fn);
+  if (s.unionNext) walkStmtExprsDeep(*s.unionNext, fn);
+}
+
+// Does `col` (inside subquery `sub`) refer to the outer statement?
+static bool outerRef(Catalog& cat, const ExprP& col, const Stmt& sub, const Stmt& outer,
+                     const std::map<std::string, std::string>& ctes) {
+  if (col->kind != Expr::COL) return false;
+  if (!col->table.empty()) return !fromHasAliasDeep(sub, col->table) && fromHasAlias(outer, col->table);
+  // Unqualified: outer if no table of the subquery has it but an outer table does.
+  Stmt subR = sub;
+  for (auto& f : subR.from) {
+    auto it = ctes.find(lower(f.name));
+    if (it != ctes.end()) f.name = it->second;
+  }
+  for (auto& f : subR.from)
+    if (f.sub) return false;  // unknown columns: assume local
+  return !fromHasColumn(cat, subR, col->name) && fromHasColumn(cat, outer, col->name);
+}
+
+void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
+  auto correlated = [&](Stmt& sub) {
+    bool any = false;
+    std::function<void(const ExprP&)> scan = [&](const ExprP& e) {
+      if (!e || any) return;
+      if (outerRef(cat_, e, sub, s, q.ctes)) any = true;
+      for (auto& a : e->args) scan(a);
+    };
+    walkStmtExprsDeep(sub, [&](ExprP& e) { scan(e); });
+    return any;
+  };
+  // EXISTS (SELECT .. WHERE inner = outer AND ..) -> outer IN (SELECT inner FROM .. WHERE ..)
+  auto decorrelateExists = [&](ExprP& e) -> bool {
+    Stmt sub = cloneStmt(*e->sub);
+    std::vector<ExprP> conj;
+    std::function<void(const ExprP&)> flat = [&](const ExprP& x) {
+      if (x && x->kind == Expr::BIN && x->op == "AND") { flat(x->args[0]); flat(x->args[1]); }
+      else if (x) conj.push_back(x);
+    };
+    flat(sub.where);
+    ExprP outerCol, innerCol;
+    std::vector<ExprP> rest;
+    for (auto& c : conj) {
+      if (!outerCol && c->kind == Expr::BIN && c->op == "=" && c->args[0]->kind == Expr::COL && c->args[1]->kind == Expr::COL) {
+        bool o0 = outerRef(cat_, c->args[0], sub, s, q.ctes), o1 = outerRef(cat_, c->args[1], sub, s, q.ctes);
+        if (o0 != o1) {
+          outerCol = o0 ? c->args[0] : c->args[1];
+          innerCol = o0 ? c->args[1] : c->args[0];
+          continue;
+        }
+      }
+      rest.push_back(c);
+    }
+    if (!outerCol) return false;
+    ExprP w;
+    for (auto& r : rest) w = w ? mkBin("AND", w, r) : r;
+    sub.where = w;
+    sub.items = {SelectItem{innerCol, ""}};
+    sub.orderBy.clear();
+    sub.limit = -1;
+    if (correlated(sub)) return false;
+    auto in = std::make_shared<Expr>();
+    in->kind = Expr::INLIST;
+    in->args = {cloneExpr(outerCol)};
+    in->sub = std::make_shared<Stmt>(std::move(sub));
+    e = in;
+    return true;
+  };
+  // Any other correlated scalar subquery: evaluate it once per distinct combination of the outer
+  // columns it references (from the outer FROM), keep the results in a temporary table and LEFT JOIN
+  // it on those columns.
+  auto applyPerOuterValue = [&](ExprP& e) {
+    Stmt sub = cloneStmt(*e->sub);
+    std::vector<ExprP> outerCols;
+    std::set<std::string> seen;
+    std::function<void(const ExprP&)> collect = [&](const ExprP& x) {
+      if (!x) return;
+      if (x->kind == Expr::COL && outerRef(cat_, x, sub, s, q.ctes)) {
+        if (seen.insert(lower(x->table + "." + x->name)).second) outerCols.push_back(x);
+        return;
+      }
+      for (auto& a : x->args) collect(a);
+    };
+    walkStmtExprsDeep(sub, [&](ExprP& x) { collect(x); });
+    Stmt dq = cloneStmt(s);
+    dq.items.clear();
+    for (auto& c : outerCols) dq.items.push_back(SelectItem{cloneExpr(c), ""});
+    dq.distinct = true;
+    dq.where.reset();
+    dq.having.reset();
+    dq.groupBy.clear();
+    dq.orderBy.clear();
+    dq.limit = -1;
+    dq.offset = 0;
+    dq.unionNext.reset();
+    ResultSet keys = query(dq, q, false, true);
+    if (keys.vals.size() > 20000)
+      throw SqlError("correlated subquery: " + std::to_string(keys.vals.size()) + " distinct outer values (at most 20000)", 1235);
+    ResultSet tab;
+    tab.typed = true;
+    for (size_t k = 0; k < outerCols.size(); ++k) tab.names.push_back("__o" + std::to_string(k));
+    tab.types = keys.types;
+    tab.names.push_back("__v");
+    LType vt = LType::BIGINT;
+    for (auto& row : keys.vals) {
+      Stmt one = cloneStmt(sub);
+      std::function<void(ExprP&)> bindOuter = [&](ExprP& x) {
+        if (!x) return;
+        if (x->kind == Expr::COL && outerRef(cat_, x, sub, s, q.ctes)) {
+          const std::string key = lower(x->table + "." + x->name);
+          size_t k = 0;
+          while (k < outerCols.size() && lower(outerCols[k]->table + "." + outerCols[k]->name) != key) ++k;
+          x = mkLit(row[k]);
+          return;
+        }
+        for (auto& a : x->args) bindOuter(a);
+      };
+      walkStmtExprsDeep(one, bindOuter);
+      ResultSet r = query(one, q, false, true);
+      if (r.names.size() != 1) throw SqlError("Operand should contain 1 column(s)", 1241);
+      if (r.vals.size() > 1) throw SqlError("Subquery returns more than 1 row", 1242);
+      if (!r.types.empty()) vt = r.types[0];
+      std::vector<Value> out = row;
+      out.push_back(r.vals.empty() ? Value::Null() : r.vals[0][0]);
+      tab.vals.push_back(std::move(out));
+    }
+    tab.types.push_back(vt);
+    const std::string tmp = makeTemp(tab, q, "apply");
+    static std::atomic<int> sq{0};
+    const std::string alias = "__ap" + std::to_string(++sq);
+    TableRef ref;
+    ref.name = tmp;
+    ref.alias = alias;
+    ref.join = 1;
+    for (size_t k = 0; k < outerCols.size(); ++k) {
+      ExprP eq = mkBin("=", mkCol(alias, "__o" + std::to_string(k)), cloneExpr(outerCols[k]));
+      ref.on = ref.on ? mkBin("AND", ref.on, eq) : eq;
+    }
+    s.from.push_back(ref);
+    e = mkCol(alias, "__v");
+  };
+  std::function<void(ExprP&)> fix = [&](ExprP& e) {
+    if (!e) return;
+    for (auto& a : e->args) fix(a);
+    if (e->kind == Expr::SUBQUERY) {
+      Stmt sub = cloneStmt(*e->sub);
+      if (correlated(sub)) {
+        // (SELECT agg(x) FROM t2 WHERE t2.k = outer.k AND ..) -> LEFT JOIN (SELECT k, agg(x) .. GROUP BY k)
+        std::vector<ExprP> conj, rest;
+        std::function<void(const ExprP&)> flat = [&](const ExprP& x) {
+          if (x && x->kind == Expr::BIN && x->op == "AND") { flat(x->args[0]); flat(x->args[1]); }
+          else if (x) conj.push_back(x);
+        };
+        flat(sub.where);
+        std::vector<ExprP> outerCols, innerCols;  // every inner.col = outer.col equality
+        for (auto& c : conj) {
+          if (c->kind == Expr::BIN && c->op == "=" && c->args[0]->kind == Expr::COL && c->args[1]->kind == Expr::COL) {
+            bool o0 = outerRef(cat_, c->args[0], sub, s, q.ctes), o1 = outerRef(cat_, c->args[1], sub, s, q.ctes);
+            if (o0 != o1) {
+              outerCols.push_back(o0 ? c->args[0] : c->args[1]);
+              innerCols.push_back(o0 ? c->args[1] : c->args[0]);
+              continue;
+            }
+          }
+          rest.push_back(c);
+        }
+        if (outerCols.empty() || sub.items.size() != 1 || !sub.groupBy.empty()) {
+          applyPerOuterValue(e);
+          return;
+        }
+        ExprP w;
+        for (auto& r : rest) w = w ? mkBin("AND", w, r) : r;
+        sub.where = w;
+        ExprP item = sub.items[0].e;
+        // Aggregates (GPU and host ones) in the item: each becomes a column of the grouped derived
+        // table; the expression around them (COALESCE(COUNT(*), 0), ..) is evaluated after the LEFT
+        // JOIN, so outer rows without matches see the empty-set values (COUNT 0, others NULL).
+        std::vector<ExprP> aggs;
+        std::function<bool(const ExprP&)> anyAgg = [&](const ExprP& x) {
+          if (!x) return false;
+          if (x->kind == Expr::FUNC && !x->window && (isAggName(x->op) || isHostAggName(x->op))) return true;
+          for (auto& a : x->args)
+            if (anyAgg(a)) return true;
+          return false;
+        };
+        if (!anyAgg(item)) {  // plain value: one row per key expected; MAX keeps it single-valued
+          auto m = std::make_shared<Expr>();
+          m->kind = Expr::FUNC;
+          m->op = "MAX";
+          m->args = {item};
+          item = m;
+        }
+        static std::atomic<int> sq{0};
+        const std::string alias = "__sq" + std::to_string(++sq);
+        std::function<ExprP(const ExprP&)> lift = [&](const ExprP& x) -> ExprP {
+          if (x->kind == Expr::FUNC && !x->window && (isAggName(x->op) || isHostAggName(x->op))) {
+            const std::string col = "__a" + std::to_string(aggs.size());
+            aggs.push_back(x);
+            ExprP v = mkCol(alias, col);
+            if (x->op == "COUNT") {  // no matching rows: COUNT is 0, not NULL
+              auto f = std::make_shared<Expr>();
+              f->kind = Expr::FUNC;
+              f->op = "COALESCE";
+              f->args = {v, mkLit(Value::I(0))};
+              v = f;
+            }
+            return v;
+          }
+          auto y = std::make_shared<Expr>(*x);
+          for (auto& a : y->args) a = lift(a);
+          return y;
+        };
+        ExprP outerExpr = lift(item);
+        sub.items.clear();
+        sub.groupBy.clear();
+        for (size_t k = 0; k < innerCols.size(); ++k) {
+          sub.items.push_back(SelectItem{innerCols[k], "__k" + std::to_string(k)});
+          sub.groupBy.push_back(cloneExpr(innerCols[k]));
+        }
+        for (size_t k = 0; k < aggs.size(); ++k) sub.items.push_back(SelectItem{aggs[k], "__a" + std::to_string(k)});
+        sub.orderBy.clear();
+        sub.limit = -1;
+        if (correlated(sub)) {
+          applyPerOuterValue(e);
+          return;
+        }
+        TableRef ref;
+        ref.alias = alias;
+        ref.sub = std::make_shared<Stmt>(std::move(sub));
+        ref.join = 1;
+        for (size_t k = 0; k < outerCols.size(); ++k) {
+          ExprP eq = mkBin("=", mkCol(alias, "__k" + std::to_string(k)), cloneExpr(outerCols[k]));
+          ref.on = ref.on ? mkBin("AND", ref.on, eq) : eq;
+        }
+        s.from.push_back(ref);
+        e = outerExpr;
+        return;
+      }
+      ResultSet r = query(sub, q, false, true);
+      if (r.names.size() != 1) throw SqlError("Operand should contain 1 column(s)", 1241);
+      if (r.vals.size() > 1) throw SqlError("Subquery returns more than 1 row", 1242);
+      e = mkLit(r.vals.empty() ? Value::Null() : r.vals[0][0]);
+      return;
+    }
+    if (e->kind == Expr::FUNC && e->op == "EXISTS") {
+      Stmt sub = cloneStmt(*e->sub);
+      if (correlated(sub)) {
+        if (!decorrelateExists(e)) {
+          // EXISTS (.. WHERE <equalities with the outer query> AND inner.c <> outer.d AND <local filters>)
+          //   = COUNT(.. equalities, filters, c IS NOT NULL) - COUNT(.. equalities, filters, c = d) > 0
+          // (both equality-correlated counts, decorrelated into grouped LEFT JOINs).
+          std::vector<ExprP> conj;
+          std::function<void(const ExprP&)> flat = [&](const ExprP& x) {
+            if (x && x->kind == Expr::BIN && x->op == "AND") { flat(x->args[0]); flat(x->args[1]); }
+            else if (x) conj.push_back(x);
+          };
+          flat(sub.where);
+          ExprP neq;
+          std::vector<ExprP> keep;
+          bool ok = true;
+          for (auto& c : conj) {
+            bool corr = false;
+            std::function<void(const ExprP&)> chk = [&](const ExprP& x) {
+              if (!x) return;
+              if (x->kind == Expr::COL && outerRef(cat_, x, sub, s, q.ctes)) corr = true;
+              for (auto& a : x->args) chk(a);
+            };
+            chk(c);
+            const bool isEq = c->kind == Expr::BIN && c->op == "=" && c->args[0]->kind == Expr::COL && c->args[1]->kind == Expr::COL;
+            if (corr && !isEq) {
+              if (neq || !(c->kind == Expr::BIN && c->op == "<>" && c->args[0]->kind == Expr::COL && c->args[1]->kind == Expr::COL)) ok = false;
+              else neq = c;
+            } else {
+              keep.push_back(c);
+            }
+          }
+          if (!ok || !neq) throw SqlError("this correlated EXISTS subquery is not supported", 1235);
+          // EXISTS (.. inner.c <> outer.d ..) <=> MIN(c) <> d OR MAX(c) <> d over the rows matching the
+          // equalities and filters (if any c differs from d, the smallest or the largest does): one
+          // grouped derived table on the equality keys, LEFT JOINed, instead of a correlated scan.
+          const bool o0 = outerRef(cat_, neq->args[0], sub, s, q.ctes);
+          const ExprP inner = o0 ? neq->args[1] : neq->args[0], outer = o0 ? neq->args[0] : neq->args[1];
+          std::vector<ExprP> innerKeys, outerKeys, local;
+          for (auto& k : keep) {
+            const bool isEq = k->kind == Expr::BIN && k->op == "=" && k->args[0]->kind == Expr::COL && k->args[1]->kind == Expr::COL;
+            const bool a0 = isEq && outerRef(cat_, k->args[0], sub, s, q.ctes), a1 = isEq && outerRef(cat_, k->args[1], sub, s, q.ctes);
+            if (isEq && a0 != a1) {
+              outerKeys.push_back(a0 ? k->args[0] : k->args[1]);
+              innerKeys.push_back(a0 ? k->args[1] : k->args[0]);
+            } else {
+              local.push_back(k);
+            }
+          }
+          if (innerKeys.empty()) throw SqlError("this correlated EXISTS subquery is not supported (no equality with the outer query)", 1235);
+          Stmt ds = cloneStmt(sub);
+          ExprP w;
+          for (auto& l : local) w = w ? mkBin("AND", w, cloneExpr(l)) : cloneExpr(l);
+          ds.where = w;
+          ds.items.clear();
+          ds.groupBy.clear();
+          for (size_t k = 0; k < innerKeys.size(); ++k) {
+            ds.items.push_back(SelectItem{cloneExpr(innerKeys[k]), "__k" + std::to_string(k)});
+            ds.groupBy.push_back(cloneExpr(innerKeys[k]));
+          }
+          auto agg = [&](const char* fn) {
+            auto f = std::make_shared<Expr>();
+            f->kind = Expr::FUNC;
+            f->op = fn;
+            f->args = {cloneExpr(inner)};
+            return f;
+          };
+          ds.items.push_back(SelectItem{agg("MIN"), "__mn"});
+          ds.items.push_back(SelectItem{agg("MAX"), "__mx"});
+          ds.orderBy.clear();
+          ds.limit = -1;
+          if (correlated(ds)) throw SqlError("this correlated EXISTS subquery is not supported", 1235);
+          static std::atomic<int> ex{0};
+          const std::string alias = "__ex" + std::to_string(++ex);
+          TableRef ref;
+          ref.alias = alias;
+          ref.sub = std::make_shared<Stmt>(std::move(ds));
+          ref.join = 1;
+          for (size_t k = 0; k < outerKeys.size(); ++k) {
+            ExprP eq = mkBin("=", mkCol(alias, "__k" + std::to_string(k)), cloneExpr(outerKeys[k]));
+            ref.on = ref.on ? mkBin("AND", ref.on, eq) : eq;
+          }
+          s.from.push_back(ref);
+          ExprP differs = mkBin("OR", mkBin("<>", mkCol(alias, "__mn"), cloneExpr(outer)), mkBin("<>", mkCol(alias, "__mx"), cloneExpr(outer)));
+          auto co = std::make_shared<Expr>();
+          co->kind = Expr::FUNC;
+          co->op = "COALESCE";
+          co->args = {differs, mkLit(Value::I(0))};
+          e = co;
+          return;
+        }
+      } else {
+        sub.limit = 1;
+        ResultSet r = query(sub, q, false, true);
+        e = mkLit(Value::I(!r.vals.empty()));
+        return;
+      }
+    }
+    if (e->kind == Expr::INLIST && e->sub) {
+      Stmt sub = cloneStmt(*e->sub);
+      if (correlated(sub)) throw SqlError("correlated IN subqueries are not supported yet", 1235);
+      // Only the set of values matters: numbers come back as one raw array (no row objects).
+      tRawNumber = true;
+      ResultSet r;
+      try {
+        r = query(sub, q, false, true);
+      } catch (...) {
+        tRawNumber = false;
+        throw;
+      }
+      tRawNumber = false;
+      if (r.numCol) {
+        auto vals = r.numCol;
+        vals->erase(std::remove_if(vals->begin(), vals->end(), [](double v) { return v != v; }), vals->end());
+        const bool neg = e->neg;
+        if (vals->empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+        // Sorted distinct values: integers in a compact range through a bitmap (no sort), else a sort.
+        double lo = (*vals)[0], hi = lo;
+        bool integral = true;
+        for (double v : *vals) {
+          lo = std::min(lo, v), hi = std::max(hi, v);
+          integral = integral && v == std::floor(v);
+        }
+        if (integral && hi - lo < (double)(1 << 28)) {
+          const int64_t base = (int64_t)lo, span = (int64_t)(hi - lo) + 1;
+          std::vector<uint64_t> bits((size_t)(span + 63) / 64, 0);
+          for (double v : *vals) {
+            const int64_t k = (int64_t)v - base;
+            bits[(size_t)k >> 6] |= 1ull << (k & 63);
+          }
+          vals->clear();
+          for (size_t w = 0; w < bits.size(); ++w)
+            for (uint64_t b = bits[w]; b; b &= b - 1) vals->push_back((double)(base + (int64_t)(w * 64 + __builtin_ctzll(b))));
+        } else {
+          std::sort(vals->begin(), vals->end());
+          vals->erase(std::unique(vals->begin(), vals->end()), vals->end());
+        }
+        auto f = std::make_shared<Expr>();
+        f->kind = Expr::FUNC;
+        f->op = "#INSORTED";
+        f->args = {e->args[0]};
+        f->aux = vals;
+        if (neg) {
+          auto n = std::make_shared<Expr>();
+          n->kind = Expr::UNARY;
+          n->op = "NOT";
+          n->args = {f};
+          e = n;
+        } else {
+          e = f;
+        }
+        return;
+      }
+      if (r.names.size() != 1) throw SqlError("Operand should contain 1 column(s)", 1241);
+      const bool neg = e->neg;
+      ExprP x = e->args[0];
+      if (r.types[0] == LType::VARCHAR) {
+        std::set<std::string> vs;
+        for (auto& row : r.vals)
+          if (!row[0].isNull()) vs.insert(row[0].toString());
+        if (vs.empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+        e->args = {x};
+        for (auto& v : vs) e->args.push_back(mkLit(Value::S(v)));
+        e->sub.reset();
+        return;
+      }
+      auto vals = std::make_shared<std::vector<double>>();
+      for (auto& row : r.vals)
+        if (!row[0].isNull()) vals->push_back(numOf(row[0]));
+      if (vals->empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+      std::sort(vals->begin(), vals->end());
+      vals->erase(std::unique(vals->begin(), vals->end()), vals->end());
+      auto f = std::make_shared<Expr>();
+      f->kind = Expr::FUNC;
+      f->op = "#INSORTED";
+      f->args = {x};
+      f->aux = vals;
+      if (neg) {
+        auto n = std::make_shared<Expr>();
+        n->kind = Expr::UNARY;
+        n->op = "NOT";
+        n->args = {f};
+        e = n;
+      } else {
+        e = f;
+      }
+    }
+  };
+  walkStmtExprs(s, fix);
+}
+
+
+// SUM(x + c) / SUM(x - c) / SUM(c + x) -> SUM(x) +/- c * COUNT(x) (exact, NULLs included): many such
+// aggregates over one column (ClickBench Q30) collapse to two.
+static void rewriteSumOffsets(Stmt& s) {
+  std::function<ExprP(const ExprP&)> rw = [&](const ExprP& e) -> ExprP {
+    if (!e) return e;
+    if (e->kind == Expr::FUNC && e->op == "SUM" && !e->window && !e->distinct && e->args.size() == 1 &&
+        e->args[0]->kind == Expr::BIN && (e->args[0]->op == "+" || e->args[0]->op == "-")) {
+      const ExprP& a = e->args[0]->args[0];
+      const ExprP& b = e->args[0]->args[1];
+      auto numLit = [](const ExprP& x) { return x->kind == Expr::LIT && (x->lit.kind == Value::INT || x->lit.kind == Value::DBL) && !x->lit.isNull(); };
+      const bool cRight = numLit(b) && !numLit(a), cLeft = e->args[0]->op == "+" && numLit(a) && !numLit(b);
+      if (cRight || cLeft) {
+        const ExprP x = cRight ? a : b, c = cRight ? b : a;
+        auto sum = std::make_shared<Expr>();
+        sum->kind = Expr::FUNC;
+        sum->op = "SUM";
+        sum->args = {x};
+        auto cnt = std::make_shared<Expr>();
+        cnt->kind = Expr::FUNC;
+        cnt->op = "COUNT";
+        cnt->args = {x};
+        return mkBin(e->args[0]->op, sum, mkBin("*", c, cnt));
+      }
+    }
+    for (auto& a : e->args) a = rw(a);
+    return e;
+  };
+  for (auto& it : s.items) {
+    ExprP n = rw(it.e);
+    if (n != it.e && it.alias.empty()) it.alias = it.e->str();
+    it.e = n;
+  }
+  s.having = rw(s.having);
+  for (auto& o : s.orderBy) o.e = rw(o.e);
+}
+
+// A derived table that only projects and filters one base table is merged into the outer query:
+// no temporary table, and (on a cluster aggregator) the outer aggregation can run on the leaves.
+void Engine::flattenDerived(Stmt& s) {
+  while (s.from.size() == 1 && s.from[0].sub && s.joinConds.empty()) {
+    Stmt& in = *s.from[0].sub;
+    if (in.type != Stmt::SELECT || in.from.size() != 1 || in.from[0].sub || in.from[0].join || !in.joinConds.empty() ||
+        !in.groupBy.empty() || in.having || in.distinct || in.limit >= 0 || in.unionNext || !in.ctes.empty() || in.items.empty() ||
+        !cat_.find(in.from[0].name))
+      return;
+    std::function<bool(const ExprP&)> complex = [&](const ExprP& e) -> bool {
+      if (!e) return false;
+      if (e->kind == Expr::STAR || e->sub || e->kind == Expr::SUBQUERY || e->window || hasAgg(e)) return true;
+      for (auto& a : e->args)
+        if (complex(a)) return true;
+      return false;
+    };
+    std::map<std::string, ExprP> byName;
+    for (auto& it : in.items) {
+      if (complex(it.e)) return;
+      const std::string n = lower(!it.alias.empty() ? it.alias : it.e->kind == Expr::COL ? it.e->name : it.e->str());
+      if (byName.count(n)) return;  // duplicate output names: leave it to the general path
+      byName[n] = it.e;
+    }
+    std::set<std::string> outAliases;
+    bool star = false;
+    for (auto& it : s.items) {
+      star = star || it.e->kind == Expr::STAR;
+      if (!it.alias.empty()) outAliases.insert(lower(it.alias));
+    }
+    if (star) return;
+    const std::string alias = s.from[0].alias;
+    bool unknown = false;
+    std::function<void(ExprP&, bool)> rw = [&](ExprP& e, bool orderLevel) {
+      if (!e) return;
+      if (e->kind == Expr::COL && (e->table.empty() || strcasecmp(e->table.c_str(), alias.c_str()) == 0)) {
+        if (orderLevel && e->table.empty() && outAliases.count(lower(e->name))) return;  // a select-list alias
+        auto it = byName.find(lower(e->name));
+        if (it == byName.end()) { unknown = true; return; }
+        e = cloneExpr(it->second);
+        return;
+      }
+      if (e->sub) unknown = true;  // correlated references into the derived table: keep it
+      for (auto& a : e->args) rw(a, false);
+    };
+    Stmt merged = cloneStmt(s);
+    for (auto& it : merged.items) {
+      if (it.alias.empty()) it.alias = it.e->kind == Expr::COL ? it.e->name : it.e->str();
+      rw(it.e, false);
+    }
+    rw(merged.where, false);
+    rw(merged.having, true);
+    for (auto& g : merged.groupBy) rw(g, true);
+    for (auto& o : merged.orderBy) rw(o.e, true);
+    if (unknown) return;
+    if (in.where) merged.where = merged.where ? mkBin("AND", cloneExpr(in.where), merged.where) : cloneExpr(in.where);
+    merged.from = {in.from[0]};
+    s = std::move(merged);
+  }
+}
+
+// (a AND b AND x) OR (a AND b AND y) -> a AND b AND (x OR y): conditions every OR branch repeats
+// (typically the join equality, TPC-H Q19) become plain conjuncts the planner can join on.
+ExprP factorOr(const ExprP& e) {
+  if (!e) return e;
+  if (e->kind == Expr::BIN && e->op == "AND") {
+    auto y = std::make_shared<Expr>(*e);
+    y->args = {factorOr(e->args[0]), factorOr(e->args[1])};
+    return y;
+  }
+  if (!(e->kind == Expr::BIN && e->op == "OR")) return e;
+  std::vector<ExprP> branches;
+  std::function<void(const ExprP&)> ors = [&](const ExprP& x) {
+    if (x->kind == Expr::BIN && x->op == "OR") { ors(x->args[0]); ors(x->args[1]); }
+    else branches.push_back(x);
+  };
+  ors(e);
+  std::vector<std::vector<ExprP>> conj(branches.size());
+  for (size_t i = 0; i < branches.size(); ++i) {
+    std::function<void(const ExprP&)> ands = [&](const ExprP& x) {
+      if (x->kind == Expr::BIN && x->op == "AND") { ands(x->args[0]); ands(x->args[1]); }
+      else conj[i].push_back(x);
+    };
+    ands(branches[i]);
+  }
+  std::vector<ExprP> common;
+  for (auto& c : conj[0]) {
+    const std::string k = c->str();
+    bool all = true;
+    for (size_t i = 1; i < conj.size() && all; ++i)
+      all = std::any_of(conj[i].begin(), conj[i].end(), [&](const ExprP& x) { return x->str() == k; });
+    if (all && std::none_of(common.begin(), common.end(), [&](const ExprP& x) { return x->str() == k; })) common.push_back(c);
+  }
+  if (common.empty()) return e;
+  ExprP rest;
+  bool anyEmpty = false;
+  for (auto& cs : conj) {
+    ExprP b;
+    for (auto& c : cs)
+      if (std::none_of(common.begin(), common.end(), [&](const ExprP& x) { return x->str() == c->str(); })) b = b ? mkBin("AND", b, c) : c;
+    if (!b) anyEmpty = true;
+    else rest = rest ? mkBin("OR", rest, b) : b;
+  }
+  ExprP out;
+  for (auto& c : common) out = out ? mkBin("AND", out, c) : c;
+  if (!anyEmpty && rest) out = mkBin("AND", out, rest);  // (a branch that was only common terms: OR is true)
+  return out;
+}
+
+// ROLLUP / CUBE / GROUPING SETS: one GROUP BY per set (keys outside the set are NULL there,
+// GROUPING(k) is 1 for them), concatenated with UNION ALL; ORDER BY / LIMIT apply to the whole.
+ResultSet Engine::groupingSetsQuery(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  for (auto& it : s.items)
+    if (it.alias.empty()) it.alias = it.e->kind == Expr::COL ? it.e->name : it.e->str();
+  std::vector<OrderItem> outerOrder;
+  for (auto& o : s.orderBy) {
+    int pos = -1;
+    if (o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT) pos = (int)o.e->lit.i;
+    for (size_t i = 0; i < s.items.size() && pos < 0; ++i)
+      if ((o.e->kind == Expr::COL && o.e->table.empty() && strcasecmp(o.e->name.c_str(), s.items[i].alias.c_str()) == 0) ||
+          o.e->str() == s.items[i].e->str())
+        pos = (int)i + 1;
+    if (pos < 0) throw SqlError("ORDER BY with ROLLUP / CUBE / GROUPING SETS must name a select-list column", 1235);
+    outerOrder.push_back({mkLit(Value::I(pos)), o.desc});
+  }
+  auto sets = s.groupingSets;
+  std::stable_sort(sets.begin(), sets.end(), [](const auto& a, const auto& b) { return a.size() > b.size(); });
+  std::shared_ptr<Stmt> head;
+  Stmt* last = nullptr;
+  for (auto& set : sets) {
+    auto b = std::make_shared<Stmt>(cloneStmt(s));
+    b->groupingSets.clear();
+    b->orderBy.clear();
+    b->limit = -1;
+    b->offset = 0;
+    b->groupBy.clear();
+    std::vector<std::string> in, out;
+    for (size_t i = 0; i < s.groupBy.size(); ++i) {
+      const bool keep = std::find(set.begin(), set.end(), (int)i) != set.end();
+      (keep ? in : out).push_back(s.groupBy[i]->str());
+      if (keep) b->groupBy.push_back(cloneExpr(s.groupBy[i]));
+    }
+    std::function<void(ExprP&)> rw = [&](ExprP& e) {
+      if (!e) return;
+      if (e->kind == Expr::FUNC && upper(e->op) == "GROUPING" && e->args.size() == 1) {
+        const std::string k = e->args[0]->str();
+        e = mkLit(Value::I(std::find(out.begin(), out.end(), k) != out.end() ? 1 : 0));
+        return;
+      }
+      if (e->kind == Expr::FUNC && (isAggName(e->op) || isHostAggName(e->op))) return;  // aggregates keep their arguments
+      if (std::find(out.begin(), out.end(), e->str()) != out.end()) {
+        e = mkLit(Value::Null());
+        return;
+      }
+      for (auto& a : e->args) rw(a);
+    };
+    for (auto& it : b->items) rw(it.e);
+    rw(b->having);
+    if (!head) head = b;
+    else {
+      last->unionNext = b;
+      last->unionAll = true;
+    }
+    last = b.get();
+  }
+  Stmt outer;
+  outer.type = Stmt::SELECT;
+  auto star = std::make_shared<Expr>();
+  star->kind = Expr::STAR;
+  outer.items = {SelectItem{star, ""}};
+  TableRef ref;
+  ref.alias = "__gs";
+  ref.sub = head;
+  outer.from = {ref};
+  outer.orderBy = outerOrder;
+  outer.limit = s.limit;
+  outer.offset = s.offset;
+  return query(outer, q, explain, typed);
+}
+
+std::shared_ptr<Stmt> tvfStatement(const std::string& name, const std::vector<ExprP>& args);  // proc.cpp
+void Engine::expandTableFunctions(Stmt& s) {
+  for (auto& f : s.from)
+    if (f.tvf) {
+      f.sub = tvfStatement(f.name, f.tvfArgs);
+      f.tvf = false;
+      f.tvfArgs.clear();
+      f.name.clear();
+    }
+}
+
+void Engine::resolveNaturalJoins(Stmt& s) {
+  auto colsOf = [&](const TableRef& f) {
+    std::vector<std::string> out;
+    if (f.sub) {
+      for (auto& it : f.sub->items) out.push_back(it.alias.empty() ? it.e->name : it.alias);
+    } else if (auto t = cat_.find(f.name)) {
+      for (auto& c : t->cols) out.push_back(c.name);
+    }
+    return out;
+  };
+  for (size_t i = 1; i < s.from.size(); ++i) {
+    if (!s.from[i].natural) continue;
+    s.from[i].natural = false;
+    ExprP cond;
+    for (auto& c : colsOf(s.from[i]))
+      for (size_t k = 0; k < i; ++k) {
+        auto ck = colsOf(s.from[k]);
+        if (std::none_of(ck.begin(), ck.end(), [&](const std::string& x) { return strcasecmp(x.c_str(), c.c_str()) == 0; })) continue;
+        ExprP eq = mkBin("=", mkCol(s.from[k].alias, c), mkCol(s.from[i].alias, c));
+        cond = cond ? mkBin("AND", cond, eq) : eq;
+        s.from[i].usingCols.push_back(c);
+        break;
+      }
+    if (!cond) continue;  // no shared columns: a cross join
+    if (s.from[i].join == 0) s.joinConds.push_back(cond);
+    else s.from[i].on = cond;
+  }
+}
+
+// [LEFT] JOIN LATERAL (SELECT a, b ..) x ON TRUE, where the subquery yields at most one row (an
+// aggregate, LIMIT 1: what ORMs such as Drizzle generate for relations): every x.a becomes the
+// correlated scalar subquery (SELECT a ..), evaluated once per distinct outer value.
+static void rewriteLateral(Stmt& s) {
+  for (size_t i = 0; i < s.from.size(); ++i) {
+    TableRef& f = s.from[i];
+    if (!f.lateral || !f.sub) continue;
+    const bool onTrue = !f.on || (f.on->kind == Expr::LIT && !f.on->lit.isNull() && f.on->lit.num() != 0);
+    if (!onTrue || f.join >= 2) throw SqlError("LATERAL derived tables are supported with ON TRUE (inner or LEFT JOIN)", 1235);
+    std::map<std::string, ExprP> repl;
+    for (auto& it : f.sub->items) {
+      if (it.e->kind == Expr::STAR) throw SqlError("SELECT * in a LATERAL derived table is not supported", 1235);
+      Stmt one = cloneStmt(*f.sub);
+      one.items = {SelectItem{cloneExpr(it.e), it.alias}};
+      auto q = std::make_shared<Expr>();
+      q->kind = Expr::SUBQUERY;
+      q->sub = std::make_shared<Stmt>(std::move(one));
+      repl[lower(!it.alias.empty() ? it.alias : it.e->kind == Expr::COL ? it.e->name : it.e->str())] = q;
+    }
+    const std::string alias = lower(f.alias);
+    std::function<void(ExprP&)> fix = [&](ExprP& e) {
+      if (!e) return;
+      if (e->kind == Expr::COL && lower(e->table) == alias) {
+        auto it = repl.find(lower(e->name));
+        if (it == repl.end()) throw SqlError("Unknown column '" + e->table + "." + e->name + "' in 'field list'", 1054);
+        auto c = std::make_shared<Expr>(*it->second);
+        c->sub = std::make_shared<Stmt>(cloneStmt(*it->second->sub));
+        e = c;
+        return;
+      }
+      for (auto& a : e->args) fix(a);
+    };
+    s.from.erase(s.from.begin() + i);
+    --i;
+    walkStmtExprs(s, fix);
+  }
+}
+
+// A single-table query whose WHERE / GROUP BY / aggregates use expressions the GPU can't run (host
+// functions over several columns, ..) runs again as
+//   SELECT .. FROM (SELECT *, f(a, b) AS __e0, .. FROM t WHERE ..) AS t GROUP BY .. :
+// the inner query filters and evaluates them on the host over the rows the GPU produces.
+static bool hostRewrite(const Stmt& s, Stmt& out) {
+  if (s.from.empty() || s.unionNext || !s.groupingSets.empty() || !s.ctes.empty()) return false;
+  for (auto& f : s.from)
+    if (f.tvf) return false;
+  const bool multi = s.from.size() > 1 || !s.joinConds.empty();
+  out = cloneStmt(s);
+  const std::string alias = multi ? std::string("__hj") : s.from[0].alias.empty() ? s.from[0].name : s.from[0].alias;
+  auto inner = std::make_shared<Stmt>();
+  inner->type = Stmt::SELECT;
+  auto star = std::make_shared<Expr>();
+  star->kind = Expr::STAR;
+  if (!multi) inner->items.push_back(SelectItem{star, ""});
+  inner->from = out.from;
+  inner->joinConds = out.joinConds;
+  out.joinConds.clear();
+  std::map<std::string, std::string> done;
+  std::function<bool(const ExprP&)> hasCol = [&](const ExprP& x) {
+    if (!x) return false;
+    if (x->kind == Expr::COL) return true;
+    for (auto& a : x->args)
+      if (hasCol(a)) return true;
+    return false;
+  };
+  std::function<bool(const ExprP&)> hasColFunc = [&](const ExprP& x) {
+    if (!x || x->kind == Expr::SUBQUERY) return false;
+    if (x->kind == Expr::FUNC && !isAgg(x) && hasCol(x)) return true;
+    for (auto& a : x->args)
+      if (hasColFunc(a)) return true;
+    return false;
+  };
+  // Joins can't filter on the host: conjuncts with functions of columns move to the outer query.
+  ExprP outerWhere;
+  if (multi && out.where) {
+    std::vector<ExprP> conj;
+    std::function<void(const ExprP&)> split = [&](const ExprP& x) {
+      if (x->kind == Expr::BIN && x->op == "AND") { split(x->args[0]); split(x->args[1]); }
+      else conj.push_back(x);
+    };
+    split(out.where);
+    ExprP in;
+    for (auto& x : conj) {
+      ExprP& dst = hasColFunc(x) ? outerWhere : in;
+      dst = dst ? mkBin("AND", dst, x) : x;
+    }
+    inner->where = in;
+  } else if (!multi) {
+    inner->where = out.where;
+  }
+  if (multi) {  // (inner join conditions may hold WHERE conjuncts too)
+    std::vector<ExprP> keep;
+    for (auto& j : inner->joinConds) {
+      if (hasColFunc(j)) outerWhere = outerWhere ? mkBin("AND", outerWhere, j) : j;
+      else keep.push_back(j);
+    }
+    inner->joinConds = keep;
+  }
+  out.where = outerWhere;
+  std::function<void(ExprP&)> lift = [&](ExprP& x) {
+    if (!x || x->kind == Expr::SUBQUERY) return;
+    if (x->kind == Expr::FUNC && !isAgg(x) && !hasAgg(x) && hasCol(x)) {
+      const std::string k = x->str();
+      auto it = done.find(k);
+      if (it == done.end()) {
+        it = done.emplace(k, "__e" + std::to_string(done.size())).first;
+        inner->items.push_back(SelectItem{x, it->second});
+      }
+      auto c = std::make_shared<Expr>();
+      c->kind = Expr::COL;
+      c->name = it->second;
+      c->table = alias;
+      x = c;
+      return;
+    }
+    for (auto& a : x->args) lift(a);
+  };
+  for (auto& it : out.items) {
+    const bool bare = it.alias.empty() && it.e && it.e->kind == Expr::FUNC && !isAgg(it.e);
+    const std::string name = it.e ? it.e->str() : "";
+    lift(it.e);
+    if (bare) it.alias = name;  // keep the column header
+  }
+  for (auto& g : out.groupBy) lift(g);
+  lift(out.having);
+  lift(out.where);
+  for (auto& o : out.orderBy) lift(o.e);
+  if (done.empty() && !inner->where) return false;
+  if (multi) {  // the join's columns the outer query still uses, each under a unique name
+    std::map<std::string, std::string> cols;
+    std::set<std::string> itemAliases;  // GROUP BY / ORDER BY / HAVING may name select items
+    for (auto& it : out.items)
+      if (!it.alias.empty()) itemAliases.insert(lower(it.alias));
+    bool star = false;
+    std::function<void(ExprP&)> mapCols = [&](ExprP& x) {
+      if (!x || x->kind == Expr::SUBQUERY) return;
+      if (x->kind == Expr::STAR) return;  // COUNT(*) (a SELECT * item is checked below)
+      if (x->kind == Expr::COL && x->table.empty() && itemAliases.count(lower(x->name))) return;
+      if (x->kind == Expr::COL && x->table != alias) {
+        const std::string k = (x->table.empty() ? "" : x->table + ".") + x->name;
+        auto it = cols.find(k);
+        if (it == cols.end()) {
+          it = cols.emplace(k, "__c" + std::to_string(cols.size())).first;
+          auto src = std::make_shared<Expr>(*x);
+          inner->items.push_back(SelectItem{src, it->second});
+        }
+        const std::string orig = x->name;
+        auto c = std::make_shared<Expr>();
+        c->kind = Expr::COL;
+        c->name = it->second;
+        c->table = alias;
+        x = c;
+        return;
+      }
+      for (auto& a : x->args) mapCols(a);
+    };
+    for (auto& it : out.items) {
+      if (it.e && it.e->kind == Expr::STAR) star = true;
+      if (it.e && it.e->kind == Expr::COL && it.alias.empty()) it.alias = it.e->name;  // keep the column header
+      mapCols(it.e);
+    }
+    for (auto& g : out.groupBy) mapCols(g);
+    mapCols(out.having);
+    mapCols(out.where);
+    for (auto& o : out.orderBy) mapCols(o.e);
+    if (star) return false;
+    if (inner->items.empty()) inner->items.push_back(SelectItem{std::make_shared<Expr>(Expr{}), ""}), inner->items.back().e->kind = Expr::LIT;
+  }
+  TableRef d;
+  d.sub = inner;
+  d.alias = alias;
+  out.from = {d};
+  return true;
+}
+
+ResultSet Engine::query(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  thread_local int tQueryDepth = 0;
+  if (tQueryDepth == 0) cudaMemsetAsync(ovfFlagDev(), 0, sizeof(int), 0);
+  ++tQueryDepth;
+  struct QD { ~QD() { --tQueryDepth; } } qd;
+  if (tQueryDepth == 1) {  // the outermost query: compiled int64 arithmetic that overflowed is an error (MySQL)
+    ResultSet r = queryRetry(s, q, explain, typed);
+    int ovf = 0;
+    cudaMemcpy(&ovf, ovfFlagDev(), sizeof(int), cudaMemcpyDeviceToHost);
+    if (ovf) throw SqlError("BIGINT value is out of range", 1690);
+    return r;
+  }
+  return queryRetry(s, q, explain, typed);
+}
+
+ResultSet Engine::queryRetry(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  thread_local int tHostRewrite = 0;
+  Stmt orig;
+  const bool canRetry = !explain && tHostRewrite == 0 && !s.from.empty() && !s.unionNext;
+  if (canRetry) orig = cloneStmt(s);
+  try {
+    return queryImpl(s, q, explain, typed);
+  } catch (SqlError& e) {
+    Stmt re;
+    if (!canRetry || e.code != 1235 || !hostRewrite(orig, re)) throw;
+    ++tHostRewrite;
+    struct Dec { int& n; ~Dec() { --n; } } dec{tHostRewrite};
+    return queryImpl(re, q, explain, typed);
+  }
+}
+
+ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  // tRawNumber applies to this statement's own projection only, not to the queries run on the way.
+  const bool rawNumber = tRawNumber && !s.unionNext && !explain, columnar = tColumnar && !s.unionNext && !explain;
+  tRawNumber = tColumnar = false;
+  struct RawRestore {
+    bool v;
+    ~RawRestore() { tRawNumber = tColumnar = false; }
+  } rawRestore{rawNumber};
+  expandTableFunctions(s);
+  if (!s.groupingSets.empty()) return groupingSetsQuery(s, q, explain, typed);
+  rewriteLateral(s);
+  resolveNaturalJoins(s);
+  flattenDerived(s);
+  s.where = factorOr(s.where);
+  for (auto& j : s.joinConds) j = factorOr(j);
+  rewriteSumOffsets(s);
+  auto savedCtes = q.ctes;
+  struct Restore {
+    QueryCtx& q;
+    std::map<std::string, std::string> saved;
+    ~Restore() { q.ctes = saved; }
+  } restore{q, savedCtes};
+  for (auto& [name, cs] : s.ctes) {
+    // WITH RECURSIVE: anchor UNION [ALL] parts that reference the CTE itself, iterated to a fixpoint.
+    bool recursive = false;
+    for (Stmt* p = cs->unionNext.get(); p && !recursive; p = p->unionNext.get())
+      for (auto& f : p->from) recursive |= !f.sub && strcasecmp(f.name.c_str(), name.c_str()) == 0;
+    if (!recursive) {
+      Stmt c = cloneStmt(*cs);
+      ResultSet r = query(c, q, false, true);
+      q.ctes[lower(name)] = makeTemp(r, q, name);
+      continue;
+    }
+    Stmt anchor = cloneStmt(*cs);
+    anchor.unionNext.reset();
+    const bool all = cs->unionAll;
+    ResultSet acc = query(anchor, q, false, true);
+    std::set<std::string> seen;
+    auto key = [](const std::vector<Value>& v) {
+      std::string k;
+      for (auto& x : v) k += (x.isNull() ? std::string("\x02") : x.toString()) + '\x1f';
+      return k;
+    };
+    if (!all) {
+      std::vector<std::vector<Value>> u;
+      for (auto& v : acc.vals)
+        if (seen.insert(key(v)).second) u.push_back(v);
+      acc.vals.swap(u);
+    }
+    ResultSet delta = acc;
+    for (int iter = 0; iter < 1000 && !delta.vals.empty(); ++iter) {
+      q.ctes[lower(name)] = makeTemp(delta, q, name);
+      Stmt rec = cloneStmt(*cs->unionNext);
+      ResultSet r = query(rec, q, false, true);
+      delta.vals.clear();
+      for (auto& v : r.vals)
+        if (all || seen.insert(key(v)).second) delta.vals.push_back(v);
+      for (auto& v : delta.vals) acc.vals.push_back(v);
+      if (iter == 999) throw SqlError("Recursive query aborted after 1000 iterations", 3636);
+    }
+    q.ctes[lower(name)] = makeTemp(acc, q, name);
+  }
+  if (s.unionNext) {
+    std::vector<Stmt*> parts;
+    for (Stmt* p = &s; p; p = p->unionNext.get()) parts.push_back(p);
+    bool dedupe = false;
+    for (size_t i = 0; i + 1 < parts.size(); ++i) dedupe |= !parts[i]->unionAll || parts[i]->setOp != 0;
+    auto rowKey = [](const std::vector<Value>& v) {
+      std::string k;
+      for (auto& x : v) k += (x.isNull() ? std::string("\x02") : x.toString()) + '\x1f';
+      return k;
+    };
+    ResultSet out;
+    out.isResult = true;
+    out.typed = true;
+    for (size_t i = 0; i < parts.size(); ++i) {
+      Stmt ps = cloneStmt(*parts[i]);
+      ps.unionNext.reset();
+      ps.ctes.clear();
+      if (i == 0 && s.unionOrder) {
+        ps.orderBy.clear();
+        ps.limit = -1;
+        ps.offset = 0;
+      }
+      ResultSet r = query(ps, q, false, true);
+      if (i == 0) {
+        out.names = r.names;
+        out.types = r.types;
+      } else {
+        if (r.names.size() != out.names.size())
+          throw SqlError("The used SELECT statements have a different number of columns", 1222);
+        for (size_t c = 0; c < out.types.size(); ++c) {
+          LType a = out.types[c], b = r.types[c];
+          if (a == b) continue;
+          bool na = a == LType::INT || a == LType::BIGINT || a == LType::DOUBLE, nb = b == LType::INT || b == LType::BIGINT || b == LType::DOUBLE;
+          out.types[c] = na && nb ? (a == LType::DOUBLE || b == LType::DOUBLE ? LType::DOUBLE : LType::BIGINT) : LType::VARCHAR;
+        }
+      }
+      const int op = i == 0 ? 0 : parts[i - 1]->setOp;
+      if (op == 0) {
+        for (auto& v : r.vals) out.vals.push_back(std::move(v));
+      } else {  // INTERSECT / EXCEPT against the rows accumulated so far
+        std::set<std::string> other;
+        for (auto& v : r.vals) other.insert(rowKey(v));
+        std::vector<std::vector<Value>> keep;
+        for (auto& v : out.vals)
+          if ((other.count(rowKey(v)) > 0) == (op == 1)) keep.push_back(std::move(v));
+        out.vals.swap(keep);
+      }
+    }
+    if (dedupe) {
+      std::set<std::string> seen;
+      std::vector<std::vector<Value>> keep;
+      for (auto& v : out.vals) {
+        std::string k;
+        for (auto& x : v) k += (x.isNull() ? std::string("\x02") : x.toString()) + '\x1f';
+        if (seen.insert(k).second) keep.push_back(std::move(v));
+      }
+      out.vals.swap(keep);
+    }
+    if (!s.orderBy.empty()) {
+      std::vector<std::pair<int, bool>> keys;
+      for (auto& o : s.orderBy) {
+        int idx = -1;
+        if (o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT) idx = (int)o.e->lit.i - 1;
+        else if (o.e->kind == Expr::COL)
+          for (size_t c = 0; c < out.names.size(); ++c)
+            if (strcasecmp(out.names[c].c_str(), o.e->name.c_str()) == 0) idx = (int)c;
+        if (idx < 0 || idx >= (int)out.names.size()) throw SqlError("Unknown column '" + o.e->str() + "' in 'order clause'", 1054);
+        keys.push_back({idx, o.desc});
+      }
+      std::stable_sort(out.vals.begin(), out.vals.end(), [&](const std::vector<Value>& a, const std::vector<Value>& b) {
+        for (auto& [i, d] : keys) {
+          int c = cmpVal(a[i], b[i]);
+          if (c) return d ? c > 0 : c < 0;
+        }
+        return false;
+      });
+    }
+    if (s.offset > 0 || s.limit >= 0) {
+      size_t st = std::min<size_t>(s.offset, out.vals.size());
+      size_t en = s.limit < 0 ? out.vals.size() : std::min<size_t>(out.vals.size(), st + s.limit);
+      out.vals = std::vector<std::vector<Value>>(out.vals.begin() + st, out.vals.begin() + en);
+    }
+    if (!typed) formatRows(out);
+    return out;
+  }
+  // FROM: derived tables, CTE references, views and information_schema become temp tables.
+  auto resolveFrom = [&]() {
+  for (auto& f : s.from) {
+    if (!f.sub && !q.ctes.count(lower(f.name))) {
+      if (lower(f.name).rfind("information_schema.", 0) == 0 || (lower(currentDb()) == "information_schema" && f.name.find('.') == std::string::npos)) {
+        ResultSet r = infoSchema(plainName(f.name));
+        f.name = makeTemp(r, q, "is_" + plainName(f.name));
+        continue;
+      }
+      std::string view;
+      {
+        std::lock_guard<std::mutex> g(cat_.mu);
+        auto it = cat_.views.find(Catalog::key(f.name));
+        if (it != cat_.views.end()) view = it->second;
+      }
+      if (!view.empty()) {
+        std::vector<std::string> names;
+        if (view.rfind("/*cols:", 0) == 0) {
+          size_t e = view.find("*/");
+          std::string list = view.substr(7, e - 7);
+          for (size_t a = 0, b; a <= list.size(); a = b + 1) {
+            b = list.find(',', a);
+            if (b == std::string::npos) b = list.size();
+            names.push_back(list.substr(a, b - a));
+          }
+          view = view.substr(e + 2);
+        }
+        f.sub = std::make_shared<Stmt>(parseSql(view));
+        for (size_t i = 0; i < names.size() && i < f.sub->items.size(); ++i) f.sub->items[i].alias = names[i];
+      }
+    }
+    if (f.sub) {
+      Stmt sub = cloneStmt(*f.sub);
+      tColumnar = true;  // a numeric GROUP BY result may come back as columns (straight into the temp table)
+      ResultSet r = query(sub, q, false, true);
+      tColumnar = false;
+      f.name = makeTemp(r, q, f.alias);
+      f.sub.reset();
+    } else {
+      auto it = q.ctes.find(lower(f.name));
+      if (it != q.ctes.end()) f.name = it->second;
+    }
+  }
+  };
+  resolveFrom();
+  resolveSubqueries(s, q);
+  resolveFrom();  // derived tables added by subquery decorrelation
+  {
+    bool win = false;
+    std::function<void(const ExprP&)> find = [&](const ExprP& e) {
+      if (!e || win) return;
+      if (e->window) win = true;
+      for (auto& a : e->args) find(a);
+    };
+    for (auto& it : s.items) find(it.e);
+    for (auto& o : s.orderBy) find(o.e);
+    if (win) return windows(s, q, explain, typed);
+  }
+  {  // aggregates only the host computes (GROUP_CONCAT, JSON_ARRAYAGG, STDDEV, ..): host aggregation
+    bool hostAgg = false;
+    std::function<void(const ExprP&)> find = [&](const ExprP& e) {
+      if (!e || hostAgg) return;
+      if (e->kind == Expr::FUNC && isHostAggName(e->op) && !e->window) hostAgg = true;
+      for (auto& a : e->args) find(a);
+    };
+    for (auto& it : s.items) find(it.e);
+    find(s.having);
+    for (auto& o : s.orderBy) find(o.e);
+    if (hostAgg) return hostAggregate(s, q, explain, typed);
+  }
+  // DISTINCT aggregates (COUNT/SUM/AVG(DISTINCT x), mixed with ordinary aggregates): two-level
+  // aggregation. The inner query groups by the GROUP BY keys plus x and computes partial aggregates;
+  // the outer one aggregates x (now distinct per group) and combines the partials.
+  std::vector<ExprP> dist;
+  std::vector<ExprP> plainAggs;
+  std::function<void(const ExprP&)> findAggs = [&](const ExprP& e) {
+    if (!e) return;
+    if (e->kind == Expr::FUNC && isAggName(e->op) && !e->window) {
+      (e->distinct ? dist : plainAggs).push_back(e);
+      return;
+    }
+    for (auto& a : e->args) findAggs(a);
+  };
+  for (auto& it : s.items) findAggs(it.e);
+  findAggs(s.having);
+  for (auto& o : s.orderBy) findAggs(o.e);
+  bool gpuDistinct = !dist.empty() && s.from.size() == 1 && !s.from[0].sub && s.from[0].join == 0;
+  for (auto& d : dist) gpuDistinct &= d->op == "COUNT" && d->args[0]->kind != Expr::STAR && d->args[0]->str() == dist[0]->args[0]->str();
+  if (!dist.empty() && !gpuDistinct) {
+    const std::string x = dist[0]->args[0]->str();
+    for (auto& d : dist)
+      if (d->args[0]->str() != x) return hostAggregate(s, q, explain, typed);  // mixed DISTINCT: host path
+    for (auto& d : dist)
+      if (d->op == "MIN" || d->op == "MAX") d->distinct = false;  // MIN/MAX(DISTINCT x) = MIN/MAX(x)
+    auto resolveGroup = [&](const ExprP& g) -> ExprP {
+      if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size())
+        return s.items[g->lit.i - 1].e;
+      if (g->kind == Expr::COL && g->table.empty())
+        for (auto& it : s.items)
+          if (!it.alias.empty() && strcasecmp(it.alias.c_str(), g->name.c_str()) == 0) return it.e;
+      return g;
+    };
+    std::vector<ExprP> groups;
+    for (auto& g : s.groupBy) groups.push_back(resolveGroup(g));
+    Stmt inner = cloneStmt(s);
+    inner.items.clear();
+    inner.groupBy.clear();
+    for (size_t i = 0; i < groups.size(); ++i) {
+      inner.items.push_back({cloneExpr(groups[i]), "__g" + std::to_string(i)});
+      inner.groupBy.push_back(cloneExpr(groups[i]));
+    }
+    inner.items.push_back({cloneExpr(dist[0]->args[0]), "__d"});
+    inner.groupBy.push_back(cloneExpr(dist[0]->args[0]));
+    // Partial aggregates of the ordinary aggregates, per (keys, x).
+    std::map<std::string, ExprP> outerOf;  // canonical text of an ordinary aggregate -> its outer form
+    auto mkAgg = [](const std::string& fn, ExprP arg) {
+      auto f = std::make_shared<Expr>();
+      f->kind = Expr::FUNC;
+      f->op = fn;
+      f->args = {arg};
+      return f;
+    };
+    int np = 0;
+    for (auto& a : plainAggs) {
+      const std::string k = a->str();
+      if (outerOf.count(k)) continue;
+      auto part = [&](const std::string& fn, const ExprP& arg) {
+        std::string name = "__p" + std::to_string(np++);
+        inner.items.push_back({mkAgg(fn, arg->kind == Expr::STAR ? arg : cloneExpr(arg)), name});
+        return mkCol("", name);
+      };
+      ExprP o;
+      if (a->op == "COUNT") {
+        auto c = std::make_shared<Expr>();
+        c->kind = Expr::FUNC;
+        c->op = "COALESCE";
+        c->args = {mkAgg("SUM", part("COUNT", a->args[0])), mkLit(Value::I(0))};
+        o = c;
+      } else if (a->op == "SUM") o = mkAgg("SUM", part("SUM", a->args[0]));
+      else if (a->op == "MIN") o = mkAgg("MIN", part("MIN", a->args[0]));
+      else if (a->op == "MAX") o = mkAgg("MAX", part("MAX", a->args[0]));
+      else {  // AVG = SUM / COUNT
+        ExprP sm = mkAgg("SUM", part("SUM", a->args[0])), cn = mkAgg("SUM", part("COUNT", a->args[0]));
+        o = mkBin("/", sm, cn);
+      }
+      outerOf[k] = o;
+    }
+    inner.having.reset();
+    inner.orderBy.clear();
+    inner.limit = -1;
+    inner.offset = 0;
+    inner.distinct = false;
+    tColumnar = true;  // numeric / dictionary-code GROUP BY results come back as columns
+    ResultSet r;
+    try {
+      r = query(inner, q, false, true);
+    } catch (...) {
+      tColumnar = false;
+      throw;
+    }
+    tColumnar = false;
+    std::string tmp = makeTemp(r, q, "dist");
+    std::function<void(ExprP&)> rw = [&](ExprP& e) {
+      if (!e) return;
+      for (size_t i = 0; i < groups.size(); ++i)
+        if (e->str() == groups[i]->str()) { e = mkCol("", "__g" + std::to_string(i)); return; }
+      if (e->kind == Expr::FUNC && isAggName(e->op)) {
+        if (e->distinct) {
+          auto c = std::make_shared<Expr>(*e);
+          c->distinct = false;
+          c->args = {mkCol("", "__d")};
+          e = c;
+        } else {
+          e = cloneExpr(outerOf.at(e->str()));
+        }
+        return;
+      }
+      for (auto& a : e->args) rw(a);
+    };
+    for (auto& it : s.items) {
+      if (it.alias.empty()) it.alias = it.e->str();
+      rw(it.e);
+    }
+    rw(s.having);
+    for (auto& o : s.orderBy) rw(o.e);
+    s.groupBy.clear();
+    for (size_t i = 0; i < groups.size(); ++i) s.groupBy.push_back(mkCol("", "__g" + std::to_string(i)));
+    s.from = {TableRef{tmp, "__dist", nullptr, 0, nullptr}};
+    s.joinConds.clear();
+    s.where.reset();
+  }
+  bool savedWant = tWantVals;
+  tWantVals = typed;
+  ResultSet out;
+  std::unique_ptr<Stmt> pristine;
+  if (!s.groupBy.empty()) pristine = std::make_unique<Stmt>(cloneStmt(s));
+  try {
+    tRawNumber = rawNumber;
+    tColumnar = columnar;
+    out = doSelect(s, explain);
+    tRawNumber = tColumnar = false;
+  } catch (SqlError& e) {
+    tWantVals = savedWant;
+    if (pristine && std::string(e.what()).find("GROUP BY on this string") != std::string::npos)
+      return hostAggregate(*pristine, q, explain, typed);
+    throw;
+  } catch (...) {
+    tWantVals = savedWant;
+    throw;
+  }
+  tWantVals = savedWant;
+  if (!typed) formatRows(out);
+  return out;
+}
+
+void Engine::expandStars(Stmt& s) {
+  std::vector<SelectItem> items;
+  for (auto& it : s.items) {
+    if (it.e->kind != Expr::STAR) {
+      items.push_back(it);
+      continue;
+    }
+    for (auto& f : s.from) {
+      if (!it.e->table.empty() && strcasecmp(it.e->table.c_str(), f.alias.c_str()) != 0) continue;
+      auto t = cat_.get(f.name);
+      for (auto& c : t->cols) items.push_back({mkCol(f.alias, c.name), c.name});
+    }
+  }
+  s.items = std::move(items);
+}
+
+// Window functions: run the query without them (keeping every expression they need as hidden
+// columns), compute the windows over the result on the host, then run the final projection,
+// ORDER BY and LIMIT over a temp table with the results.
+ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  expandStars(s);
+  Stmt inner = cloneStmt(s);
+  inner.items.clear();
+  inner.orderBy.clear();
+  inner.limit = -1;
+  inner.offset = 0;
+  inner.distinct = false;
+  std::map<std::string, int> hiddenOf;
+  auto hidden = [&](const ExprP& e) -> int {
+    std::string k = e->str();
+    auto it = hiddenOf.find(k);
+    if (it != hiddenOf.end()) return it->second;
+    int i = (int)inner.items.size();
+    inner.items.push_back({cloneExpr(e), "__c" + std::to_string(i)});
+    hiddenOf[k] = i;
+    return i;
+  };
+  struct Win {
+    ExprP node;
+    std::vector<int> args, part;
+    std::vector<std::pair<int, bool>> ord;
+  };
+  std::vector<Win> wins;
+  std::map<const Expr*, int> winOf;
+  std::function<ExprP(const ExprP&)> outerOf = [&](const ExprP& e) -> ExprP {
+    if (e->window) {
+      auto it = winOf.find(e.get());
+      int w;
+      if (it != winOf.end()) {
+        w = it->second;
+      } else {
+        Win wn;
+        wn.node = e;
+        for (auto& a : e->args)
+          if (a->kind != Expr::STAR) wn.args.push_back(hidden(a));
+        for (auto& p : e->partBy) wn.part.push_back(hidden(p));
+        for (auto& [o, d] : e->winOrder) wn.ord.push_back({hidden(o), d});
+        w = (int)wins.size();
+        wins.push_back(wn);
+        winOf[e.get()] = w;
+      }
+      return mkCol("", "__w" + std::to_string(w));
+    }
+    if (e->kind == Expr::COL || (e->kind == Expr::FUNC && isAggName(e->op))) return mkCol("", "__c" + std::to_string(hidden(e)));
+    auto y = std::make_shared<Expr>(*e);
+    y->bound = false;
+    for (auto& a : y->args) a = outerOf(a);
+    return y;
+  };
+  Stmt outer;
+  outer.type = Stmt::SELECT;
+  for (auto& it : s.items) outer.items.push_back({outerOf(it.e), it.alias.empty() ? (it.e->kind == Expr::COL ? it.e->name : it.e->str()) : it.alias});
+  for (auto& o : s.orderBy) {
+    bool alias = o.e->kind == Expr::COL && o.e->table.empty() &&
+                 std::any_of(s.items.begin(), s.items.end(), [&](const SelectItem& it) { return !it.alias.empty() && strcasecmp(it.alias.c_str(), o.e->name.c_str()) == 0; });
+    bool pos = o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT;
+    outer.orderBy.push_back({alias || pos ? o.e : outerOf(o.e), o.desc});
+  }
+  outer.limit = s.limit;
+  outer.offset = s.offset;
+  outer.distinct = s.distinct;
+  if (inner.items.empty()) inner.items.push_back({mkLit(Value::I(1)), "__c0"});
+  const auto tW0 = Clock::now();
+  ResultSet r = query(inner, q, false, true);
+  const auto tW1 = Clock::now();
+  const size_t n = r.vals.size(), base = r.names.size();
+  for (size_t w = 0; w < wins.size(); ++w) {
+    const Win& wn = wins[w];
+    const std::string f = wn.node->op;
+    std::vector<size_t> idx(n);
+    for (size_t i = 0; i < n; ++i) idx[i] = i;
+    // Sort keys as doubles (strings: rank among the distinct values; NULL lowest), so the sort and
+    // the partition / peer scans compare numbers instead of Values.
+    std::map<int, std::vector<double>> keys;
+    auto keyCol = [&](int col) -> const std::vector<double>& {
+      auto it = keys.find(col);
+      if (it != keys.end()) return it->second;
+      std::vector<double> k(n);
+      bool str = false;
+      for (size_t i = 0; i < n && !str; ++i) str = r.vals[i][col].kind == Value::STR;
+      if (str) {  // rank the distinct strings, then look each row up
+        std::unordered_map<std::string_view, size_t> id;
+        std::vector<size_t> first;
+        std::vector<uint32_t> rowId(n, 0);
+        for (size_t i = 0; i < n; ++i) {
+          const Value& v = r.vals[i][col];
+          if (v.isNull()) continue;
+          auto [it, fresh] = id.try_emplace(v.s, first.size());
+          if (fresh) first.push_back(i);
+          rowId[i] = (uint32_t)it->second;
+        }
+        std::vector<size_t> o(first.size());
+        for (size_t j = 0; j < o.size(); ++j) o[j] = j;
+        std::sort(o.begin(), o.end(), [&](size_t a, size_t b) { return cmpVal(r.vals[first[a]][col], r.vals[first[b]][col]) < 0; });
+        std::vector<double> rank(o.size());
+        double rk = 0;
+        for (size_t j = 0; j < o.size(); ++j) {
+          if (j && cmpVal(r.vals[first[o[j - 1]]][col], r.vals[first[o[j]]][col]) != 0) ++rk;
+          rank[o[j]] = rk;
+        }
+        for (size_t i = 0; i < n; ++i)
+          if (!r.vals[i][col].isNull()) k[i] = rank[rowId[i]];
+      }
+      parallelFor(n, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i)
+          if (r.vals[i][col].isNull()) k[i] = -HUGE_VAL;
+          else if (!str) k[i] = numOf(r.vals[i][col]);
+      });
+      return keys[col] = std::move(k);
+    };
+    std::vector<const std::vector<double>*> pk;
+    std::vector<std::pair<const std::vector<double>*, bool>> ok;
+    for (int p : wn.part) pk.push_back(&keyCol(p));
+    for (auto& [o, d] : wn.ord) ok.push_back({&keyCol(o), d});
+    auto cmpKeys = [&](size_t a, size_t b, bool withOrder) {
+      for (auto* k : pk) {
+        double x = (*k)[a], y = (*k)[b];
+        if (x != y) return x < y ? -1 : 1;
+      }
+      if (withOrder)
+        for (auto& [k, d] : ok) {
+          double x = (*k)[a], y = (*k)[b];
+          if (x != y) return (x < y) != d ? -1 : 1;
+        }
+      return 0;
+    };
+    const auto tK = Clock::now();
+    {  // stable sort on all cores: sorted chunks, then pairwise merges
+      auto less = [&](size_t a, size_t b) { return cmpKeys(a, b, true) < 0; };
+      const size_t nth = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), n / 32768));
+      std::vector<size_t> bounds;
+      for (size_t t = 0; t <= nth; ++t) bounds.push_back(n * t / nth);
+      parallelFor(nth, [&](size_t b, size_t e) {
+        for (size_t t = b; t < e; ++t) std::stable_sort(idx.begin() + bounds[t], idx.begin() + bounds[t + 1], less);
+      }, 1);
+      for (size_t step = 1; step < nth; step *= 2) {
+        std::vector<size_t> starts;
+        for (size_t t = 0; t + step < nth; t += 2 * step) starts.push_back(t);
+        parallelFor(starts.size(), [&](size_t b, size_t e) {
+          for (size_t k = b; k < e; ++k) {
+            size_t t = starts[k];
+            std::inplace_merge(idx.begin() + bounds[t], idx.begin() + bounds[t + step], idx.begin() + bounds[std::min(nth, t + 2 * step)], less);
+          }
+        }, 1);
+      }
+    }
+    if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] window %zu: keys+sort %.1f ms (sort %.1f)\n", w, msSince(tW1), msSince(tK));
+    std::vector<Value> out(n);
+    LType ty = LType::BIGINT;
+    const LType argTy = wn.args.empty() ? LType::BIGINT : r.types[wn.args[0]];
+    if (f == "PERCENT_RANK" || f == "CUME_DIST" || f == "AVG") ty = LType::DOUBLE;
+    else if (f == "SUM") ty = argTy == LType::DOUBLE ? LType::DOUBLE : LType::BIGINT;
+    else if (f == "MIN" || f == "MAX" || f == "LAG" || f == "LEAD" || f == "FIRST_VALUE" || f == "LAST_VALUE" || f == "NTH_VALUE") ty = argTy;
+    auto argv = [&](size_t row, size_t k) -> Value { return k < wn.args.size() ? r.vals[row][wn.args[k]] : Value::Null(); };
+    auto constArg = [&](size_t k, double def) {  // LAG/LEAD offset, NTILE buckets, NTH_VALUE n: constants
+      if (k >= wn.node->args.size()) return def;
+      const ExprP& a = wn.node->args[k];
+      return a->kind == Expr::LIT ? numOf(a->lit) : def;
+    };
+    static const std::set<std::string> kWinFns = {"ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST", "NTILE", "LAG", "LEAD",
+                                                  "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "SUM", "AVG", "COUNT", "MIN", "MAX"};
+    if (!kWinFns.count(f)) throw SqlError("window function " + f + " is not supported", 1235);
+    // Partitions are independent: computed on all cores.
+    std::vector<std::pair<size_t, size_t>> parts;
+    for (size_t a = 0; a < n;) {
+      size_t b = a + 1;
+      while (b < n && cmpKeys(idx[a], idx[b], false) == 0) ++b;
+      parts.push_back({a, b});
+      a = b;
+    }
+    parallelFor(parts.size(), [&](size_t pb, size_t pe) {
+    for (size_t pi = pb; pi < pe; ++pi) {
+      const size_t a = parts[pi].first, b = parts[pi].second;
+      const size_t cnt = b - a;
+      // peer groups (equal ORDER BY keys)
+      std::vector<size_t> peerStart(cnt), peerEnd(cnt);
+      for (size_t i = 0; i < cnt;) {
+        size_t j = i + 1;
+        while (j < cnt && cmpKeys(idx[a + i], idx[a + j], true) == 0) ++j;
+        for (size_t k = i; k < j; ++k) peerStart[k] = i, peerEnd[k] = j;
+        i = j;
+      }
+      int64_t dense = 0;
+      for (size_t i = 0; i < cnt; ++i) {
+        const size_t row = idx[a + i];
+        if (i == 0 || peerStart[i] == i) ++dense;
+        // frame [lo, hi) within the partition
+        size_t lo, hi;
+        if (wn.node->rowsFrame) {
+          int64_t L = wn.node->frameLo == INT64_MIN ? 0 : std::max<int64_t>(0, (int64_t)i + wn.node->frameLo);
+          int64_t H = wn.node->frameHi == INT64_MAX ? (int64_t)cnt : std::min<int64_t>((int64_t)cnt, (int64_t)i + wn.node->frameHi + 1);
+          lo = (size_t)L;
+          hi = (size_t)std::max<int64_t>(L, H);
+        } else if (wn.ord.empty()) {
+          lo = 0, hi = cnt;
+        } else {
+          lo = 0, hi = wn.node->frameHi == INT64_MAX ? cnt : peerEnd[i];
+        }
+        Value v;
+        if (f == "ROW_NUMBER") v = Value::I((int64_t)i + 1);
+        else if (f == "RANK") v = Value::I((int64_t)peerStart[i] + 1);
+        else if (f == "DENSE_RANK") v = Value::I(dense);
+        else if (f == "PERCENT_RANK") v = Value::D(cnt > 1 ? (double)peerStart[i] / (double)(cnt - 1) : 0.0);
+        else if (f == "CUME_DIST") v = Value::D((double)peerEnd[i] / (double)cnt);
+        else if (f == "NTILE") {
+          int64_t k = std::max<int64_t>(1, (int64_t)constArg(0, 1)), sz = (int64_t)cnt / k, rem = (int64_t)cnt % k;
+          int64_t pos = (int64_t)i, bucket = pos < rem * (sz + 1) ? pos / (sz + 1) : rem + (pos - rem * (sz + 1)) / std::max<int64_t>(sz, 1);
+          v = Value::I(bucket + 1);
+        } else if (f == "LAG" || f == "LEAD") {
+          int64_t off = (int64_t)constArg(1, 1), j = f == "LAG" ? (int64_t)i - off : (int64_t)i + off;
+          v = j >= 0 && j < (int64_t)cnt ? argv(idx[a + j], 0) : (wn.args.size() > 2 ? argv(row, 2) : Value::Null());
+        } else if (f == "FIRST_VALUE") v = hi > lo ? argv(idx[a + lo], 0) : Value::Null();
+        else if (f == "LAST_VALUE") v = hi > lo ? argv(idx[a + hi - 1], 0) : Value::Null();
+        else if (f == "NTH_VALUE") {
+          size_t k = (size_t)std::max<double>(1, constArg(1, 1));
+          v = lo + k - 1 < hi ? argv(idx[a + lo + k - 1], 0) : Value::Null();
+        } else if (f == "SUM" || f == "AVG" || f == "COUNT" || f == "MIN" || f == "MAX") {
+          double acc = 0;
+          int64_t c = 0;
+          Value best;
+          bool star = wn.args.empty();
+          for (size_t j = lo; j < hi; ++j) {
+            if (star) { ++c; continue; }
+            Value x = argv(idx[a + j], 0);
+            if (x.isNull()) continue;
+            ++c;
+            acc += numOf(x);
+            if (best.isNull() || (f == "MIN" ? cmpVal(x, best) < 0 : cmpVal(x, best) > 0)) best = x;
+          }
+          if (f == "COUNT") v = Value::I(c);
+          else if (c == 0) v = Value::Null();
+          else if (f == "SUM") v = ty == LType::DOUBLE ? Value::D(acc) : Value::I((int64_t)std::llround(acc));
+          else if (f == "AVG") v = Value::D(acc / c);
+          else v = best;
+        } else {
+          throw SqlError("window function " + f + " is not supported", 1235);
+        }
+        out[row] = v;
+      }
+    }
+    }, std::max<size_t>(1, parts.size() / (4 * std::thread::hardware_concurrency())));
+    r.names.push_back("__w" + std::to_string(w));
+    r.types.push_back(ty);
+    parallelFor(n, [&](size_t b, size_t e) {
+      for (size_t i = b; i < e; ++i) {
+        if (w == 0) r.vals[i].reserve(base + wins.size());
+        r.vals[i].push_back(std::move(out[i]));
+      }
+    });
+  }
+  (void)base;
+  const auto tW2 = Clock::now();
+  std::string tmp = makeTemp(r, q, "win");
+  if (getenv("GPUDB_TRACE"))
+    fprintf(stderr, "[trace] windows: inner %.1f ms, compute %.1f ms, temp %.1f ms (%zu rows)\n", msSince(tW0) - msSince(tW1),
+            msSince(tW1) - msSince(tW2), msSince(tW2), n);
+  outer.from = {TableRef{tmp, "__win", nullptr, 0, nullptr}};
+  return query(outer, q, explain, typed);
+}
+
+void Engine::stopPipeline(Pipeline& p) {
+  p.running = false;
+  if (p.th.joinable()) p.th.join();
+  std::lock_guard<std::mutex> g(p.mu);
+  p.state = "Stopped";
+}
+
+void Engine::startPipeline(const std::shared_ptr<Pipeline>& p) {
+  if (p->running) return;
+  {
+    std::lock_guard<std::mutex> g(p->mu);
+    for (auto& f : replayedLoads_) p->done.insert(f);
+    p->state = "Running";
+  }
+  p->running = true;
+  if (p->glob.find('\x1e') != std::string::npos) {
+    p->th = std::thread([this, p] {
+      currentDb() = p->db;
+      runRemotePipeline(p);
+    });
+    return;
+  }
+  p->th = std::thread([this, p] {
+    currentDb() = p->db;
+    while (p->running) {
+      glob_t g{};
+      std::vector<std::string> files;
+      if (::glob(p->glob.c_str(), 0, nullptr, &g) == 0)
+        for (size_t i = 0; i < g.gl_pathc; ++i) files.push_back(g.gl_pathv[i]);
+      globfree(&g);
+      std::sort(files.begin(), files.end());
+      for (auto& f : files) {
+        if (!p->running) break;
+        {
+          std::lock_guard<std::mutex> lk(p->mu);
+          if (p->done.count(f)) continue;
+        }
+        std::string sql = "LOAD DATA INFILE '" + f + "' INTO TABLE " + p->table + " FIELDS TERMINATED BY '" +
+                          (p->delim == "\t" ? std::string("\\t") : p->delim) + "' IGNORE " + std::to_string(p->skip) + " LINES" +
+                          (p->cols.empty() ? "" : " (" + p->cols + ")");
+        try {
+          ResultSet r = execute(sql);
+          std::lock_guard<std::mutex> lk(p->mu);
+          p->done.insert(f);
+          ++p->files;
+          p->rows += r.affected;
+        } catch (const std::exception& e) {
+          std::lock_guard<std::mutex> lk(p->mu);
+          p->done.insert(f);  // don't retry a bad file forever
+          p->lastError = f + ": " + e.what();
+          p->state = "Running (with errors)";
+        }
+      }
+      for (int i = 0; i < 10 && p->running; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  });
+}
+
+ResultSet Engine::doPipeline(Stmt& s) {
+  const std::string key = lower(s.table);
+  if (s.setName == "CREATE") {
+    const Stmt& l = *s.inner;
+    if (l.setValue != "FS" && l.setValue != "S3" && l.setValue != "KAFKA" && l.setValue != "LINK")
+      throw SqlError("pipelines from " + l.setValue + " are not supported (use FS, S3 or KAFKA)", 1235);
+    cat_.get(l.table);  // the target table must exist
+    auto p = std::make_shared<Pipeline>();
+    p->name = s.table;
+    p->db = currentDb();
+    p->table = l.table.find('.') == std::string::npos ? currentDb() + "." + l.table : l.table;
+    p->glob = l.path;
+    if (l.setValue != "FS" || l.format == "JSON") {  // remote source: packed spec (see unpackSource)
+      std::string paths;
+      for (auto& jp : l.jsonPaths) paths += (paths.empty() ? "" : "\x1f") + jp;
+      p->glob = l.setValue + "\x1e" + l.path + "\x1e" + l.config + "\x1e" + l.credentials + "\x1e" + l.format + "\x1e" + paths;
+    }
+    p->delim = std::string(1, l.delim);
+    p->skip = l.skipLines;
+    for (auto& c : l.insertCols) p->cols += (p->cols.empty() ? "" : ", ") + c;
+    std::lock_guard<std::mutex> g(pipesMu_);
+    if (pipes_.count(key)) {
+      if (s.ifNotExists) return okResult(0);
+      throw SqlError("Pipeline '" + s.table + "' already exists", 1050);
+    }
+    pipes_[key] = p;
+    return okResult(0);
+  }
+  std::shared_ptr<Pipeline> p;
+  {
+    std::lock_guard<std::mutex> g(pipesMu_);
+    auto it = pipes_.find(key);
+    if (it == pipes_.end()) {
+      if (s.ifExists) return okResult(0);
+      throw SqlError("Pipeline '" + s.table + "' doesn't exist", 1146);
+    }
+    p = it->second;
+  }
+  if (s.setName == "START") {
+    p->wantRun = true;
+    if (!replaying_ && !isReplica_) startPipeline(p);  // replicas get the pipeline's loads from the WAL
+  } else if (s.setName == "STOP") {
+    p->wantRun = false;
+    stopPipeline(*p);
+  } else if (s.setName == "DROP") {
+    stopPipeline(*p);
+    std::lock_guard<std::mutex> g(pipesMu_);
+    pipes_.erase(key);
+  }
+  return okResult(0);
+}
+
+namespace {
+struct SourceSpec {
+  std::string src, path, config, creds, format;
+  std::vector<std::string> jsonPaths;
+};
+SourceSpec unpackSource(const std::string& g) {
+  std::vector<std::string> f;
+  for (size_t a = 0;;) {
+    size_t b = g.find('\x1e', a);
+    f.push_back(g.substr(a, b == std::string::npos ? std::string::npos : b - a));
+    if (b == std::string::npos) break;
+    a = b + 1;
+  }
+  f.resize(6);
+  SourceSpec s{f[0], f[1], f[2], f[3], f[4], {}};
+  for (size_t a = 0; !f[5].empty();) {
+    size_t b = f[5].find('\x1f', a);
+    s.jsonPaths.push_back(f[5].substr(a, b == std::string::npos ? std::string::npos : b - a));
+    if (b == std::string::npos) break;
+    a = b + 1;
+  }
+  return s;
+}
+std::string sanitizeName(const std::string& s) {
+  std::string o;
+  for (char c : s) o += isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_' ? c : '_';
+  return o.size() > 180 ? o.substr(o.size() - 180) : o;
+}
+std::string baseName(const std::string& p) { return p.substr(p.rfind('/') + 1); }
+}  // namespace
+
+int64_t Engine::ingest(const std::string& table, char delim, int64_t skip, const std::vector<std::string>& cols,
+                       const std::vector<std::string>& jsonPaths, bool json, const std::string& data, const std::string& stagedName) {
+  std::string body = data;
+  std::vector<std::string> loadCols = cols;
+  bool escaped = false;  // the staged text uses backslash escapes (Parquet values can hold tabs / newlines)
+  const bool parquet = data.size() >= 12 && data.compare(0, 4, "PAR1") == 0 && data.compare(data.size() - 4, 4, "PAR1") == 0;
+  const bool avro = data.size() >= 4 && data.compare(0, 4, std::string("Obj\x01", 4)) == 0;
+  const bool orc = data.size() >= 16 && data.compare(0, 3, "ORC") == 0;
+  if (parquet || avro || orc) {  // columnar / row binary formats: by column name
+    std::vector<std::string> names = cols;
+    if (names.empty()) {
+      auto t = cat_.get(table);
+      for (auto& c : t->cols) names.push_back(c.name);
+    }
+    body = parquet ? parquetToTsv(data, names) : avro ? avroToTsv(data, names) : orcToTsv(data, names);
+    delim = '\t';
+    skip = 0;
+    escaped = true;
+  } else if (json) {
+    std::vector<std::string> paths = jsonPaths;
+    if (cols.empty()) {
+      auto t = cat_.get(table);
+      for (auto& c : t->cols) paths.push_back(c.name);
+    }
+    body = jsonLinesToTsv(data, paths);
+    delim = '\t';
+    skip = 0;
+  }
+  const std::string dir = dir_.empty() ? std::string("/tmp") : dir_ + "/pipeline-loads";
+  if (!dir_.empty()) mkdir(dir.c_str(), 0755);
+  const std::string path = dir + "/" + (dir_.empty() ? "gpudb-" : "") + stagedName + ".tsv";  // (never re-routed by its name)
+  {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) throw SqlError("cannot stage " + path, 1105);
+    fwrite(body.data(), 1, body.size(), f);
+    fclose(f);
+  }
+  std::string colList;
+  for (auto& c : loadCols) colList += (colList.empty() ? "" : ", ") + c;
+  std::string sql = "LOAD DATA INFILE '" + path + "' INTO TABLE " + table + " FIELDS TERMINATED BY '" +
+                    (delim == '\t' ? std::string("\\t") : std::string(1, delim)) + "'" + (escaped ? " ESCAPED BY '\\\\'" : "") +
+                    " IGNORE " + std::to_string(skip) + " LINES" +
+                    (colList.empty() ? "" : " (" + colList + ")");
+  ResultSet r;
+  try {
+    r = execute(sql);
+  } catch (...) {
+    if (dir_.empty()) unlink(path.c_str());
+    throw;
+  }
+  if (dir_.empty()) unlink(path.c_str());  // without a data dir nothing replays it
+  return r.affected;
+}
+
+ResultSet Engine::loadRemote(Stmt& s) {
+  auto t0 = Clock::now();
+  const bool json = s.format == "JSON";
+  const std::string table = s.table.find('.') == std::string::npos ? currentDb() + "." + s.table : s.table;
+  cat_.get(table);
+  int64_t total = 0, objects = 0;
+  const std::string tag = std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+  if (s.setValue == "S3") {
+    const std::string bucket = s3Bucket(s.path);
+    for (auto& o : s3List(s.path, s.config, s.credentials)) {
+      std::string data = decompressByName(o.key, s3Get(bucket, o.key, s.config, s.credentials));
+      total += ingest(table, s.delim, s.skipLines, s.insertCols, s.jsonPaths, json, data, "s3-" + tag + "-" + sanitizeName(o.key));
+      ++objects;
+    }
+  } else if (s.setValue == "KAFKA") {
+    std::map<int, int64_t> next;
+    for (int round = 0; round < 100000; ++round) {
+      auto msgs = kafkaPoll(s.path, next, 8 << 20);
+      if (msgs.empty()) break;
+      std::string data;
+      for (auto& m : msgs) {
+        data += m.value;
+        if (data.empty() || data.back() != '\n') data += '\n';
+      }
+      total += ingest(table, s.delim, 0, s.insertCols, s.jsonPaths, json, data, "kafka-" + tag + "-" + std::to_string(round));
+      objects += (int64_t)msgs.size();
+    }
+  } else if (s.path.rfind("http://", 0) == 0 || s.path.rfind("https://", 0) == 0) {
+    std::string data = decompressByName(s.path, httpGet(s.path));
+    total = ingest(table, s.delim, s.skipLines, s.insertCols, s.jsonPaths, json, data, "http-" + tag);
+    objects = 1;
+  } else {  // FS + FORMAT JSON
+    glob_t g{};
+    std::vector<std::string> files;
+    if (::glob(s.path.c_str(), 0, nullptr, &g) == 0)
+      for (size_t i = 0; i < g.gl_pathc; ++i) files.push_back(g.gl_pathv[i]);
+    globfree(&g);
+    if (files.empty()) throw SqlError("File '" + s.path + "' not found", 29);
+    for (auto& f : files) {
+      FILE* fp = fopen(f.c_str(), "rb");
+      if (!fp) throw SqlError("cannot read " + f, 29);
+      std::string data;
+      char buf[1 << 16];
+      for (size_t n; (n = fread(buf, 1, sizeof buf, fp)) > 0;) data.append(buf, n);
+      fclose(fp);
+      total += ingest(table, s.delim, s.skipLines, s.insertCols, s.jsonPaths, json, decompressByName(f, data),
+                      "fs-" + tag + "-" + sanitizeName(baseName(f)));
+      ++objects;
+    }
+  }
+  char info[160];
+  snprintf(info, sizeof info, "Records: %lld  Sources: %lld  Loaded in %.1f s", (long long)total, (long long)objects, msSince(t0) / 1000);
+  return okResult(total, info);
+}
+
+void Engine::runRemotePipeline(const std::shared_ptr<Pipeline>& p) {
+  const SourceSpec sp = unpackSource(p->glob);
+  const bool json = sp.format == "JSON";
+  std::vector<std::string> cols;
+  for (size_t a = 0; !p->cols.empty();) {
+    size_t b = p->cols.find(", ", a);
+    cols.push_back(p->cols.substr(a, b == std::string::npos ? std::string::npos : b - a));
+    if (b == std::string::npos) break;
+    a = b + 2;
+  }
+  const char delim = p->delim.empty() ? '\t' : p->delim[0];
+  // Kafka offsets come back from the staged file names already loaded: kafka-<pipe>-<part>-<from>-<next>.
+  std::map<int, int64_t> next;
+  const std::string kpre = "kafka-" + sanitizeName(lower(p->name)) + "-";
+  {
+    std::lock_guard<std::mutex> lk(p->mu);
+    for (auto& d : p->done) {
+      std::string b = baseName(d);
+      if (b.rfind("gpudb-", 0) == 0) b = b.substr(6);
+      if (b.rfind(kpre, 0) != 0) continue;
+      int part;
+      long long from, nx;
+      if (sscanf(b.c_str() + kpre.size(), "%d-%lld-%lld", &part, &from, &nx) == 3) next[part] = std::max<int64_t>(next[part], nx);
+    }
+  }
+  auto stagedPath = [&](const std::string& name) {
+    return (dir_.empty() ? std::string("/tmp/gpudb-") : dir_ + "/pipeline-loads/") + name;
+  };
+  auto fail = [&](const std::string& what) {
+    std::lock_guard<std::mutex> lk(p->mu);
+    p->lastError = what;
+    p->state = "Running (with errors)";
+  };
+  while (p->running) {
+    try {
+      if (sp.src == "S3" || sp.src == "FS") {
+        std::vector<std::string> keys;
+        if (sp.src == "S3") {
+          for (auto& o : s3List(sp.path, sp.config, sp.creds)) keys.push_back(o.key);
+        } else {
+          glob_t g{};
+          if (::glob(sp.path.c_str(), 0, nullptr, &g) == 0)
+            for (size_t i = 0; i < g.gl_pathc; ++i) keys.push_back(g.gl_pathv[i]);
+          globfree(&g);
+        }
+        std::sort(keys.begin(), keys.end());
+        for (auto& k : keys) {
+          if (!p->running) break;
+          const std::string name = lower(sp.src) + "-" + sanitizeName(lower(p->name)) + "-" + sanitizeName(k);
+          {
+            std::lock_guard<std::mutex> lk(p->mu);
+            if (p->done.count(stagedPath(name))) continue;
+          }
+          try {
+            std::string data;
+            if (sp.src == "S3") {
+              data = s3Get(s3Bucket(sp.path), k, sp.config, sp.creds);
+            } else {
+              FILE* fp = fopen(k.c_str(), "rb");
+              if (!fp) continue;
+              char buf[1 << 16];
+              for (size_t n; (n = fread(buf, 1, sizeof buf, fp)) > 0;) data.append(buf, n);
+              fclose(fp);
+            }
+            int64_t n = ingest(p->table, delim, p->skip, cols, sp.jsonPaths, json, decompressByName(k, data), name);
+            std::lock_guard<std::mutex> lk(p->mu);
+            p->done.insert(stagedPath(name));
+            ++p->files;
+            p->rows += n;
+          } catch (std::exception& e) {
+            std::lock_guard<std::mutex> lk(p->mu);
+            p->done.insert(stagedPath(name));  // don't retry a bad object forever
+            p->lastError = k + ": " + e.what();
+            p->state = "Running (with errors)";
+          }
+        }
+      } else if (sp.src == "KAFKA") {
+        auto before = next;
+        auto msgs = kafkaPoll(sp.path, next, 8 << 20);
+        std::map<int, std::string> byPart;
+        std::map<int, int64_t> cnt;
+        for (auto& m : msgs) {
+          std::string& d = byPart[m.partition];
+          d += m.value;
+          if (d.empty() || d.back() != '\n') d += '\n';
+          ++cnt[m.partition];
+        }
+        for (auto& [part, data] : byPart) {
+          int64_t from = before.count(part) ? before[part] : 0;
+          const std::string name = kpre + std::to_string(part) + "-" + std::to_string(from) + "-" + std::to_string(next[part]);
+          int64_t n = ingest(p->table, delim, 0, cols, sp.jsonPaths, json, data, name);
+          std::lock_guard<std::mutex> lk(p->mu);
+          for (auto it = p->done.begin(); it != p->done.end();)  // keep only the latest batch per partition
+            it = baseName(*it).find(kpre + std::to_string(part) + "-") != std::string::npos ? p->done.erase(it) : std::next(it);
+          p->done.insert(stagedPath(name));
+          p->files += cnt[part];
+          p->rows += n;
+        }
+        if (!msgs.empty()) continue;  // more may be waiting
+      }
+      {
+        std::lock_guard<std::mutex> lk(p->mu);
+        if (p->state == "Running (with errors)" && p->lastError.empty()) p->state = "Running";
+      }
+    } catch (std::exception& e) {
+      fail(e.what());
+    }
+    for (int i = 0; i < 10 && p->running; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+}
+
+ResultSet Engine::showPipelines() {
+  ResultSet r;
+  r.isResult = true;
+  r.names = {"Pipelines_in_" + currentDb(), "State", "Table", "Source", "Files_Loaded", "Rows_Loaded", "Last_Error"};
+  r.types = {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::BIGINT, LType::BIGINT, LType::VARCHAR};
+  std::lock_guard<std::mutex> g(pipesMu_);
+  for (auto& [k, p] : pipes_) {
+    std::lock_guard<std::mutex> lk(p->mu);
+    std::string src = p->glob.find('\x1e') == std::string::npos ? "FS " + p->glob
+                      : p->glob.substr(0, p->glob.find('\x1e')) + " " + p->glob.substr(p->glob.find('\x1e') + 1, p->glob.find('\x1e', p->glob.find('\x1e') + 1) - p->glob.find('\x1e') - 1);
+    r.rows.push_back({p->name, p->state, p->table, src, std::to_string(p->files), std::to_string(p->rows),
+                      p->lastError.empty() ? kNullCell : p->lastError});
+  }
+  return r;
+}
+
+// Host aggregation: the GPU produces the filtered / joined rows (group keys and aggregate arguments),
+// the host groups them and computes every aggregate, then HAVING / ORDER BY / LIMIT run over a temp
+// table of the groups. Used for aggregates without a GPU implementation and as a fallback.
+ResultSet Engine::hostAggregate(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  auto resolveGroup = [&](const ExprP& g) -> ExprP {
+    if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size())
+      return s.items[g->lit.i - 1].e;
+    if (g->kind == Expr::COL && g->table.empty())
+      for (auto& it : s.items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), g->name.c_str()) == 0) return it.e;
+    return g;
+  };
+  std::vector<ExprP> groups;
+  for (auto& g : s.groupBy) groups.push_back(resolveGroup(g));
+  std::vector<ExprP> aggs;
+  std::map<std::string, int> aggOf;
+  std::function<void(const ExprP&)> collect = [&](const ExprP& e) {
+    if (!e) return;
+    if (e->kind == Expr::FUNC && (isAggName(e->op) || isHostAggName(e->op)) && !e->window) {
+      if (!aggOf.count(e->str() + (e->distinct ? "!" : ""))) {
+        aggOf[e->str() + (e->distinct ? "!" : "")] = (int)aggs.size();
+        aggs.push_back(e);
+      }
+      return;
+    }
+    for (auto& a : e->args) collect(a);
+  };
+  for (auto& it : s.items) collect(it.e);
+  collect(s.having);
+  for (auto& o : s.orderBy) collect(o.e);
+  // Inner query: group keys and every argument / ORDER BY expression of every aggregate.
+  Stmt inner = cloneStmt(s);
+  inner.items.clear();
+  inner.groupBy.clear();
+  inner.having.reset();
+  inner.orderBy.clear();
+  inner.limit = -1;
+  inner.offset = 0;
+  inner.distinct = false;
+  for (size_t i = 0; i < groups.size(); ++i) inner.items.push_back({cloneExpr(groups[i]), "__g" + std::to_string(i)});
+  struct AggCols {
+    std::vector<int> args;
+    std::vector<std::pair<int, bool>> ord;
+  };
+  std::vector<AggCols> ac(aggs.size());
+  for (size_t j = 0; j < aggs.size(); ++j) {
+    for (auto& a : aggs[j]->args) {
+      if (a->kind == Expr::STAR) continue;
+      ac[j].args.push_back((int)inner.items.size());
+      inner.items.push_back({cloneExpr(a), "__x" + std::to_string(inner.items.size())});
+    }
+    for (auto& [o, d] : aggs[j]->winOrder) {
+      ac[j].ord.push_back({(int)inner.items.size(), d});
+      inner.items.push_back({cloneExpr(o), "__x" + std::to_string(inner.items.size())});
+    }
+  }
+  if (inner.items.empty()) inner.items.push_back({mkLit(Value::I(1)), "__x0"});
+  ResultSet r = query(inner, q, false, true);
+  if (r.vals.size() > 50'000'000) throw SqlError("too many rows for host aggregation", 1105);
+  // Group.
+  std::unordered_map<std::string, size_t> gi;
+  std::vector<std::vector<size_t>> members;
+  std::vector<size_t> firstRow;
+  for (size_t i = 0; i < r.vals.size(); ++i) {
+    std::string k;
+    for (size_t g = 0; g < groups.size(); ++g) {
+      const Value& v = r.vals[i][g];
+      k += (v.isNull() ? std::string("\x02") : v.kind == Value::STR && ciColl() ? foldCase(v.s) : v.toString()) + '\x1f';
+    }
+    auto [it, fresh] = gi.emplace(k, members.size());
+    if (fresh) {
+      members.emplace_back();
+      firstRow.push_back(i);
+    }
+    members[it->second].push_back(i);
+  }
+  if (groups.empty() && members.empty()) {  // aggregate over no rows: one group
+    members.emplace_back();
+    firstRow.push_back(SIZE_MAX);
+  }
+  auto jsonVal = [](const Value& v) -> std::string {
+    if (v.isNull()) return "null";
+    if (v.kind == Value::INT || v.kind == Value::DBL) return v.toString();
+    std::string o = "\"";
+    for (char ch : v.toString()) {
+      if (ch == '"' || ch == '\\') o += '\\';
+      o += ch;
+    }
+    return o + "\"";
+  };
+  ResultSet out;
+  out.isResult = true;
+  out.typed = true;
+  for (size_t g = 0; g < groups.size(); ++g) {
+    out.names.push_back("__g" + std::to_string(g));
+    out.types.push_back(r.types[g] == LType::DECIMAL ? LType::DOUBLE : r.types[g]);
+  }
+  for (size_t j = 0; j < aggs.size(); ++j) {
+    const std::string f = aggs[j]->op;
+    LType at = ac[j].args.empty() ? LType::BIGINT : r.types[ac[j].args[0]];
+    if (at == LType::DECIMAL) at = LType::DOUBLE;
+    LType t = f == "COUNT" ? LType::BIGINT
+            : f == "SUM" ? (at == LType::DOUBLE ? LType::DOUBLE : LType::BIGINT)
+            : f == "MIN" || f == "MAX" || f == "ANY_VALUE" || f == "FIRST" || f == "LAST" || f == "PERCENTILE_DISC" ? at
+            : f == "GROUP_CONCAT" || f == "STRING_AGG" || f == "JSON_ARRAYAGG" || f == "JSON_AGG" || f == "JSON_OBJECTAGG" ? LType::VARCHAR
+            : f.rfind("BIT_", 0) == 0 ? LType::BIGINT : LType::DOUBLE;
+    out.names.push_back("__a" + std::to_string(j));
+    out.types.push_back(t);
+  }
+  for (size_t gidx = 0; gidx < members.size(); ++gidx) {
+    std::vector<Value> row;
+    for (size_t g = 0; g < groups.size(); ++g) row.push_back(r.vals[firstRow[gidx]][g]);
+    for (size_t j = 0; j < aggs.size(); ++j) {
+      const ExprP& a = aggs[j];
+      const std::string f = a->op;
+      std::vector<size_t> rows = members[gidx];
+      if (!ac[j].ord.empty())
+        std::stable_sort(rows.begin(), rows.end(), [&](size_t x, size_t y) {
+          for (auto& [c, d] : ac[j].ord) {
+            int k = cmpVal(r.vals[x][c], r.vals[y][c]);
+            if (k) return d ? k > 0 : k < 0;
+          }
+          return false;
+        });
+      // Values of the first argument (rows with a NULL argument are skipped, as in SQL).
+      std::vector<Value> vals;
+      std::set<std::string> seen;
+      size_t starCount = rows.size();
+      for (size_t rr : rows) {
+        if (ac[j].args.empty()) continue;
+        bool nul = false;
+        for (int c : ac[j].args) nul |= r.vals[rr][c].isNull() && (f != "JSON_OBJECTAGG" || c == ac[j].args[0]);
+        if (nul && f != "JSON_ARRAYAGG" && f != "JSON_AGG") continue;
+        Value v = r.vals[rr][ac[j].args[0]];
+        if ((f == "GROUP_CONCAT") && ac[j].args.size() > 1) {  // GROUP_CONCAT(a, b): concatenated
+          std::string cat;
+          for (int c : ac[j].args) cat += r.vals[rr][c].toString();
+          v = Value::S(cat);
+        }
+        if (f == "JSON_OBJECTAGG") v = Value::S(jsonVal(Value::S(v.toString())) + ":" + jsonVal(r.vals[rr][ac[j].args[1]]));
+        if (a->distinct) {
+          std::string k = v.isNull() ? "\x02" : v.kind == Value::STR && ciColl() ? foldCase(v.s) : v.toString();
+          if (!seen.insert(k).second) continue;
+        }
+        vals.push_back(v);
+      }
+      Value res = Value::Null();
+      if (f == "COUNT") res = Value::I(ac[j].args.empty() ? (int64_t)starCount : (int64_t)vals.size());
+      else if (f == "SUM" || f == "AVG") {
+        if (!vals.empty()) {
+          double acc = 0;
+          for (auto& v : vals) acc += numOf(v);
+          res = f == "AVG" ? Value::D(acc / vals.size()) : out.types[groups.size() + j] == LType::DOUBLE ? Value::D(acc) : Value::I((int64_t)std::llround(acc));
+        }
+      } else if (f == "MIN" || f == "MAX") {
+        for (auto& v : vals)
+          if (res.isNull() || (f == "MIN" ? cmpVal(v, res) < 0 : cmpVal(v, res) > 0)) res = v;
+      } else if (f == "ANY_VALUE") {
+        if (!vals.empty()) res = vals[0];
+      } else if (f == "GROUP_CONCAT" || f == "STRING_AGG") {
+        std::string sep = a->castType == "SEP" ? a->name : ",";
+        if (f == "STRING_AGG" && a->args.size() > 1 && a->args[1]->kind == Expr::LIT) sep = a->args[1]->lit.toString();
+        if (!vals.empty()) {
+          std::string cat;
+          for (size_t i = 0; i < vals.size(); ++i) cat += (i ? sep : "") + vals[i].toString();
+          res = Value::S(cat);
+        }
+      } else if (f == "JSON_ARRAYAGG" || f == "JSON_AGG") {
+        if (!vals.empty()) {
+          std::string o = "[";
+          const bool raw = !a->args.empty() && isJsonExpr(a->args[0], nullptr);
+          for (size_t i = 0; i < vals.size(); ++i) o += (i ? ", " : "") + (raw ? jsonOfValue(vals[i], true) : jsonVal(vals[i]));
+          res = Value::S(o + "]");
+        }
+      } else if (f == "JSON_OBJECTAGG") {
+        if (!vals.empty()) {
+          std::string o = "{";
+          for (size_t i = 0; i < vals.size(); ++i) o += (i ? "," : "") + vals[i].s;
+          res = Value::S(o + "}");
+        }
+      } else if (f.rfind("BIT_", 0) == 0) {
+        int64_t acc = f == "BIT_AND" ? -1 : 0;
+        for (auto& v : vals) {
+          int64_t x = (int64_t)numOf(v);
+          acc = f == "BIT_AND" ? acc & x : f == "BIT_OR" ? acc | x : acc ^ x;
+        }
+        res = Value::I(acc);
+      } else if (f == "FIRST" || f == "LAST") {  // FIRST(v, t) / LAST(v, t): v at the smallest / largest t
+        Value best, bestT;
+        bool have = false;
+        for (size_t rr : rows) {
+          const Value& v = r.vals[rr][ac[j].args[0]];
+          const Value t = ac[j].args.size() > 1 ? r.vals[rr][ac[j].args[1]] : Value::I((int64_t)rr);
+          if (t.isNull()) continue;
+          const int c = have ? cmpVal(t, bestT) : 0;
+          if (!have || (f == "FIRST" ? c < 0 : c > 0)) best = v, bestT = t, have = true;
+        }
+        if (have) res = best;
+      } else if (f == "PERCENTILE_CONT" || f == "PERCENTILE_DISC" || f == "APPROX_PERCENTILE") {
+        if (!vals.empty()) {
+          double p = 0.5;
+          if (ac[j].args.size() > 1 && !rows.empty()) p = numOf(r.vals[rows[0]][ac[j].args[1]]);
+          p = std::min(1.0, std::max(0.0, p));
+          std::vector<double> d;
+          for (auto& v : vals) d.push_back(numOf(v));
+          std::sort(d.begin(), d.end());
+          if (f == "PERCENTILE_DISC") {
+            size_t k = (size_t)std::ceil(p * d.size());
+            res = Value::D(d[k == 0 ? 0 : k - 1]);
+          } else {
+            const double pos = p * (d.size() - 1);
+            const size_t lo = (size_t)std::floor(pos), hi = (size_t)std::ceil(pos);
+            res = Value::D(d[lo] + (d[hi] - d[lo]) * (pos - lo));
+          }
+        }
+      } else if (f == "MEDIAN") {
+        if (!vals.empty()) {
+          std::vector<double> d;
+          for (auto& v : vals) d.push_back(numOf(v));
+          std::sort(d.begin(), d.end());
+          res = Value::D(d.size() % 2 ? d[d.size() / 2] : (d[d.size() / 2 - 1] + d[d.size() / 2]) / 2);
+        }
+      } else {  // STDDEV / VARIANCE family
+        const bool samp = f == "STDDEV_SAMP" || f == "VAR_SAMP";
+        if (vals.size() > (samp ? 1u : 0u)) {
+          double mean = 0, m2 = 0;
+          for (auto& v : vals) mean += numOf(v);
+          mean /= vals.size();
+          for (auto& v : vals) m2 += (numOf(v) - mean) * (numOf(v) - mean);
+          double var = m2 / (vals.size() - (samp ? 1 : 0));
+          res = Value::D(f.rfind("VAR", 0) == 0 ? var : std::sqrt(var));
+        }
+      }
+      row.push_back(res);
+    }
+    out.vals.push_back(std::move(row));
+  }
+  std::string tmp = makeTemp(out, q, "hagg");
+  // Outer query over the groups.
+  std::function<ExprP(const ExprP&)> rw = [&](const ExprP& e) -> ExprP {
+    if (!e) return e;
+    for (size_t i = 0; i < groups.size(); ++i)
+      if (e->str() == groups[i]->str()) return mkCol("", "__g" + std::to_string(i));
+    if (e->kind == Expr::FUNC && (isAggName(e->op) || isHostAggName(e->op)) && !e->window)
+      return mkCol("", "__a" + std::to_string(aggOf.at(e->str() + (e->distinct ? "!" : ""))));
+    auto y = std::make_shared<Expr>(*e);
+    y->bound = false;
+    for (auto& a : y->args) a = rw(a);
+    return y;
+  };
+  Stmt outer;
+  outer.type = Stmt::SELECT;
+  for (auto& it : s.items) outer.items.push_back({rw(it.e), it.alias.empty() ? (it.e->kind == Expr::COL ? it.e->name : it.e->str()) : it.alias});
+  outer.where = rw(s.having);
+  for (auto& o : s.orderBy) {
+    bool alias = o.e->kind == Expr::COL && o.e->table.empty() &&
+                 std::any_of(s.items.begin(), s.items.end(), [&](const SelectItem& it) { return !it.alias.empty() && strcasecmp(it.alias.c_str(), o.e->name.c_str()) == 0; });
+    bool pos = o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT;
+    outer.orderBy.push_back({alias || pos ? o.e : rw(o.e), o.desc});
+  }
+  outer.limit = s.limit;
+  outer.offset = s.offset;
+  outer.distinct = s.distinct;
+  outer.from = {TableRef{tmp, "__hagg", nullptr, 0, nullptr}};
+  return query(outer, q, explain, typed);
+}
+
+thread_local bool tTypedResult = false;
+thread_local bool tRawNumber = false;
+thread_local bool tColumnar = false;  // a single numeric column comes back as ResultSet::numCol (IN subqueries)
+thread_local int tOnlyPart = -1;
+ResultSet Engine::runStatementQuery(Stmt& s, bool explain) {
+  QueryCtx q;
+  ResultSet r;
+  try {
+    r = query(s, q, explain, tTypedResult && !explain);
+  } catch (...) {
+    dropTemps(q);
+    throw;
+  }
+  dropTemps(q);
+  return r;
+}
+
+// ---- Snapshots (SNAPSHOT DATABASE): every database, table (schema + rows), view and pipeline in one
+// file; the WAL then only holds what happened after it.
+namespace {
+void putU64(FILE* f, uint64_t v) { fwrite(&v, 8, 1, f); }
+void putStr(FILE* f, const std::string& s) { putU64(f, s.size()); fwrite(s.data(), 1, s.size(), f); }
+bool getU64(FILE* f, uint64_t& v) { return fread(&v, 8, 1, f) == 1; }
+bool getStr(FILE* f, std::string& s) {
+  uint64_t n;
+  if (!getU64(f, n) || n > (1ull << 32)) return false;
+  s.resize(n);
+  return fread(s.data(), 1, n, f) == n;
+}
+void putVal(FILE* f, const Value& v) {
+  uint8_t k = v.isNull() ? 0 : v.kind == Value::INT ? 1 : v.kind == Value::DBL ? 2 : v.kind == Value::STR ? 3 : v.kind == Value::DATE ? 4 : 5;
+  fwrite(&k, 1, 1, f);
+  if (k == 2) fwrite(&v.d, 8, 1, f);
+  else if (k == 3) putStr(f, v.s);
+  else if (k) fwrite(&v.i, 8, 1, f);
+}
+bool getVal(FILE* f, Value& v) {
+  uint8_t k;
+  if (fread(&k, 1, 1, f) != 1) return false;
+  if (k == 0) { v = Value::Null(); return true; }
+  if (k == 3) { std::string s; if (!getStr(f, s)) return false; v = Value::S(std::move(s)); return true; }
+  int64_t i;
+  double d;
+  if (k == 2) { if (fread(&d, 8, 1, f) != 1) return false; v = Value::D(d); return true; }
+  if (fread(&i, 8, 1, f) != 1) return false;
+  v = k == 1 ? Value::I(i) : k == 4 ? Value::Dt(i) : Value::Ts(i);
+  return true;
+}
+}  // namespace
+
+ResultSet Engine::doSnapshot() {
+  if (dir_.empty()) throw SqlError("SNAPSHOT needs a data directory (the server runs with --no-wal)", 1235);
+  if (tTxn.active) commitTxn();
+  writeSnapshot("", "");
+  return okResult(0, "snapshot written");
+}
+
+// Columnar table image: dictionaries, NULL flags, then per partition the live rows' physical column
+// bytes (string columns as dictionary codes). Restoring it skips parsing and per-row inserts.
+void writeColumnar(FILE* f, const Table& t) {
+  const size_t nc = t.cols.size();
+  putU64(f, (uint64_t)t.nparts);
+  for (size_t c = 0; c < nc; ++c) {
+    const Dict* d = t.dicts[c].get();
+    putU64(f, d ? d->strs.size() : 0);
+    if (d)
+      for (auto& x : d->strs) putStr(f, x);
+    putU64(f, t.hasNull[c]);
+  }
+  // The committed state: rows inserted by still-open transactions are left out, rows they deleted
+  // are kept (their WAL records only appear at COMMIT, so recovery stays consistent).
+  std::set<std::pair<int32_t, int32_t>> hidden, ghosts;
+  for (auto& [k, v] : t.txnPending) {
+    if (v.commitSeq) continue;
+    for (auto& l : v.hidden) hidden.insert({l.seg, l.row});
+    for (auto& l : v.ghosts) ghosts.insert({l.seg, l.row});
+  }
+  auto keep = [&](int32_t seg, int64_t r, bool deleted) {
+    if (hidden.empty() && ghosts.empty()) return !deleted;
+    if (ghosts.count({seg, (int32_t)r})) return true;
+    return !deleted && !hidden.count({seg, (int32_t)r});
+  };
+  for (int p = 0; p < t.nparts; ++p) {
+    std::vector<std::pair<const Segment*, std::vector<int32_t>>> parts;  // live rows per segment
+    int64_t n = 0;
+    for (size_t si = 0; si < t.segs.size(); ++si) {
+      const auto& sg = t.segs[si];
+      if (sg->part != p) continue;
+      std::vector<int32_t> live;
+      for (int64_t r = 0; r < sg->n; ++r)
+        if (keep((int32_t)si, r, (sg->delHost[r >> 5] >> (r & 31)) & 1u)) live.push_back((int32_t)r);
+      n += (int64_t)live.size();
+      parts.push_back({sg.get(), std::move(live)});
+    }
+    const WriteBuffer& b = *t.bufs[p];
+    std::vector<int32_t> blive;
+    for (int64_t r = 0; r < b.n; ++r)
+      if (keep(-1 - p, r, (b.del[r >> 5] >> (r & 31)) & 1u)) blive.push_back((int32_t)r);
+    n += (int64_t)blive.size();
+    putU64(f, (uint64_t)n);
+    std::vector<uint8_t> out;
+    for (size_t c = 0; c < nc; ++c) {
+      const int sz = t.colBytes((int)c);
+      out.resize((size_t)n * sz);
+      size_t o = 0;
+      auto copy = [&](const uint8_t* src, const std::vector<int32_t>& rows, int64_t total) {
+        if ((int64_t)rows.size() == total) {
+          memcpy(out.data() + o, src, (size_t)total * sz);
+          o += (size_t)total * sz;
+          return;
+        }
+        for (int32_t r : rows) memcpy(out.data() + o, src + (size_t)r * sz, sz), o += sz;
+      };
+      for (auto& [sg, live] : parts) copy(sg->host[c].data(), live, sg->n);
+      copy(b.cols[c].data(), blive, b.n);
+      fwrite(out.data(), 1, out.size(), f);
+    }
+  }
+}
+
+void readColumnar(FILE* f, Table& t) {
+  const size_t nc = t.cols.size();
+  uint64_t np, v;
+  getU64(f, np);
+  for (size_t c = 0; c < nc; ++c) {
+    getU64(f, v);
+    for (uint64_t i = 0; i < v; ++i) {
+      std::string x;
+      getStr(f, x);
+      t.dicts[c]->getOrAdd(x);
+    }
+    getU64(f, v);
+    t.hasNull[c] = (uint8_t)v;
+  }
+  for (uint64_t p = 0; p < np; ++p) {
+    uint64_t n;
+    getU64(f, n);
+    std::vector<std::vector<uint8_t>> colsIn(nc);
+    for (size_t c = 0; c < nc; ++c) {
+      colsIn[c].resize(n * t.colBytes((int)c));
+      if (fread(colsIn[c].data(), 1, colsIn[c].size(), f) != colsIn[c].size()) throw SqlError("truncated snapshot", 1105);
+    }
+    auto place = [&](int dst, size_t from, size_t cnt, const std::vector<int64_t>* rows) {
+      WriteBuffer& b = *t.bufs[dst];
+      for (size_t c = 0; c < nc; ++c) {
+        const int sz = t.colBytes((int)c);
+        auto& bc = b.cols[c];
+        if (!rows) bc.insert(bc.end(), colsIn[c].begin() + from * sz, colsIn[c].begin() + (from + cnt) * sz);
+        else
+          for (int64_t r : *rows) bc.insert(bc.end(), colsIn[c].begin() + r * sz, colsIn[c].begin() + (r + 1) * sz);
+      }
+      b.n += (int64_t)(rows ? rows->size() : cnt);
+      b.del.resize((b.n + 31) / 32, 0);
+      ++b.version;
+    };
+    if ((int)np == t.nparts || t.nparts == 1) {
+      place(t.nparts == 1 ? 0 : (int)p, 0, n, nullptr);
+    } else {  // a different partition count: re-hash each row by its shard key
+      std::vector<std::vector<int64_t>> to(t.nparts);
+      std::vector<int64_t> ints(nc);
+      std::vector<double> dbls(nc);
+      for (uint64_t r = 0; r < n; ++r) {
+        for (int c : t.shardKey) {
+          const uint8_t* x = colsIn[c].data() + r * t.colBytes(c);
+          if (t.cols[c].pt == PType::F64) memcpy(&dbls[c], x, 8);
+          else if (t.cols[c].pt == PType::I64) memcpy(&ints[c], x, 8);
+          else { int32_t i32; memcpy(&i32, x, 4); ints[c] = i32; }
+        }
+        to[t.partOf(ints, dbls)].push_back((int64_t)r);
+      }
+      for (int q = 0; q < t.nparts; ++q) place(q, 0, 0, &to[q]);
+    }
+    t.flush(true);  // segments (sorted by the SORT KEY, compressed, primary-key index) right away
+  }
+  for (auto& ix : t.indexes) t.buildIndex(ix);
+}
+
+// Writes a snapshot of everything (path "" = the data dir's snapshot.bin, which also truncates the
+// WAL) or of one database (BACKUP DATABASE).
+// zstd-compressed snapshot / backup streams: a FILE* (fopencookie) the snapshot code writes and
+// reads as usual.
+namespace {
+struct ZW {
+  FILE* raw;
+  ZSTD_CCtx* c;
+  std::vector<char> out;
+};
+ssize_t zwWrite(void* ck, const char* buf, size_t n) {
+  auto* z = (ZW*)ck;
+  ZSTD_inBuffer ib{buf, n, 0};
+  while (ib.pos < ib.size) {
+    ZSTD_outBuffer ob{z->out.data(), z->out.size(), 0};
+    size_t rc = ZSTD_compressStream2(z->c, &ob, &ib, ZSTD_e_continue);
+    if (ZSTD_isError(rc)) return -1;
+    if (fwrite(z->out.data(), 1, ob.pos, z->raw) != ob.pos) return -1;
+  }
+  return (ssize_t)n;
+}
+int zwClose(void* ck) {
+  auto* z = (ZW*)ck;
+  ZSTD_inBuffer ib{nullptr, 0, 0};
+  size_t rc;
+  do {
+    ZSTD_outBuffer ob{z->out.data(), z->out.size(), 0};
+    rc = ZSTD_compressStream2(z->c, &ob, &ib, ZSTD_e_end);
+    fwrite(z->out.data(), 1, ob.pos, z->raw);
+  } while (rc > 0 && !ZSTD_isError(rc));
+  fflush(z->raw);
+  fdatasync(fileno(z->raw));
+  int r = fclose(z->raw);
+  ZSTD_freeCCtx(z->c);
+  delete z;
+  return r;
+}
+FILE* zstdWriter(FILE* raw) {
+  auto* z = new ZW{raw, ZSTD_createCCtx(), std::vector<char>(ZSTD_CStreamOutSize())};
+  ZSTD_CCtx_setParameter(z->c, ZSTD_c_compressionLevel, 3);
+  ZSTD_CCtx_setParameter(z->c, ZSTD_c_nbWorkers, 4);
+  cookie_io_functions_t io{nullptr, zwWrite, nullptr, zwClose};
+  return fopencookie(z, "w", io);
+}
+struct ZR {
+  FILE* raw;
+  ZSTD_DCtx* d;
+  std::vector<char> in;
+  ZSTD_inBuffer ib{nullptr, 0, 0};
+};
+ssize_t zrRead(void* ck, char* buf, size_t n) {
+  auto* z = (ZR*)ck;
+  ZSTD_outBuffer ob{buf, n, 0};
+  while (ob.pos == 0) {
+    if (z->ib.pos == z->ib.size) {
+      size_t got = fread(z->in.data(), 1, z->in.size(), z->raw);
+      if (got == 0) break;
+      z->ib = {z->in.data(), got, 0};
+    }
+    size_t rc = ZSTD_decompressStream(z->d, &ob, &z->ib);
+    if (ZSTD_isError(rc)) return -1;
+  }
+  return (ssize_t)ob.pos;
+}
+int zrClose(void* ck) {
+  auto* z = (ZR*)ck;
+  int r = fclose(z->raw);
+  ZSTD_freeDCtx(z->d);
+  delete z;
+  return r;
+}
+FILE* zstdReader(FILE* raw) {
+  auto* z = new ZR{raw, ZSTD_createDCtx(), std::vector<char>(ZSTD_DStreamInSize())};
+  cookie_io_functions_t io{zrRead, nullptr, nullptr, zrClose};
+  return fopencookie(z, "r", io);
+}
+}  // namespace
+
+void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb, uint64_t* lsnOut) {
+  std::vector<std::shared_ptr<Table>> tabs;
+  std::set<std::string> dbs;
+  std::map<std::string, std::string> views;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (t->db != "__tmp" && (onlyDb.empty() || lower(t->db) == lower(onlyDb))) tabs.push_back(t);
+    for (auto& d : cat_.dbs)
+      if (onlyDb.empty() || d == lower(onlyDb)) dbs.insert(d);
+    for (auto& [k, v] : cat_.views)
+      if (onlyDb.empty() || k.rfind(lower(onlyDb) + ".", 0) == 0) views[k] = v;
+  }
+  std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
+  std::sort(tabs.begin(), tabs.end());
+  for (auto& t : tabs) locks.emplace_back(t->mu);
+  std::lock_guard<std::mutex> wg(walMu_);
+  if (lsnOut) *lsnOut = lsn_;  // the snapshot contains exactly the records up to this lsn
+  const std::string fin = outPath.empty() ? dir_ + "/snapshot.bin" : outPath, tmp = fin + ".tmp";
+  FILE* f = fopen(tmp.c_str(), "wb");
+  if (!f) throw SqlError("cannot write " + tmp, 1105);
+  fwrite("GDBSNAP3", 1, 8, f);  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables
+  f = zstdWriter(f);
+  putU64(f, dbs.size());
+  for (auto& d : dbs) putStr(f, cat_.syncDbs.count(d) ? d + "\x1fSYNC" : d);  // (cat_.mu not needed: dbs only grow under writes, quiesced here)
+  putU64(f, views.size());
+  for (auto& [k, v] : views) { putStr(f, k); putStr(f, v); }
+  int64_t rows = 0;
+  putU64(f, tabs.size());
+  for (auto& t : tabs) {
+    putStr(f, t->db);
+    putStr(f, showCreate(*t));
+    putU64(f, (uint64_t)t->autoNext);
+    putU64(f, (uint64_t)t->liveRows());
+    writeColumnar(f, *t);
+    rows += t->liveRows();
+  }
+  std::vector<std::shared_ptr<Pipeline>> ps;
+  {
+    std::lock_guard<std::mutex> g(pipesMu_);
+    for (auto& [k, p] : pipes_)
+      if (onlyDb.empty() || lower(p->db) == lower(onlyDb)) ps.push_back(p);
+  }
+  putU64(f, ps.size());
+  for (auto& p : ps) {
+    std::lock_guard<std::mutex> g(p->mu);
+    for (auto* x : {&p->name, &p->db, &p->table, &p->glob, &p->delim, &p->cols}) putStr(f, *x);
+    putU64(f, (uint64_t)p->skip);
+    putU64(f, p->wantRun ? 1 : 0);
+    putU64(f, p->done.size());
+    for (auto& d : p->done) putStr(f, d);
+  }
+  fflush(f);
+  fdatasync(fileno(f));
+  fclose(f);
+  auto syncDir = [&](const std::string& file) {
+    std::string d = file.substr(0, file.rfind('/') == std::string::npos ? 0 : file.rfind('/'));
+    int fd = open(d.empty() ? "." : d.c_str(), O_RDONLY);
+    if (fd >= 0) { fsync(fd); ::close(fd); }
+  };
+  {
+    std::lock_guard<std::mutex> ug(usersMu_);  // users go into a side file next to the snapshot (tmp + rename)
+    const std::string uf = fin + ".users", ut = uf + ".tmp";
+    if (FILE* u = fopen(ut.c_str(), "wb")) {
+      putU64(u, users_.size());
+      for (auto& [name, h] : users_) { putStr(u, name); putStr(u, h); }
+      auto defs = routineDefs();
+      putU64(u, defs.size());
+      for (auto& d : defs) putStr(u, d);
+      putU64(u, grants_.size());
+      for (auto& [name, es] : grants_) {
+        putStr(u, name);
+        putU64(u, es.size());
+        for (auto& e : es) putStr(u, e);
+      }
+      fflush(u);
+      fdatasync(fileno(u));
+      fclose(u);
+      rename(ut.c_str(), uf.c_str());
+    }
+  }
+  if (outPath.empty()) {
+    // Crash-safe order: (1) the WAL so far moves to wal.old and a new WAL starts, (2) the snapshot is
+    // installed, (3) wal.old is deleted. Recovery replays wal.old only if snapshot.bin.tmp is still
+    // there (the snapshot was not installed), so every change is applied exactly once.
+    if (wal_) fclose(wal_);
+    wal_ = nullptr;
+    rename((dir_ + "/wal.log").c_str(), (dir_ + "/wal.old").c_str());
+    walOpen(true);
+    if (wal_) fdatasync(fileno(wal_));
+    syncDir(fin);
+  }
+  if (rename(tmp.c_str(), fin.c_str()) != 0) throw SqlError("cannot install snapshot " + fin, 1105);
+  syncDir(fin);
+  if (outPath.empty()) unlink((dir_ + "/wal.old").c_str());
+  (void)rows;
+}
+
+// ---- Users: mysql_native_password (token = SHA1(pw) XOR SHA1(scramble + SHA1(SHA1(pw)))).
+static std::string sha1(const std::string& x) {
+  unsigned char d[20];
+  SHA1((const unsigned char*)x.data(), x.size(), d);
+  return std::string((const char*)d, 20);
+}
+
+bool Engine::checkAuth(const std::string& user, const std::string& scramble, const std::string& token) {
+  std::lock_guard<std::mutex> g(usersMu_);
+  auto it = users_.find(user.empty() ? "root" : user);
+  if (it == users_.end()) return false;
+  const std::string& stage2 = it->second;
+  if (stage2.empty()) return user == "root" || user.empty() ? true : token.empty();  // root without a password: open
+  if (token.size() != 20) return false;
+  std::string h = sha1(scramble + stage2), stage1(20, '\0');
+  for (int i = 0; i < 20; ++i) stage1[i] = (char)(token[i] ^ h[i]);
+  return sha1(stage1) == stage2;
+}
+
+thread_local std::string tUser = "root";
+thread_local bool tLocalInfile = false;
+thread_local bool tDescribeOnly = false;
+const std::string& sessionUser() { return tUser; }
+const std::string& tUserName() { return tUser; }
+
+bool Engine::checkPassword(const std::string& user, const std::string& pw) {
+  std::lock_guard<std::mutex> g(usersMu_);
+  auto it = users_.find(user.empty() ? "root" : user);
+  if (it == users_.end() || it->second == "!role") return false;
+  return it->second.empty() ? pw.empty() : it->second == sha1(sha1(pw));
+}
+
+bool Engine::isSuper(const std::string& user) {
+  if (user == "root") return true;
+  std::lock_guard<std::mutex> g(usersMu_);
+  return grants_[user].count("ALL|*.*") > 0;
+}
+void Engine::setUser(const std::string& user) { tUser = user.empty() ? "root" : user; }
+
+bool Engine::hasPriv(const std::string& user, const std::string& priv, const std::string& db, const std::string& table) {
+  std::set<std::string> seen;
+  std::function<bool(const std::string&)> rec = [&](const std::string& u) {
+    if (u == "root") return true;
+    if (!seen.insert(u).second) return false;
+    auto it = grants_.find(u);
+    if (it == grants_.end()) return false;
+    for (const std::string& e : it->second) {
+      if (e[0] == '@') {
+        if (rec(e.substr(1))) return true;
+        continue;
+      }
+      const std::string pv = e.substr(0, e.find('|')), sc = e.substr(e.find('|') + 1);
+      if (pv != "ALL" && pv != priv) continue;
+      if (sc == "*.*" || sc == db + ".*" || sc == db + "." + table || (sc.find('.') == std::string::npos && sc == table)) return true;
+    }
+    return false;
+  };
+  return rec(user);
+}
+
+// Statement-level privilege checks (SELECT / INSERT / UPDATE / DELETE / CREATE / DROP / ALTER per
+// table or database; account management, pipelines, backups need ALL ON *.*). Views are checked by
+// their own name, so a view over a filtered table is how row-level security is expressed.
+void Engine::checkPrivileges(const Stmt& s) {
+  if (tUser == "root") return;
+  std::lock_guard<std::mutex> g(usersMu_);
+  if (hasPriv(tUser, "ALL", "*", "*") && grants_[tUser].count("ALL|*.*")) return;
+  auto need = [&](const std::string& priv, const std::string& name) {
+    if (name.empty()) return;
+    std::string db = lower(dbOf(name)), t = lower(plainName(name));
+    if (db == "information_schema" || db == "__tmp") return;
+    if (!hasPriv(tUser, priv, db, t) && !hasPriv(tUser, priv, db, "*"))
+      throw SqlError(priv + " command denied to user '" + tUser + "'@'%' for table '" + t + "'", 1142);
+  };
+  auto needDb = [&](const std::string& priv, const std::string& db) {
+    if (!hasPriv(tUser, priv, lower(db), "*") && !grants_[tUser].count(priv + "|" + lower(db) + ".*") &&
+        !hasPriv(tUser, priv, lower(db), ""))
+      throw SqlError("Access denied for user '" + tUser + "'@'%' to database '" + db + "'", 1044);
+  };
+  auto super = [&] {
+    if (!grants_[tUser].count("ALL|*.*") && !hasPriv(tUser, "SUPER", "", ""))
+      throw SqlError("Access denied; you need (at least one of) the SUPER privilege(s) for this operation", 1227);
+  };
+  std::function<void(const Stmt&, std::set<std::string>)> reads = [&](const Stmt& q, std::set<std::string> ctes) {
+    for (auto& [n, c] : q.ctes) {
+      ctes.insert(lower(n));
+      reads(*c, ctes);
+    }
+    std::function<void(const ExprP&)> ex = [&](const ExprP& e) {
+      if (!e) return;
+      if (e->sub) reads(*e->sub, ctes);
+      for (auto& a : e->args) ex(a);
+    };
+    for (auto& f : q.from) {
+      if (f.sub) reads(*f.sub, ctes);
+      else if (!ctes.count(lower(f.name))) need("SELECT", f.name);
+      ex(f.on);
+    }
+    for (auto& it : q.items) ex(it.e);
+    ex(q.where);
+    ex(q.having);
+    for (auto& c : q.joinConds) ex(c);
+    if (q.unionNext) reads(*q.unionNext, ctes);
+    if (q.select) reads(*q.select, ctes);
+  };
+  switch (s.type) {
+    case Stmt::SELECT:
+      reads(s, {});
+      if (!s.outfile.empty()) super();  // SELECT .. INTO OUTFILE writes server files: FILE privilege
+      break;
+    case Stmt::EXPLAIN: case Stmt::PROFILE: if (s.inner) reads(*s.inner, {}); break;
+    case Stmt::INSERT: need("INSERT", s.table); reads(s, {}); break;
+    case Stmt::LOAD:  // reading server-side files / remote sources needs FILE (SUPER here), as in MySQL
+      need("INSERT", s.table);
+      if (!tLocalInfile) super();
+      break;
+    case Stmt::UPDATE: need("UPDATE", s.table); reads(s, {}); break;
+    case Stmt::DELETE: need("DELETE", s.table); reads(s, {}); break;
+    case Stmt::CREATE: if (!s.temporary) need("CREATE", s.table); if (s.select) reads(*s.select, {}); break;
+    case Stmt::CREATE_VIEW: need("CREATE VIEW", s.table); break;
+    case Stmt::DROP: for (auto& n : s.names) need("DROP", n); break;
+    case Stmt::DROP_VIEW: for (auto& n : s.names) need("DROP", n); break;
+    case Stmt::TRUNCATE: need("DROP", s.table); break;
+    case Stmt::ALTER: need("ALTER", s.table); break;
+    case Stmt::RENAME: for (auto& n : s.names) need("ALTER", n); break;
+    case Stmt::CREATE_DB: case Stmt::DROP_DB: needDb(s.type == Stmt::CREATE_DB ? "CREATE" : "DROP", s.table); break;
+    case Stmt::USER:
+      if (s.setName == "ALTER" && (s.table.empty() || s.table == tUser)) break;  // own password
+      super();
+      break;
+    case Stmt::PIPELINE: case Stmt::BACKUP: case Stmt::SNAPSHOT: case Stmt::DROP_PLANCACHE: super(); break;
+    default: break;
+  }
+}
+
+ResultSet Engine::doUser(Stmt& s) {
+  std::lock_guard<std::mutex> g(usersMu_);
+  if (s.setName.rfind("GRANT", 0) == 0 || s.setName.rfind("REVOKE", 0) == 0) {
+    const bool grant = s.setName[0] == 'G', role = s.setName.find("_ROLE") != std::string::npos;
+    for (auto& who : s.grantees) {
+      if (!users_.count(who)) throw SqlError("Can't find any matching row in the user table for '" + who + "'", 1133);
+      for (auto& pv : s.names) {
+        std::string e = role ? "@" + pv : pv + "|" + s.path;
+        if (role) {
+          std::string r = pv;
+          if (!r.empty() && (r[0] == '\'' || r[0] == '"')) r = r.substr(1, r.size() - 2);
+          if (!users_.count(lower(r)) && !users_.count(r)) throw SqlError("Unknown role '" + r + "'", 3523);
+          e = "@" + (users_.count(r) ? r : lower(r));
+        }
+        if (grant) grants_[who].insert(e);
+        else if (!role && pv == "ALL") {  // REVOKE ALL ON scope: every privilege on that scope
+          for (auto it = grants_[who].begin(); it != grants_[who].end();)
+            it = it->size() > s.path.size() && it->substr(it->size() - s.path.size() - 1) == "|" + s.path ? grants_[who].erase(it) : std::next(it);
+        } else grants_[who].erase(e);
+      }
+    }
+    return okResult(0);
+  }
+  const std::string u = s.table.empty() ? tUser : s.table;
+  const std::string hash = s.path == "\x01" || s.path.empty() ? "" : s.path == "\x03role" ? "!role" : sha1(sha1(s.path));
+  if (s.setName == "CREATE") {
+    if (users_.count(u)) {
+      if (s.ifNotExists) return okResult(0);
+      throw SqlError("Operation CREATE USER failed for '" + u + "'@'%'", 1396);
+    }
+    users_[u] = hash;
+  } else if (s.setName == "DROP") {
+    if (!users_.erase(u) && !s.ifExists) throw SqlError("Operation DROP USER failed for '" + u + "'@'%'", 1396);
+    grants_.erase(u);
+    for (auto& [k, v] : grants_) v.erase("@" + u);
+  } else {
+    if (!users_.count(u)) throw SqlError("Operation ALTER USER failed for '" + u + "'@'%'", 1396);
+    if (s.path != "\x01") users_[u] = hash;
+  }
+  return okResult(0);
+}
+
+ResultSet Engine::doBackup(Stmt& s) {
+  std::string path = s.path;
+  struct stat st;
+  if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) path += "/" + lower(s.table) + ".backup";
+  if (s.setName == "BACKUP") {
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      if (!cat_.dbs.count(lower(s.table))) throw SqlError("Unknown database '" + s.table + "'", 1049);
+    }
+    writeSnapshot(path, s.table);
+    return okResult(0, "backup written to " + path);
+  }
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (lower(t->db) == lower(s.table)) throw SqlError("Can't restore: database '" + s.table + "' has tables", 1007);
+  }
+  const bool saved = replaying_;
+  replaying_ = true;  // the restore itself is not logged statement by statement ...
+  try {
+    loadSnapshot(path);
+  } catch (...) {
+    replaying_ = saved;
+    throw;
+  }
+  replaying_ = saved;
+  if (!dir_.empty()) doSnapshot();  // ... so make it durable with a checkpoint
+  return okResult(0, "restored from " + path);
+}
+
+
+void Engine::connectionClosed() {
+  if (tTxn.active) rollbackTxn();
+  for (auto& n : tTempTables) {
+    try {
+      execute("DROP TABLE IF EXISTS " + n);
+    } catch (...) {
+    }
+  }
+  tTempTables.clear();
+}
+
+void Engine::loadSnapshot(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return;
+  auto t0 = Clock::now();
+  const std::string savedDb = currentDb();
+  char magic[8];
+  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '3') {
+    fclose(f);
+    throw SqlError("bad snapshot file " + path, 1105);
+  }
+  if (magic[7] >= '2') f = zstdReader(f);
+  const bool columnar = magic[7] >= '3';
+  uint64_t n;
+  getU64(f, n);
+  for (uint64_t i = 0; i < n; ++i) {
+    std::string d;
+    getStr(f, d);
+    if (d.size() > 5 && d.compare(d.size() - 5, 5, "\x1fSYNC") == 0) {
+      d.resize(d.size() - 5);
+      cat_.syncDbs.insert(d);
+    }
+    cat_.dbs.insert(d);
+  }
+  getU64(f, n);
+  for (uint64_t i = 0; i < n; ++i) {
+    std::string k, v;
+    getStr(f, k);
+    getStr(f, v);
+    cat_.views[k] = v;
+  }
+  getU64(f, n);
+  const uint64_t ntables = n;
+  int64_t total = 0;
+  for (uint64_t i = 0; i < n; ++i) {
+    std::string db, ddl;
+    uint64_t next, rows;
+    getStr(f, db);
+    getStr(f, ddl);
+    getU64(f, next);
+    getU64(f, rows);
+    currentDb() = db;
+    Stmt cs = parseSql(ddl);
+    doCreate(cs);
+    auto t = cat_.get(db + "." + cs.table);
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    std::vector<Value> row(t->cols.size());
+    if (columnar) readColumnar(f, *t), rows = 0;  // (rows: counted below from the table)
+    for (uint64_t r = 0; r < rows; ++r) {
+      for (auto& v : row) getVal(f, v);
+      t->appendRow(row);
+    }
+    t->autoNext = (int64_t)next;
+    t->flush(true);
+    total += columnar ? t->liveRows() : (int64_t)rows;
+  }
+  if (getU64(f, n))
+    for (uint64_t i = 0; i < n; ++i) {
+      auto p = std::make_shared<Pipeline>();
+      for (auto* x : {&p->name, &p->db, &p->table, &p->glob, &p->delim, &p->cols}) getStr(f, *x);
+      uint64_t skip, want, nd;
+      getU64(f, skip);
+      getU64(f, want);
+      getU64(f, nd);
+      p->skip = (int64_t)skip;
+      p->wantRun = want != 0;
+      for (uint64_t k = 0; k < nd; ++k) {
+        std::string d;
+        getStr(f, d);
+        p->done.insert(d);
+      }
+      pipes_[lower(p->name)] = p;
+    }
+  fclose(f);
+  if (FILE* uf = fopen((path + ".users").c_str(), "rb")) {
+    uint64_t nu;
+    if (getU64(uf, nu))
+      for (uint64_t i = 0; i < nu; ++i) {
+        std::string u, h;
+        if (!getStr(uf, u) || !getStr(uf, h)) break;
+        std::lock_guard<std::mutex> g(usersMu_);
+        users_[u] = h;
+      }
+    if (getU64(uf, nu))
+      for (uint64_t i = 0; i < nu; ++i) {
+        std::string d;
+        if (!getStr(uf, d)) break;
+        try {
+          ResultSet rr;
+          routineStatement(d, rr);
+        } catch (std::exception& ex) {
+          fprintf(stderr, "[gpu-db] routine restore failed: %s\n", ex.what());
+        }
+      }
+    if (getU64(uf, nu))
+      for (uint64_t i = 0; i < nu; ++i) {
+        std::string u, e;
+        uint64_t ne;
+        if (!getStr(uf, u) || !getU64(uf, ne)) break;
+        std::lock_guard<std::mutex> g(usersMu_);
+        for (uint64_t j = 0; j < ne && getStr(uf, e); ++j) grants_[u].insert(e);
+      }
+    fclose(uf);
+  }
+  currentDb() = savedDb;
+  fprintf(stderr, "[gpu-db] loaded snapshot: %llu tables, %lld rows in %.0f ms\n", (unsigned long long)ntables, (long long)total, msSince(t0));
+}
+
+
+}  // namespace gdb

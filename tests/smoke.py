@@ -1,0 +1,33 @@
+import pymysql, sys
+port = int(sys.argv[1]) if len(sys.argv) > 1 else 3307
+c = pymysql.connect(host="127.0.0.1", port=port, user="root", password="x", autocommit=True)
+cur = c.cursor()
+def q(sql):
+    cur.execute(sql)
+    rows = cur.fetchall()
+    print(sql, "->", rows)
+    return rows
+q("select @@version_comment limit 1")
+cur.execute("drop table if exists t")
+cur.execute("create table t (id int primary key, name varchar(20), price double, d date, sort key(id))")
+cur.execute("insert into t values (1,'apple',1.5,'2024-01-01'),(2,'banana',0.25,'2024-02-01'),(3,'cherry',3.0,'2024-03-01'),(4,'apple',2.5,'2024-04-01')")
+q("select * from t")
+q("select * from t where id = 3")
+q("select name, count(*), sum(price), avg(price), min(d), max(price) from t group by name order by name")
+q("select count(*), sum(price) from t where name like 'b%' or price > 2")
+q("select id, price*2 as p2 from t where d >= date '2024-02-01' order by p2 desc limit 2")
+cur.execute("update t set price = price + 10 where name = 'apple'"); print("updated", cur.rowcount)
+q("select id, name, price from t order by id")
+cur.execute("delete from t where id = 2"); print("deleted", cur.rowcount)
+q("optimize table t")
+q("show segments from t")
+cur.execute("insert into t values (5,'date',9.0,'2024-05-01')")
+q("select id, name, price from t order by id")
+q("select name, sum(price) s from t group by name having s > 5 order by s desc")
+try:
+    cur.execute("insert into t values (5,'dup',1,'2024-01-01')")
+except Exception as e: print("expected error:", e)
+q("explain select name, sum(price) from t where id > 2 group by name")
+q("select case when price > 10 then 1 else 0 end as big, count(*) from t group by big order by big")
+q("select year(d) y, count(*) from t group by y order by y")
+q("select name from t where name in ('apple','date') order by name, id")
