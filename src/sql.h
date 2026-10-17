@@ -131,6 +131,7 @@ struct Stmt {
   char escape = 0;  // LOAD DATA .. ESCAPED BY 'c' (0: no escape processing)
   int64_t skipLines = 0;
   std::string config, credentials, format;  // LOAD DATA S3/KAFKA .. CONFIG '{..}' CREDENTIALS '{..}' FORMAT JSON
+  std::string asName, until;  // RESTORE DATABASE db AS asName .. UNTIL TIMESTAMP 'until'
   std::vector<std::string> jsonPaths;       // FORMAT JSON (col <- a::b, ..): source path per insertCols entry
   // EXPLAIN / PROFILE
   std::shared_ptr<Stmt> inner;

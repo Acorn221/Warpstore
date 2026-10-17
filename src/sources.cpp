@@ -425,6 +425,149 @@ std::string s3Get(const std::string& bucket, const std::string& key, const std::
   return curlGet(c.base(bucket) + "/" + esc(key, false), c.region, c.key, c.secret, c.token);
 }
 
+// ---- S3 uploads / downloads (backups): streamed from / to files, multipart above 64 MB ----------
+namespace {
+
+struct Upload {
+  FILE* f;
+  int64_t left;
+};
+size_t readUp(char* p, size_t sz, size_t n, void* ud) {
+  auto* u = static_cast<Upload*>(ud);
+  size_t want = std::min<int64_t>((int64_t)(sz * n), u->left);
+  size_t got = want ? fread(p, 1, want, u->f) : 0;
+  u->left -= (int64_t)got;
+  return got;
+}
+size_t headerSink(char* p, size_t sz, size_t n, void* ud) {
+  static_cast<std::string*>(ud)->append(p, sz * n);
+  return sz * n;
+}
+size_t fileSink(char* p, size_t sz, size_t n, void* ud) { return fwrite(p, sz, n, static_cast<FILE*>(ud)) * sz; }
+
+// One signed S3 request. Body: `len` bytes of `f` from its current position (or the string `text`).
+// Response body into `out` (or the file `outFile`), headers into `hdrOut`.
+void s3Call(const S3Ctx& c, const char* method, const std::string& url, FILE* f, int64_t len, const std::string* text,
+            std::string* out, FILE* outFile, std::string* hdrOut) {
+  static std::once_flag once;
+  std::call_once(once, [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+  std::unique_ptr<CURL, void (*)(CURL*)> h(curl_easy_init(), curl_easy_cleanup);
+  CURL* k = h.get();
+  std::string body, hdrs;
+  Upload up{f, len};
+  curl_easy_setopt(k, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(k, CURLOPT_CUSTOMREQUEST, method);
+  if (f) {
+    curl_easy_setopt(k, CURLOPT_UPLOAD, 1L);
+    curl_easy_setopt(k, CURLOPT_READFUNCTION, readUp);
+    curl_easy_setopt(k, CURLOPT_READDATA, &up);
+    curl_easy_setopt(k, CURLOPT_INFILESIZE_LARGE, (curl_off_t)len);
+  } else if (text) {
+    curl_easy_setopt(k, CURLOPT_POSTFIELDS, text->data());
+    curl_easy_setopt(k, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t)text->size());
+  }
+  if (outFile) {
+    curl_easy_setopt(k, CURLOPT_WRITEFUNCTION, fileSink);
+    curl_easy_setopt(k, CURLOPT_WRITEDATA, outFile);
+  } else {
+    curl_easy_setopt(k, CURLOPT_WRITEFUNCTION, sink);
+    curl_easy_setopt(k, CURLOPT_WRITEDATA, &body);
+  }
+  curl_easy_setopt(k, CURLOPT_HEADERFUNCTION, headerSink);
+  curl_easy_setopt(k, CURLOPT_HEADERDATA, &hdrs);
+  curl_easy_setopt(k, CURLOPT_CONNECTTIMEOUT, 10L);
+  curl_easy_setopt(k, CURLOPT_TIMEOUT, 3600L);
+  curl_slist* hl = curl_slist_append(nullptr, "Expect:");
+  std::string sigv4, userpwd;
+  if (!c.key.empty()) {
+    sigv4 = "aws:amz:" + c.region + ":s3";
+    userpwd = c.key + ":" + c.secret;
+    curl_easy_setopt(k, CURLOPT_AWS_SIGV4, sigv4.c_str());
+    curl_easy_setopt(k, CURLOPT_USERPWD, userpwd.c_str());
+    hl = curl_slist_append(hl, "x-amz-content-sha256: UNSIGNED-PAYLOAD");
+    if (!c.token.empty()) hl = curl_slist_append(hl, ("x-amz-security-token: " + c.token).c_str());
+  }
+  curl_easy_setopt(k, CURLOPT_HTTPHEADER, hl);
+  CURLcode rc = curl_easy_perform(k);
+  long status = 0;
+  curl_easy_getinfo(k, CURLINFO_RESPONSE_CODE, &status);
+  curl_slist_free_all(hl);
+  if (rc != CURLE_OK) throw SqlError(std::string("S3 ") + method + " " + url + " failed: " + curl_easy_strerror(rc), 1105);
+  if (status >= 300) {
+    std::string msg = body;
+    size_t a = msg.find("<Message>"), b = msg.find("</Message>");
+    if (a != std::string::npos && b != std::string::npos) msg = msg.substr(a + 9, b - a - 9);
+    throw SqlError("S3 " + std::string(method) + " " + url + ": HTTP " + std::to_string(status) + " " + msg.substr(0, 200), 1105);
+  }
+  if (out) *out = std::move(body);
+  if (hdrOut) *hdrOut = std::move(hdrs);
+}
+
+std::string headerValue(const std::string& hdrs, const std::string& name) {
+  for (size_t p = 0; p < hdrs.size();) {
+    size_t e = hdrs.find('\n', p);
+    if (e == std::string::npos) e = hdrs.size();
+    std::string line = hdrs.substr(p, e - p);
+    p = e + 1;
+    if (line.size() > name.size() && strncasecmp(line.c_str(), name.c_str(), name.size()) == 0 && line[name.size()] == ':') {
+      std::string v = line.substr(name.size() + 1);
+      while (!v.empty() && (v.back() == '\r' || v.back() == ' ')) v.pop_back();
+      while (!v.empty() && v[0] == ' ') v.erase(0, 1);
+      return v;
+    }
+  }
+  return "";
+}
+
+}  // namespace
+
+void s3PutFile(const std::string& bucket, const std::string& key, const std::string& file, const std::string& config, const std::string& creds) {
+  S3Ctx c(config, creds);
+  const std::string url = c.base(bucket) + "/" + esc(key, false);
+  std::unique_ptr<FILE, int (*)(FILE*)> f(fopen(file.c_str(), "rb"), fclose);
+  if (!f) throw SqlError("cannot read " + file, 1105);
+  fseeko(f.get(), 0, SEEK_END);
+  const int64_t size = ftello(f.get());
+  fseeko(f.get(), 0, SEEK_SET);
+  static const int64_t kPart = getenv("GPUDB_S3_PART_BYTES") ? std::atoll(getenv("GPUDB_S3_PART_BYTES")) : 64ll << 20;  // (override: tests)
+  if (size <= kPart) {
+    s3Call(c, "PUT", url, f.get(), size, nullptr, nullptr, nullptr, nullptr);
+    return;
+  }
+  std::string resp;
+  const std::string empty;
+  s3Call(c, "POST", url + "?uploads", nullptr, 0, &empty, &resp, nullptr, nullptr);
+  size_t a = resp.find("<UploadId>"), b = resp.find("</UploadId>");
+  if (a == std::string::npos || b == std::string::npos) throw SqlError("S3 multipart upload: no UploadId in the response", 1105);
+  const std::string id = xmlUnescape(resp.substr(a + 10, b - a - 10));
+  std::string done = "<CompleteMultipartUpload>";
+  try {
+    for (int64_t off = 0, part = 1; off < size; off += kPart, ++part) {
+      std::string hdrs;
+      fseeko(f.get(), off, SEEK_SET);
+      s3Call(c, "PUT", url + "?partNumber=" + std::to_string(part) + "&uploadId=" + esc(id, true), f.get(), std::min(kPart, size - off), nullptr,
+             nullptr, nullptr, &hdrs);
+      done += "<Part><PartNumber>" + std::to_string(part) + "</PartNumber><ETag>" + headerValue(hdrs, "ETag") + "</ETag></Part>";
+    }
+    done += "</CompleteMultipartUpload>";
+    s3Call(c, "POST", url + "?uploadId=" + esc(id, true), nullptr, 0, &done, nullptr, nullptr, nullptr);
+  } catch (...) {
+    try {
+      s3Call(c, "DELETE", url + "?uploadId=" + esc(id, true), nullptr, 0, nullptr, nullptr, nullptr, nullptr);
+    } catch (...) {
+    }
+    throw;
+  }
+}
+
+void s3GetFile(const std::string& bucket, const std::string& key, const std::string& file, const std::string& config, const std::string& creds) {
+  S3Ctx c(config, creds);
+  std::unique_ptr<FILE, int (*)(FILE*)> f(fopen(file.c_str(), "wb"), fclose);
+  if (!f) throw SqlError("cannot write " + file, 1105);
+  s3Call(c, "GET", c.base(bucket) + "/" + esc(key, false), nullptr, 0, nullptr, nullptr, f.get(), nullptr);
+  if (fflush(f.get()) != 0) throw SqlError("cannot write " + file, 1105);
+}
+
 // ---- Kafka (plaintext wire protocol: Metadata v1, ListOffsets v1, Fetch v4, RecordBatch v2) ----
 namespace {
 

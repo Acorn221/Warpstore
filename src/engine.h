@@ -66,6 +66,7 @@ struct Pipeline;  // CREATE PIPELINE: background file ingestion
 extern thread_local bool tLocalInfile;
 // Set while the server describes a prepared statement: SELECTs return their columns without rows.
 extern thread_local bool tDescribeOnly;
+extern std::string gWalArchive;  // --wal-archive: rotated-out WALs (and loaded files) are kept here
 
 class Engine {
  public:
@@ -124,6 +125,15 @@ class Engine {
   std::thread flushTh_;                           // async durability: syncs the WAL every 10 ms
   void walOpen(bool truncate);
   int64_t replayWal(const std::string& path, bool repairTail);
+  // WAL format 3: "GDBWAL3\n" + u64 generation, then records. The generation goes up at every
+  // SNAPSHOT (WAL rotation); rotated-out WALs go to the archive (--wal-archive) for point-in-time
+  // restores. A "\x1eTS" + u64 microseconds record marks the time, at most once a second.
+  uint64_t walGen_ = 1;
+  int64_t walTsSec_ = 0;
+  void walWriteLocked(const std::string& rec);
+  void archiveWal(const std::string& path);  // rotated-out WAL: into the archive (or deleted)
+  void archiveLoads(uint64_t belowGen);      // copies of loaded files only older WALs refer to
+  int64_t replayFrom(const std::string& db, const std::string& asDb, uint64_t gen, int64_t off, int64_t untilUs);
   std::mutex syncMu_;
   std::condition_variable syncCv_;
   uint64_t walWritten_ = 0, walSynced_ = 0;  // records written (walMu_) / known durable (syncMu_)
@@ -141,7 +151,8 @@ class Engine {
   void checkPrivileges(const Stmt& s);
   ResultSet doUser(Stmt& s);
   ResultSet doBackup(Stmt& s);
-  void writeSnapshot(const std::string& path, const std::string& onlyDb, uint64_t* lsnOut = nullptr);
+  // posOut (optional): {WAL generation, offset} the snapshot corresponds to (records after it are not in it).
+  void writeSnapshot(const std::string& path, const std::string& onlyDb, uint64_t* lsnOut = nullptr, std::pair<uint64_t, int64_t>* posOut = nullptr);
   // Replication state: recent WAL records by lsn (guarded by walMu_), replica thread.
   void replAppend(const std::string& rec);
   std::vector<std::string> leaves_;
@@ -176,7 +187,8 @@ class Engine {
   void logWrite(const std::string& sql, const std::string& db = "");
   ResultSet doTxn(const std::string& what);
   ResultSet doSnapshot();
-  void loadSnapshot(const std::string& path);
+  // fromDb/toDb: restore a database under another name; withUsers: also the users / routines / grants side file.
+  void loadSnapshot(const std::string& path, const std::string& fromDb = "", const std::string& toDb = "", bool withUsers = true);
   void commitTxn();
   void rollbackTxn();
   ResultSet doSelect(Stmt& s, bool explain);

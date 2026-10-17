@@ -1480,14 +1480,28 @@ struct Parser {
       expectSym("=");
       if (acceptKw("PASSWORD")) { expectSym("("); s.path = t[p++].v; expectSym(")"); }
       else s.path = t[p++].v;
-    } else if (acceptKw("BACKUP") || acceptKw("RESTORE")) {  // BACKUP DATABASE db TO 'dir' / RESTORE DATABASE db FROM 'dir'
+    } else if (acceptKw("BACKUP") || acceptKw("RESTORE")) {
+      // BACKUP DATABASE db [WITH ..] TO {'dir' | S3 'bucket/prefix' [CONFIG '{..}'] [CREDENTIALS '{..}']}
+      // RESTORE DATABASE db [AS new] FROM {'dir' | S3 ..} [UNTIL TIMESTAMP 'yyyy-mm-dd hh:mm:ss']
       s.type = Stmt::BACKUP;
       s.setName = upper(t[p - 1].v);
       if (!acceptKw("DATABASE")) expectKw("SCHEMA");
       s.table = ident();
+      if (acceptKw("AS")) s.asName = ident();
+      while (cur().k == Tok::ID && !isKw("TO") && !isKw("FROM")) ++p;  // WITH INIT / DIFFERENTIAL ..
       if (!acceptKw("TO")) expectKw("FROM");
+      if (acceptKw("S3")) s.setValue = "S3";
       if (cur().k != Tok::STR) fail("path");
       s.path = t[p++].v;
+      for (;;) {
+        if (acceptKw("CONFIG") && cur().k == Tok::STR) s.config = t[p++].v;
+        else if (acceptKw("CREDENTIALS") && cur().k == Tok::STR) s.credentials = t[p++].v;
+        else if (acceptKw("UNTIL")) {
+          acceptKw("TIMESTAMP");
+          if (cur().k != Tok::STR) fail("timestamp");
+          s.until = t[p++].v;
+        } else break;
+      }
       while (cur().k != Tok::END && !isSym(";")) ++p;
     } else if (acceptKw("ALTER")) {
       if (!acceptKw("TABLE")) {  // ALTER DATABASE / USER / ..: ignored

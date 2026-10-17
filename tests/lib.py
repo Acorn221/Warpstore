@@ -94,6 +94,17 @@ def server_from_env():
     return Server().start()
 
 
+def _diff(got, want, path=""):
+    """First difference between nested sequences (big results stay readable)."""
+    if isinstance(got, (list, tuple)) and isinstance(want, (list, tuple)):
+        for i, (a, b) in enumerate(zip(got, want)):
+            if a != b:
+                return _diff(a, b, f"{path}[{i}]")
+        if len(got) != len(want):
+            return f"\n  {path}: length {len(got)} vs {len(want)}; extra: {(got[len(want):] or want[len(got):])[:3]!r}"
+    return f"\n  {path}: got {got!r}\n  {' ' * len(path)}  want {want!r}"
+
+
 class Checker:
     def __init__(self):
         self.fails = 0
@@ -109,7 +120,10 @@ class Checker:
         return cond
 
     def eq(self, name, got, want):
-        return self.check(name, got == want, f"\n  got:  {got!r}\n  want: {want!r}")
+        detail = f"\n  got:  {got!r}\n  want: {want!r}"
+        if got != want and isinstance(got, (list, tuple)) and isinstance(want, (list, tuple)):
+            detail = _diff(got, want)
+        return self.check(name, got == want, detail)
 
     def raises(self, name, fn, code=None):
         try:

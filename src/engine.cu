@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <unistd.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <zstd.h>
 #include "gpu.h"
@@ -4006,9 +4007,11 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
   fseeko(f, 0, SEEK_END);
   const int64_t size = ftello(f);
   fseeko(f, 0, SEEK_SET);
-  char hdr[8];
-  const bool v2 = fread(hdr, 1, 8, f) == 8 && memcmp(hdr, "GDBWAL2\n", 8) == 0;
-  if (!v2) fseeko(f, 0, SEEK_SET);
+  char hdr[16];
+  const size_t got = fread(hdr, 1, 16, f);
+  const bool v3 = got == 16 && memcmp(hdr, "GDBWAL3\n", 8) == 0;
+  const bool v2 = v3 || (got >= 8 && memcmp(hdr, "GDBWAL2\n", 8) == 0);  // (records: same layout)
+  fseeko(f, v3 ? 16 : v2 ? 8 : 0, SEEK_SET);
   int64_t good = ftello(f), n = 0;
   replaying_ = true;
   auto apply = [&](std::string sql) {
@@ -4042,7 +4045,8 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
       fprintf(stderr, "[gpu-db] WAL %s: checksum mismatch at offset %lld; ignoring the rest\n", path.c_str(), (long long)at);
       break;
     }
-    if (rec.rfind("\x1eTXN", 0) == 0) {  // a committed transaction: its statements, applied together
+    if (rec.rfind("\x1eTS", 0) == 0) {  // time marker
+    } else if (rec.rfind("\x1eTXN", 0) == 0) {  // a committed transaction: its statements, applied together
       size_t i = 4;
       while (i + 4 <= rec.size()) {
         uint32_t l;
@@ -4113,14 +4117,32 @@ void Engine::walOpen(bool truncate) {
   fseeko(wal_, 0, SEEK_END);
   walOff_ = walCap_ = ftello(wal_);  // after replay the file ends at its last record
   if (walOff_ == 0) {
-    fwrite("GDBWAL2\n", 1, 8, wal_);
+    fwrite("GDBWAL3\n", 1, 8, wal_);
+    fwrite(&walGen_, 8, 1, wal_);
     fflush(wal_);
-    walOff_ = walCap_ = 8;
+    walOff_ = walCap_ = 16;
+  } else {
+    char hdr[16];
+    fseeko(wal_, 0, SEEK_SET);
+    if (fread(hdr, 1, 16, wal_) == 16 && memcmp(hdr, "GDBWAL3\n", 8) == 0) memcpy(&walGen_, hdr + 8, 8);
+    fseeko(wal_, 0, SEEK_END);
   }
+  walTsSec_ = 0;  // the next record gets a time marker
 }
 
 void Engine::walAppendLocked(const std::string& rec) {
   if (!wal_) return;
+  const int64_t us = nowUs();
+  if (us / 1000000 != walTsSec_) {  // time marker for point-in-time restores (at most one a second)
+    walTsSec_ = us / 1000000;
+    std::string ts = "\x1eTS";
+    ts.append((const char*)&us, 8);
+    walWriteLocked(ts);
+  }
+  walWriteLocked(rec);
+}
+
+void Engine::walWriteLocked(const std::string& rec) {
   const uint32_t len = (uint32_t)rec.size(), crc = (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)rec.size());
   const int64_t need = 8 + (int64_t)rec.size();
   if (walOff_ + need > walCap_) {  // zero the next chunk (and make its size durable) before using it
@@ -4212,7 +4234,7 @@ void Engine::recover() {
     int64_t n = 0;
     if (access(old.c_str(), F_OK) == 0) {
       if (tmpLeft) n += replayWal(old, false);
-      unlink(old.c_str());
+      archiveWal(old);
     }
     n += replayWal(path, true);
     fprintf(stderr, "[gpu-db] replayed %lld WAL records in %.0f ms\n", (long long)n, msSince(t0));
@@ -4522,6 +4544,10 @@ ResultSet Engine::doTxn(const std::string& what) {
   ResultSet r;
   return r;
 }
+
+thread_local std::string tLoadLogPath;  // doLoad loaded a copy of the file: the WAL names the copy
+static void copyFile(const std::string& from, const std::string& to);
+static void mkdirs(const std::string& d);
 
 void Engine::logWrite(const std::string& sql, const std::string& db) {
   if (replaying_) return;
@@ -4847,7 +4873,20 @@ ResultSet Engine::execute(const std::string& sql) {
     case Stmt::DESCRIBE: return doDescribe(s);
     default: return okResult(0);
   }
-  if (s.type != Stmt::OPTIMIZE) logWrite(sql, s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
+  if (s.type != Stmt::OPTIMIZE) {
+    std::string logged = sql;
+    if (!tLoadLogPath.empty()) {  // LOAD DATA INFILE of a copy (doLoad): log the copy's path
+      auto quote = [](const std::string& x) {
+        std::string q = "'";
+        for (char ch : x) q += ch == '\'' ? std::string("''") : std::string(1, ch);
+        return q + "'";
+      };
+      const size_t at = logged.find(quote(s.path));
+      if (at != std::string::npos) logged.replace(at, quote(s.path).size(), quote(tLoadLogPath));
+      tLoadLogPath.clear();
+    }
+    logWrite(logged, s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
+  }
   return r;
 }
 
@@ -5914,9 +5953,27 @@ ResultSet Engine::doLoad(Stmt& s) {
     }
   }
   if (replaying_) replayedLoads_.insert(s.path);
+  std::string path = s.path;
+  if (replaying_ && access(path.c_str(), F_OK) != 0 && !gWalArchive.empty() && path.find("/loads/g") != std::string::npos) {
+    const std::string alt = gWalArchive + path.substr(path.rfind("/loads/"));  // moved to the archive already
+    if (access(alt.c_str(), F_OK) == 0) path = alt;
+  }
+  if (!replaying_ && !dir_.empty() && s.path.rfind(dir_ + "/", 0) != 0) {
+    // the WAL must not depend on a file outside the data directory: load (and log) a copy
+    static std::atomic<uint64_t> seq{0};
+    uint64_t gen;
+    {
+      std::lock_guard<std::mutex> g(walMu_);
+      gen = walGen_;
+    }
+    mkdirs(dir_ + "/loads");
+    path = dir_ + "/loads/g" + std::to_string(gen) + "-" + std::to_string(nowUs()) + "-" + std::to_string(++seq) + ".dat";
+    copyFile(s.path, path);
+    tLoadLogPath = path;
+  }
   // The exclusive lock is released briefly every 256K rows so queries are not stalled by a long load
   // (they see the rows loaded so far, like other uncommitted writes).
-  int64_t n = t->loadFile(s.path, s.delim, s.skipLines, srcOf, [&] {
+  int64_t n = t->loadFile(path, s.delim, s.skipLines, srcOf, [&] {
     lk.unlock();
     std::this_thread::yield();
     lk.lock();
@@ -9491,6 +9548,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   }
   // FROM: derived tables, CTE references, views and information_schema become temp tables.
   auto resolveFrom = [&]() {
+  std::string viewDb;
   for (auto& f : s.from) {
     if (!f.sub && !q.ctes.count(lower(f.name))) {
       if (lower(f.name).rfind("information_schema.", 0) == 0 || (lower(currentDb()) == "information_schema" && f.name.find('.') == std::string::npos)) {
@@ -9502,7 +9560,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       {
         std::lock_guard<std::mutex> g(cat_.mu);
         auto it = cat_.views.find(Catalog::key(f.name));
-        if (it != cat_.views.end()) view = it->second;
+        if (it != cat_.views.end()) view = it->second, viewDb = it->first.substr(0, it->first.find('.'));
       }
       if (!view.empty()) {
         std::vector<std::string> names;
@@ -9523,6 +9581,13 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     if (f.sub) {
       Stmt sub = cloneStmt(*f.sub);
       tColumnar = true;  // a numeric GROUP BY result may come back as columns (straight into the temp table)
+      struct DbSwitch {  // a view's tables resolve in the view's database
+        std::string saved;
+        bool on;
+        DbSwitch(const std::string& d) : saved(currentDb()), on(!d.empty()) { if (on) currentDb() = d; }
+        ~DbSwitch() { if (on) currentDb() = saved; }
+      } sw(viewDb);
+      viewDb.clear();
       ResultSet r = query(sub, q, false, true);
       tColumnar = false;
       f.name = makeTemp(r, q, f.alias);
@@ -10883,7 +10948,7 @@ FILE* zstdReader(FILE* raw) {
 }
 }  // namespace
 
-void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb, uint64_t* lsnOut) {
+void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb, uint64_t* lsnOut, std::pair<uint64_t, int64_t>* posOut) {
   std::vector<std::shared_ptr<Table>> tabs;
   std::set<std::string> dbs;
   std::map<std::string, std::string> views;
@@ -10901,6 +10966,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   for (auto& t : tabs) locks.emplace_back(t->mu);
   std::lock_guard<std::mutex> wg(walMu_);
   if (lsnOut) *lsnOut = lsn_;  // the snapshot contains exactly the records up to this lsn
+  if (posOut) *posOut = {walGen_, walOff_};  // ... and exactly the WAL up to here
   const std::string fin = outPath.empty() ? dir_ + "/snapshot.bin" : outPath, tmp = fin + ".tmp";
   FILE* f = fopen(tmp.c_str(), "wb");
   if (!f) throw SqlError("cannot write " + tmp, 1105);
@@ -10971,14 +11037,120 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     if (wal_) fclose(wal_);
     wal_ = nullptr;
     rename((dir_ + "/wal.log").c_str(), (dir_ + "/wal.old").c_str());
+    ++walGen_;
     walOpen(true);
     if (wal_) fdatasync(fileno(wal_));
     syncDir(fin);
   }
   if (rename(tmp.c_str(), fin.c_str()) != 0) throw SqlError("cannot install snapshot " + fin, 1105);
   syncDir(fin);
-  if (outPath.empty()) unlink((dir_ + "/wal.old").c_str());
+  if (outPath.empty()) {
+    archiveWal(dir_ + "/wal.old");
+    archiveLoads(walGen_);
+  }
   (void)rows;
+}
+
+std::string gWalArchive;
+
+static void copyFile(const std::string& from, const std::string& to) {
+  int in = open(from.c_str(), O_RDONLY);
+  if (in < 0) throw SqlError("cannot read " + from, 1105);
+  int out = open((to + ".tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (out < 0) {
+    ::close(in);
+    throw SqlError("cannot write " + to, 1105);
+  }
+  struct stat st;
+  fstat(in, &st);
+  off_t left = st.st_size;
+  bool ok = true;
+  while (left > 0) {  // in-kernel copy (a reflink on filesystems that have them)
+    ssize_t k = copy_file_range(in, nullptr, out, nullptr, (size_t)std::min<off_t>(left, 1 << 30), 0);
+    if (k <= 0) {
+      ok = false;
+      break;
+    }
+    left -= k;
+  }
+  if (!ok) {  // e.g. not supported across these filesystems: plain copy
+    lseek(in, 0, SEEK_SET);
+    lseek(out, 0, SEEK_SET);
+    if (ftruncate(out, 0) != 0) {}
+    std::vector<char> buf(1 << 20);
+    ok = true;
+    for (ssize_t k; ok && (k = read(in, buf.data(), buf.size())) > 0;) ok = write(out, buf.data(), (size_t)k) == k;
+  }
+  ok = ok && fdatasync(out) == 0;
+  ::close(in);
+  ::close(out);
+  if (!ok || rename((to + ".tmp").c_str(), to.c_str()) != 0) {
+    unlink((to + ".tmp").c_str());
+    throw SqlError("cannot copy " + from + " to " + to, 1105);
+  }
+}
+
+static void mkdirs(const std::string& d) {
+  for (size_t p = 1; p <= d.size(); ++p)
+    if (p == d.size() || d[p] == '/') mkdir(d.substr(0, p).c_str(), 0755);
+}
+
+static uint64_t walFileGen(const std::string& path) {
+  uint64_t g = 0;
+  if (FILE* f = fopen(path.c_str(), "rb")) {
+    char hdr[16];
+    if (fread(hdr, 1, 16, f) == 16 && memcmp(hdr, "GDBWAL3\n", 8) == 0) memcpy(&g, hdr + 8, 8);
+    fclose(f);
+  }
+  return g;
+}
+
+void Engine::archiveWal(const std::string& path) {
+  if (access(path.c_str(), F_OK) != 0) return;
+  if (!gWalArchive.empty()) {
+    const uint64_t g = walFileGen(path);
+    if (g) {
+      try {
+        mkdirs(gWalArchive);
+        char name[64];
+        snprintf(name, sizeof name, "/wal-%020llu.log", (unsigned long long)g);
+        const std::string to = gWalArchive + name;
+        if (rename(path.c_str(), to.c_str()) != 0) copyFile(path, to);
+      } catch (std::exception& e) {
+        fprintf(stderr, "[gpu-db] WAL archive: %s (keeping %s)\n", e.what(), path.c_str());
+        return;
+      }
+    }
+  }
+  unlink(path.c_str());
+}
+
+// Server-side LOAD DATA INFILE copies its file to <data dir>/loads/g<gen>-.. before logging it, so the
+// WAL never depends on files outside the data directory. Once a snapshot covers a WAL generation its
+// copies go to the archive (they are needed to replay archived WALs) or are deleted.
+void Engine::archiveLoads(uint64_t belowGen) {
+  const std::string d = dir_ + "/loads";
+  DIR* dp = opendir(d.c_str());
+  if (!dp) return;
+  std::vector<std::string> names;
+  while (dirent* e = readdir(dp))
+    if (e->d_name[0] == 'g') names.push_back(e->d_name);
+  closedir(dp);
+  for (auto& n : names) {
+    if (strtoull(n.c_str() + 1, nullptr, 10) >= belowGen) continue;
+    const std::string from = d + "/" + n;
+    if (!gWalArchive.empty()) {
+      try {
+        mkdirs(gWalArchive + "/loads");
+        const std::string to = gWalArchive + "/loads/" + n;
+        if (rename(from.c_str(), to.c_str()) != 0) copyFile(from, to);
+      } catch (std::exception& e) {
+        fprintf(stderr, "[gpu-db] WAL archive: %s\n", e.what());
+        continue;
+      }
+    }
+    unlink(from.c_str());
+  }
 }
 
 // ---- Users: mysql_native_password (token = SHA1(pw) XOR SHA1(scramble + SHA1(SHA1(pw)))).
@@ -11178,34 +11350,222 @@ ResultSet Engine::doUser(Stmt& s) {
   return okResult(0);
 }
 
+// BACKUP DATABASE db TO {'dir' | S3 'bucket/prefix' ..}: a consistent snapshot of the database
+// (<db>.backup) plus a manifest with the WAL position it corresponds to. RESTORE DATABASE db [AS new]
+// FROM .. [UNTIL TIMESTAMP 'ts'] loads it and, with UNTIL, replays the archived WAL (--wal-archive)
+// and the live WAL for that database up to the time given (point-in-time restore).
+static std::string jsonEsc(const std::string& x) {
+  std::string o;
+  for (char ch : x) {
+    if (ch == '"' || ch == '\\') o += '\\';
+    o += ch;
+  }
+  return o;
+}
+
 ResultSet Engine::doBackup(Stmt& s) {
-  std::string path = s.path;
-  struct stat st;
-  if (stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) path += "/" + lower(s.table) + ".backup";
+  const std::string db = lower(s.table);
+  const bool s3 = s.setValue == "S3";
+  const std::string stage = (dir_.empty() ? std::string("/tmp/gpudb") : dir_) + "/backup-stage-" + std::to_string(nowUs());
+  struct Cleanup {
+    std::vector<std::string> files;
+    std::string dir;
+    ~Cleanup() {
+      for (auto& f : files) unlink(f.c_str());
+      if (!dir.empty()) rmdir(dir.c_str());
+    }
+  } cleanup;
+  std::string prefix = s.path;  // S3: bucket/prefix
+  while (!prefix.empty() && prefix.back() == '/') prefix.pop_back();
+  const std::string bucket = s3 ? s3Bucket(prefix) : "";
+  const std::string keyBase = s3 ? (prefix.size() > bucket.size() ? prefix.substr(bucket.size() + 1) + "/" : "") + db + ".backup" : "";
+  auto localFile = [&] {
+    if (s3) {
+      mkdirs(stage);
+      cleanup.dir = stage;
+      return stage + "/" + db + ".backup";
+    }
+    if (s.path.size() > 7 && s.path.compare(s.path.size() - 7, 7, ".backup") == 0) return s.path;
+    struct stat st;
+    if (s.setName == "BACKUP" && stat(s.path.c_str(), &st) != 0) mkdirs(s.path);
+    return s.path + "/" + db + ".backup";
+  };
   if (s.setName == "BACKUP") {
     {
       std::lock_guard<std::mutex> g(cat_.mu);
-      if (!cat_.dbs.count(lower(s.table))) throw SqlError("Unknown database '" + s.table + "'", 1049);
+      if (!cat_.dbs.count(db)) throw SqlError("Unknown database '" + s.table + "'", 1049);
     }
-    writeSnapshot(path, s.table);
-    return okResult(0, "backup written to " + path);
+    if (tTxn.active) commitTxn();
+    const std::string file = localFile();
+    std::pair<uint64_t, int64_t> pos{0, 0};
+    auto t0 = Clock::now();
+    writeSnapshot(file, db, nullptr, &pos);
+    const int64_t now = nowUs();
+    const std::string man = "{\"format\":\"gpudb-backup-1\",\"database\":\"" + jsonEsc(db) + "\",\"created_us\":" + std::to_string(now) +
+                            ",\"created\":\"" + Value::Ts(now).toString() + "\",\"wal_gen\":" + std::to_string(pos.first) +
+                            ",\"wal_offset\":" + std::to_string(pos.second) + ",\"data_dir\":\"" + jsonEsc(dir_) + "\"}\n";
+    {
+      FILE* f = fopen((file + ".manifest").c_str(), "wb");
+      if (!f) throw SqlError("cannot write " + file + ".manifest", 1105);
+      fwrite(man.data(), 1, man.size(), f);
+      fflush(f);
+      fdatasync(fileno(f));
+      fclose(f);
+    }
+    if (s3) {
+      cleanup.files = {file, file + ".manifest", file + ".users"};
+      s3PutFile(bucket, keyBase, file, s.config, s.credentials);
+      s3PutFile(bucket, keyBase + ".manifest", file + ".manifest", s.config, s.credentials);
+    } else {
+      unlink((file + ".users").c_str());  // users / grants are server-wide: not part of a database backup
+    }
+    struct stat st;
+    stat(s3 ? (stage + "/" + db + ".backup").c_str() : file.c_str(), &st);
+    return okResult(0, "backup of " + db + " written to " + (s3 ? "s3://" + bucket + "/" + keyBase : file) + " (" +
+                           std::to_string(st.st_size) + " bytes, " + fmtMs(msSince(t0)) + " ms, WAL position " + std::to_string(pos.first) + ":" +
+                           std::to_string(pos.second) + ")");
   }
+  // RESTORE
+  const std::string target = s.asName.empty() ? db : lower(s.asName);
   {
     std::lock_guard<std::mutex> g(cat_.mu);
     for (auto& [k, t] : cat_.tables)
-      if (lower(t->db) == lower(s.table)) throw SqlError("Can't restore: database '" + s.table + "' has tables", 1007);
+      if (lower(t->db) == target) throw SqlError("Can't restore: database '" + target + "' has tables", 1007);
   }
+  const std::string file = localFile();
+  if (s3) {
+    cleanup.files = {file, file + ".manifest"};
+    s3GetFile(bucket, keyBase, file, s.config, s.credentials);
+    try {
+      s3GetFile(bucket, keyBase + ".manifest", file + ".manifest", s.config, s.credentials);
+    } catch (std::exception&) {
+    }
+  }
+  if (access(file.c_str(), R_OK) != 0) throw SqlError("backup file " + file + " not found", 1105);
+  std::string man;
+  if (FILE* f = fopen((file + ".manifest").c_str(), "rb")) {
+    char buf[4096];
+    man.assign(buf, fread(buf, 1, sizeof buf, f));
+    fclose(f);
+  }
+  int64_t untilUs = 0;
+  if (!s.until.empty()) {
+    if (!parseDateTime(s.until, untilUs)) throw SqlError("bad UNTIL TIMESTAMP '" + s.until + "'", 1525);
+    if (man.empty()) throw SqlError("UNTIL needs the backup's manifest (" + file + ".manifest)", 1105);
+    if (std::atoll(jsonField(man, "created_us").c_str()) > untilUs)
+      throw SqlError("UNTIL TIMESTAMP is before the backup was taken (" + jsonField(man, "created") + ")", 1105);
+  }
+  auto t0 = Clock::now();
   const bool saved = replaying_;
   replaying_ = true;  // the restore itself is not logged statement by statement ...
+  int64_t replayed = 0;
   try {
-    loadSnapshot(path);
+    loadSnapshot(file, db, target, false);
+    if (untilUs)
+      replayed = replayFrom(db, target, std::strtoull(jsonField(man, "wal_gen").c_str(), nullptr, 10), std::atoll(jsonField(man, "wal_offset").c_str()), untilUs);
   } catch (...) {
     replaying_ = saved;
     throw;
   }
   replaying_ = saved;
   if (!dir_.empty()) doSnapshot();  // ... so make it durable with a checkpoint
-  return okResult(0, "restored from " + path);
+  return okResult(0, "restored " + target + " from " + (s3 ? "s3://" + bucket + "/" + keyBase : file) +
+                         (untilUs ? " + " + std::to_string(replayed) + " WAL records up to " + s.until : "") + " in " + fmtMs(msSince(t0)) + " ms");
+}
+
+// Replays the WAL from {gen, off} (archive files, then the live WAL) for database db (as asDb) up to
+// time untilUs. Returns the number of statements applied.
+int64_t Engine::replayFrom(const std::string& db, const std::string& asDb, uint64_t gen, int64_t off, int64_t untilUs) {
+  std::map<uint64_t, std::string> files;
+  if (!gWalArchive.empty())
+    if (DIR* dp = opendir(gWalArchive.c_str())) {
+      while (dirent* e = readdir(dp)) {
+        unsigned long long g;
+        if (sscanf(e->d_name, "wal-%llu.log", &g) == 1 && g >= gen) files[g] = gWalArchive + "/" + e->d_name;
+      }
+      closedir(dp);
+    }
+  uint64_t liveGen;
+  {
+    std::lock_guard<std::mutex> g(walMu_);
+    liveGen = walGen_;
+  }
+  if (!dir_.empty() && liveGen >= gen && !files.count(liveGen)) files[liveGen] = dir_ + "/wal.log";
+  if (files.empty() || files.begin()->first != gen)
+    throw SqlError("point-in-time restore needs WAL generation " + std::to_string(gen) + " (is --wal-archive set to the directory with the archived WALs?)", 1105);
+  for (auto it = files.begin(); std::next(it) != files.end(); ++it)
+    if (std::next(it)->first != it->first + 1)
+      throw SqlError("WAL generation " + std::to_string(it->first + 1) + " is missing from the archive", 1105);
+  int64_t applied = 0;
+  const std::string savedDb = currentDb();
+  auto apply = [&](const std::string& rec) {
+    size_t sep = rec.find('\x1f');
+    const std::string recDb = sep == std::string::npos ? "" : rec.substr(0, sep);
+    std::string sql = sep == std::string::npos ? rec : rec.substr(sep + 1);
+    Stmt st;
+    try {
+      st = parseSql(sql);
+    } catch (std::exception&) {
+      return;
+    }
+    const size_t dot = st.table.find('.');
+    const std::string tdb = st.type == Stmt::CREATE_DB || st.type == Stmt::DROP_DB ? lower(st.table)
+                            : dot != std::string::npos                             ? lower(st.table.substr(0, dot))
+                                                                                   : lower(recDb);
+    if (tdb != db || st.type == Stmt::CREATE_DB) return;
+    if (asDb != db && dot != std::string::npos) {  // db.table in the statement: point it at the new name
+      const size_t at = lower(sql).find(db + ".");
+      if (at != std::string::npos) sql.replace(at, db.size(), asDb);
+    }
+    if (st.type == Stmt::DROP_DB) sql = "DROP DATABASE " + asDb;
+    currentDb() = lower(recDb) == db ? asDb : recDb;
+    try {
+      execute(sql);
+      ++applied;
+    } catch (std::exception& e) {
+      fprintf(stderr, "[gpu-db] point-in-time restore: %s: %s\n", e.what(), sql.substr(0, 200).c_str());
+    }
+  };
+  bool done = false;
+  for (auto& [g, path] : files) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) throw SqlError("cannot read " + path, 1105);
+    char hdr[16];
+    if (fread(hdr, 1, 16, f) != 16 || memcmp(hdr, "GDBWAL3\n", 8) != 0) {
+      fclose(f);
+      throw SqlError(path + " is not a format-3 WAL", 1105);
+    }
+    fseeko(f, g == gen ? std::max<int64_t>(off, 16) : 16, SEEK_SET);
+    for (;;) {
+      uint32_t len, crc;
+      if (fread(&len, 4, 1, f) != 1 || fread(&crc, 4, 1, f) != 1 || len == 0) break;
+      std::string rec(len, '\0');
+      if (fread(rec.data(), 1, len, f) != len || (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)len) != crc) break;
+      if (rec.rfind("\x1eTS", 0) == 0 && rec.size() >= 11) {
+        int64_t us;
+        memcpy(&us, rec.data() + 3, 8);
+        if (us > untilUs) {
+          done = true;
+          break;
+        }
+      } else if (rec.rfind("\x1eTXN", 0) == 0) {
+        for (size_t i = 4; i + 4 <= rec.size();) {
+          uint32_t l;
+          memcpy(&l, rec.data() + i, 4);
+          i += 4;
+          if (i + l > rec.size()) break;
+          apply(rec.substr(i, l));
+          i += l;
+        }
+      } else {
+        apply(rec);
+      }
+    }
+    fclose(f);
+    if (done) break;
+  }
+  currentDb() = savedDb;
+  return applied;
 }
 
 
@@ -11220,9 +11580,10 @@ void Engine::connectionClosed() {
   tTempTables.clear();
 }
 
-void Engine::loadSnapshot(const std::string& path) {
+void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, const std::string& toDb, bool withUsers) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return;
+  auto mapDb = [&](const std::string& d) { return !fromDb.empty() && lower(d) == lower(fromDb) ? lower(toDb) : d; };
   auto t0 = Clock::now();
   const std::string savedDb = currentDb();
   char magic[8];
@@ -11239,15 +11600,17 @@ void Engine::loadSnapshot(const std::string& path) {
     getStr(f, d);
     if (d.size() > 5 && d.compare(d.size() - 5, 5, "\x1fSYNC") == 0) {
       d.resize(d.size() - 5);
-      cat_.syncDbs.insert(d);
+      cat_.syncDbs.insert(mapDb(d));
     }
-    cat_.dbs.insert(d);
+    cat_.dbs.insert(mapDb(d));
   }
   getU64(f, n);
   for (uint64_t i = 0; i < n; ++i) {
     std::string k, v;
     getStr(f, k);
     getStr(f, v);
+    const size_t dot = k.find('.');
+    if (dot != std::string::npos) k = mapDb(k.substr(0, dot)) + k.substr(dot);
     cat_.views[k] = v;
   }
   getU64(f, n);
@@ -11260,6 +11623,7 @@ void Engine::loadSnapshot(const std::string& path) {
     getStr(f, ddl);
     getU64(f, next);
     getU64(f, rows);
+    db = mapDb(db);
     currentDb() = db;
     Stmt cs = parseSql(ddl);
     doCreate(cs);
@@ -11279,6 +11643,7 @@ void Engine::loadSnapshot(const std::string& path) {
     for (uint64_t i = 0; i < n; ++i) {
       auto p = std::make_shared<Pipeline>();
       for (auto* x : {&p->name, &p->db, &p->table, &p->glob, &p->delim, &p->cols}) getStr(f, *x);
+      p->db = mapDb(p->db);
       uint64_t skip, want, nd;
       getU64(f, skip);
       getU64(f, want);
@@ -11293,7 +11658,7 @@ void Engine::loadSnapshot(const std::string& path) {
       pipes_[lower(p->name)] = p;
     }
   fclose(f);
-  if (FILE* uf = fopen((path + ".users").c_str(), "rb")) {
+  if (FILE* uf = withUsers ? fopen((path + ".users").c_str(), "rb") : nullptr) {
     uint64_t nu;
     if (getU64(uf, nu))
       for (uint64_t i = 0; i < nu; ++i) {

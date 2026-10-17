@@ -1369,6 +1369,7 @@ int main(int argc, char** argv) {
     else if (a == "--compress") g_compress = 1;
     else if (a == "--no-compress") g_compress = 0;
     else if (a == "--sync" || a == "--sync-durability") sync = true;
+    else if (a == "--wal-archive" && i + 1 < argc) gWalArchive = argv[++i];
     else if (a == "--async-commit" || a == "--no-sync") sync = false;
     else if (a == "--partitions" && i + 1 < argc) partitions = atoi(argv[++i]);
     else if (a == "--plancache-dir" && i + 1 < argc) planCacheDir = argv[++i], planCacheDirSet = true;
@@ -1400,7 +1401,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-connections" && i + 1 < argc) g_maxConns = atoi(argv[++i]);
     else if (a == "--insecure-no-root-password") insecure = true;
     else {
-      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [-v]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [-v]\n", argv[0]);
       return 2;
     }
   }

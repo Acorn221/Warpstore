@@ -21,6 +21,9 @@ struct S3Object {
 std::vector<S3Object> s3List(const std::string& path, const std::string& config, const std::string& creds);
 std::string s3Get(const std::string& bucket, const std::string& key, const std::string& config, const std::string& creds);
 std::string s3Bucket(const std::string& path);
+// Backups: a local file to / from an S3 object (streamed; multipart above 64 MB).
+void s3PutFile(const std::string& bucket, const std::string& key, const std::string& file, const std::string& config, const std::string& creds);
+void s3GetFile(const std::string& bucket, const std::string& key, const std::string& file, const std::string& config, const std::string& creds);
 std::string httpGet(const std::string& url);
 // POST body (JSON or raw bytes) and return the response body; throws SqlError on HTTP >= 300.
 std::string httpPost(const std::string& url, const std::string& body, const std::string& contentType = "application/json");
