@@ -1057,7 +1057,53 @@ void serve(int fd, Engine* engine) {
         ++i;
       }
     }
-    if (!engine->checkAuth(user, scramble, token)) {
+    // Plugin the client answered with (after the database name): caching_sha2_password (MySQL 8+ / 9
+    // clients) is verified with the stored SHA256 hash, else the client is switched to native.
+    std::string plugin;
+    {
+      size_t j = i;
+      if (ccaps & 0x8) {
+        while (j < pkt.size() && pkt[j]) ++j;
+        ++j;
+      }
+      if ((ccaps & 0x80000) && j < pkt.size())
+        while (j < pkt.size() && pkt[j]) plugin += pkt[j++];
+    }
+    bool authOk = false;
+    if (plugin == "caching_sha2_password") {
+      const int r = engine->checkAuthSha2(user, scramble, token);
+      if (r == 1) {
+        authOk = true;
+        c.packet(std::string("\x01\x03", 2));  // AuthMoreData: fast_auth_success (then OK)
+      } else if (r < 0) {  // no SHA256 hash for this user: AuthSwitchRequest to mysql_native_password
+        std::string sw;
+        sw += (char)0xfe;
+        sw += "mysql_native_password";
+        sw += '\0';
+        sw += scramble;
+        sw += '\0';
+        c.packet(sw);
+        c.flush();
+        std::string resp;
+        if (!c.readPacket(resp)) { close(fd); return; }
+        authOk = engine->checkAuth(user, scramble, resp);
+      }
+    } else if (plugin.empty() || plugin == "mysql_native_password") {
+      authOk = engine->checkAuth(user, scramble, token);
+    } else {  // another plugin: switch to native
+      std::string sw;
+      sw += (char)0xfe;
+      sw += "mysql_native_password";
+      sw += '\0';
+      sw += scramble;
+      sw += '\0';
+      c.packet(sw);
+      c.flush();
+      std::string resp;
+      if (!c.readPacket(resp)) { close(fd); return; }
+      authOk = engine->checkAuth(user, scramble, resp);
+    }
+    if (!authOk) {
       {
         std::lock_guard<std::mutex> g(g_failMu);
         auto& f = g_fails[peer];

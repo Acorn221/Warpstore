@@ -108,6 +108,7 @@ struct Dict {
 };
 
 struct Segment {
+  uint64_t id = 0;  // unique for the process (keys per-segment caches such as vector graphs)
   int part = 0;  // partition this segment belongs to
   int64_t n = 0;
   std::vector<std::vector<uint8_t>> host;  // host mirror, per column
@@ -168,6 +169,14 @@ struct Loc {
 inline Loc bufLoc(int part, int64_t row) { return Loc{-1 - part, (int32_t)row}; }
 inline int bufPart(Loc l) { return -1 - l.seg; }
 
+// CAGRA vector index state: one GPU graph per segment (by segment id), built when first searched.
+struct CagraGraph;
+struct CagraState {
+  std::mutex mu;
+  std::map<uint64_t, std::shared_ptr<CagraGraph>> graphs;
+  std::set<uint64_t> failed;
+};
+
 // Secondary index (KEY / UNIQUE KEY / CREATE INDEX): a CPU hash index on the first column's raw
 // value -> row locations, maintained on every write. Equality lookups on it skip the GPU scan.
 struct IndexMeta {
@@ -179,6 +188,9 @@ struct IndexMeta {
   bool vec = false;
   int metric = 0;  // 0 DOT_PRODUCT (higher is closer), 1 EUCLIDEAN_DISTANCE
   int nlist = 0, nprobe = 0, dim = 0;
+  int algo = 0;  // 0 IVF (CPU lists), 1 CAGRA (GPU graph per segment, cuVS)
+  int graphDegree = 32, itopk = 0;
+  std::shared_ptr<CagraState> cagra;  // built graphs by segment id (shared by copies of the index)
   int64_t trainedRows = 0;
   std::vector<float> cent;  // nlist x dim
   std::string options;
@@ -260,6 +272,7 @@ struct Table {
     std::vector<std::string> cols, refCols;
   };
   std::vector<FkMeta> fks;
+  std::vector<int> fulltextCols;  // FULLTEXT columns: inverted index built in the background
   std::vector<ColumnMeta> cols;
   std::vector<std::unique_ptr<Dict>> dicts;  // per column, VARCHAR only
   int pk = -1, sortKey = -1;           // pk: single-column PRIMARY KEY with a hash index

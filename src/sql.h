@@ -118,6 +118,7 @@ struct Stmt {
   bool reference = false;              // CREATE REFERENCE TABLE: replicated, not sharded
   int vram = 0;                        // table option VRAM = AUTO | PIN | NEVER
   std::vector<ForeignKeyDef> fks;      // FOREIGN KEY constraints (not enforced)
+  std::vector<std::string> fulltextCols;  // FULLTEXT [KEY] (cols): inverted indexes built eagerly
   std::vector<IndexDef> indexes;       // KEY / INDEX / UNIQUE KEY (secondary indexes)
   // INSERT
   std::vector<std::string> insertCols;

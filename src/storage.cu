@@ -101,11 +101,16 @@ bool parseVector(const std::string& s, std::vector<float>& out) {
   while (i < s.size()) {
     while (i < s.size() && (isspace((unsigned char)s[i]) || s[i] == ',')) ++i;
     if (i < s.size() && s[i] == ']') return true;
-    char* end = nullptr;
-    float v = strtof(s.c_str() + i, &end);
-    if (end == s.c_str() + i) return false;
+    float v = 0;
+    auto [p, ec] = std::from_chars(s.data() + i, s.data() + s.size(), v);
+    if (ec != std::errc() || p == s.data() + i) {  // from_chars rejects a leading '+': fall back
+      char* end = nullptr;
+      v = strtof(s.c_str() + i, &end);
+      if (end == s.c_str() + i) return false;
+      p = end;
+    }
     out.push_back(v);
-    i = end - s.c_str();
+    i = p - s.data();
   }
   return false;
 }
@@ -113,10 +118,12 @@ bool parseVector(const std::string& s, std::vector<float>& out) {
 std::string formatVector(const float* v, int dim) {
   if (dim > 0 && v[0] != v[0]) return "";
   std::string r = "[";
+  r.reserve((size_t)dim * 12 + 2);
   char b[32];
-  for (int i = 0; i < dim; ++i) {
-    snprintf(b, sizeof b, "%s%.9g", i ? "," : "", v[i]);
-    r += b;
+  for (int i = 0; i < dim; ++i) {  // shortest text that reads back as the same float
+    if (i) r += ',';
+    auto [p, ec] = std::to_chars(b, b + sizeof b, v[i]);
+    r.append(b, p);
   }
   return r + "]";
 }
@@ -384,6 +391,7 @@ void Table::trainVectorIndex(IndexMeta& ix) {
 
 void Table::indexAdd(Loc l) {
   for (auto& ix : indexes) {
+    if (ix.vec && ix.algo == 1) continue;  // CAGRA graphs are per segment, built on demand
     int64_t k;
     if (ixKey(ix, l, k)) ix.map[k].push_back(l);
   }
@@ -391,6 +399,7 @@ void Table::indexAdd(Loc l) {
 
 void Table::indexRemove(Loc l) {
   for (auto& ix : indexes) {
+    if (ix.vec && ix.algo == 1) continue;
     int64_t k;
     if (!ixKey(ix, l, k)) continue;
     auto it = ix.map.find(k);
@@ -403,6 +412,7 @@ void Table::indexRemove(Loc l) {
 
 void Table::buildIndex(IndexMeta& ix) {
   ix.map.clear();
+  if (ix.vec && ix.algo == 1) return;  // CAGRA: graphs are built per segment when first searched
   if (ix.vec) trainVectorIndex(ix);
   // Assigning rows to IVF lists is the expensive part: precompute keys in parallel.
   std::vector<Loc> all;
@@ -742,7 +752,9 @@ void Table::flushPart(int part) {
   }
   for (size_t start = 0; start < live.size(); start += kSegRows) {
     size_t n = std::min<size_t>(kSegRows, live.size() - start);
+    static std::atomic<uint64_t> segIds{0};
     auto seg = std::make_unique<Segment>();
+    seg->id = ++segIds;
     seg->part = part;
     seg->n = (int64_t)n;
     seg->host.resize(cols.size());

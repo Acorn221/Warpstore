@@ -1288,7 +1288,14 @@ struct Parser {
         s.indexes.back().vector = true;
         continue;
       }
-      if (acceptKw("FULLTEXT") || acceptKw("SPATIAL") || acceptKw("CHECK")) {
+      if (acceptKw("FULLTEXT")) {  // FULLTEXT [USING VERSION n] [KEY | INDEX] [name] (cols)
+        if (acceptKw("USING")) { acceptKw("VERSION"); if (cur().k == Tok::NUM) ++p; }
+        if (!acceptKw("KEY")) acceptKw("INDEX");
+        if (cur().k == Tok::ID || cur().k == Tok::QID) ident();
+        for (auto& c : parenIdents()) s.fulltextCols.push_back(c);
+        continue;
+      }
+      if (acceptKw("SPATIAL") || acceptKw("CHECK")) {
         while (!isSym(",") && !isSym(")") && cur().k != Tok::END) {
           if (acceptSym("(")) { int depth = 1; while (depth && cur().k != Tok::END) { if (isSym("(")) ++depth; if (isSym(")")) --depth; ++p; } } else ++p;
         }

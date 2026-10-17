@@ -74,6 +74,8 @@ class Engine {
   ResultSet execute(const std::string& sql);
   // Users (CREATE USER .. IDENTIFIED BY): mysql_native_password check of a handshake response.
   bool checkAuth(const std::string& user, const std::string& scramble, const std::string& token);
+  // caching_sha2_password fast auth: token = SHA256(pw) XOR SHA256(SHA256(SHA256(pw)) + scramble); -1: no SHA256 hash stored (switch to native)
+  int checkAuthSha2(const std::string& user, const std::string& scramble, const std::string& token);
   void setUser(const std::string& user);
   void connectionClosed();  // rolls back an open transaction, drops TEMPORARY tables
   void recover();

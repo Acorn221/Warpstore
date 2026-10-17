@@ -21,6 +21,8 @@
 #include <zstd.h>
 #include "gpu.h"
 #include "jit.h"
+#include "cagra.h"
+#include "embed.h"
 #include "sources.h"
 
 namespace gdb {
@@ -269,6 +271,7 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
 // After a bulk load: sort the table's large dictionaries in the background (one pass per table at
 // a time, under the read lock), so the first ORDER BY / MIN / MAX / comparison on a string column
 // does not pay for the sort.
+void (*gFtsWarm)(const Dict& d) = nullptr;  // builds a FULLTEXT column's inverted index (set by the full-text code)
 void warmDicts(const std::shared_ptr<Table>& t) {
   static std::mutex mu;
   static std::set<const Table*> busy;
@@ -284,6 +287,9 @@ void warmDicts(const std::shared_ptr<Table>& t) {
         for (auto& d : t->dicts)
           if (d && d->strs.size() >= 50000) sortedDict(*d);
       }
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      for (int c : t->fulltextCols)
+        if (c >= 0 && c < (int)t->dicts.size() && t->dicts[c] && gFtsWarm) gFtsWarm(*t->dicts[c]);
     } catch (...) {
     }
     std::lock_guard<std::mutex> g(mu);
@@ -429,6 +435,7 @@ struct BindCtx {
   std::vector<std::shared_ptr<Table>> tabs;
   std::vector<std::string> aliases;
   std::vector<std::vector<std::string>> usingCols;  // per FROM entry: JOIN .. USING columns
+  bool rowWise = false;  // UPDATE: EMBED is evaluated for the matched rows only, not for a whole dictionary
   bool inAgg = false;
   // Binding the select list of an unordered, LIMIT-ed plain projection: string functions are
   // evaluated per output row on the host instead of over the whole (large) dictionary.
@@ -898,7 +905,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
       {"SUBSTRING_INDEX", LType::VARCHAR}, {"FORMAT", LType::VARCHAR}, {"DATE_FORMAT", LType::VARCHAR},
       {"TIME_FORMAT", LType::VARCHAR}, {"DAYNAME", LType::VARCHAR}, {"MONTHNAME", LType::VARCHAR}, {"HEX", LType::VARCHAR},
       {"JSON_EXTRACT_STRING", LType::VARCHAR}, {"JSON_EXTRACT_JSON", LType::VARCHAR}, {"JSON_EXTRACT", LType::VARCHAR},
-      {"JSON_UNQUOTE", LType::VARCHAR}, {"JSON_ARRAY", LType::VARCHAR}, {"JSON_OBJECT", LType::VARCHAR}, {"JSON_QUOTE", LType::VARCHAR},
+      {"EMBED", LType::VARCHAR}, {"EMBED_TOKENS", LType::VARCHAR}, {"JSON_UNQUOTE", LType::VARCHAR}, {"JSON_ARRAY", LType::VARCHAR}, {"JSON_OBJECT", LType::VARCHAR}, {"JSON_QUOTE", LType::VARCHAR},
       {"UUID", LType::VARCHAR}, {"ELT", LType::VARCHAR}, {"REGEXP_REPLACE", LType::VARCHAR},
       {"LENGTH", LType::BIGINT}, {"OCTET_LENGTH", LType::BIGINT}, {"CHAR_LENGTH", LType::BIGINT},
       {"CHARACTER_LENGTH", LType::BIGINT}, {"LOCATE", LType::BIGINT}, {"POSITION", LType::BIGINT}, {"INSTR", LType::BIGINT},
@@ -1979,6 +1986,40 @@ size_t utf8Len(const std::string& s) {
 
 // String (and other host-only) scalar functions: evaluated on the CPU, per dictionary entry when
 // the expression has a single string column (encoded execution), otherwise per result row.
+// EMBED: texts -> VECTOR literals through the GPU model, with a process-wide cache (embedding the
+// same text again costs a lookup). Misses are embedded in one batch.
+void embedCached(const std::vector<std::string>& texts, std::vector<std::string>& out) {
+  static std::mutex mu;
+  static std::unordered_map<std::string, std::string> cache;
+  out.assign(texts.size(), std::string());
+  std::vector<size_t> miss;
+  {
+    std::lock_guard<std::mutex> g(mu);
+    for (size_t i = 0; i < texts.size(); ++i) {
+      auto it = cache.find(texts[i]);
+      if (it != cache.end()) out[i] = it->second;
+      else miss.push_back(i);
+    }
+  }
+  if (miss.empty()) return;
+  std::vector<std::string> todo;
+  for (size_t i : miss) todo.push_back(texts[i]);
+  std::vector<float> vecs;
+  std::string err;
+  const auto t0 = std::chrono::steady_clock::now();
+  if (!embedBatch(todo, vecs, err)) throw SqlError("EMBED: " + err, 1105);
+  if (getenv("GPUDB_TRACE"))
+    fprintf(stderr, "[trace] EMBED: %zu texts through the model in %.1f ms\n", todo.size(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+  const int d = embedDim();
+  std::lock_guard<std::mutex> g(mu);
+  if (cache.size() > 200000) cache.clear();
+  for (size_t j = 0; j < miss.size(); ++j) {
+    out[miss[j]] = formatVector(vecs.data() + j * d, d);
+    cache[todo[j]] = out[miss[j]];
+  }
+}
+
 // JSON text of a value: numbers bare, strings / dates quoted (MySQL's JSON rendering); raw: the value
 // already is JSON text (a JSON column, JSON_ARRAY(..), ..) and is embedded as is.
 std::string jsonQuoteStr(const std::string& x) {
@@ -2055,6 +2096,111 @@ std::vector<std::tuple<char, std::string, bool>> ftsTerms(const std::string& qs,
   }
   return r;
 }
+// Inverted index of a VARCHAR column's dictionary (each distinct value is a document): term ->
+// (code, term count) postings and per-code lengths, extended as the dictionary grows. MATCH ..
+// AGAINST then scores only the postings of the query's terms instead of re-reading every document.
+struct FtsIndex {
+  std::mutex mu;
+  size_t n = 0;  // dictionary entries indexed
+  std::map<std::string, std::vector<std::pair<int32_t, uint32_t>>> post;
+  std::vector<uint32_t> len;
+  double total = 0;
+  std::string first;  // the dictionary's first entry: detects a different dictionary at a reused address
+};
+static FtsIndex& ftsIndexFor(const Dict& d) {
+  static std::mutex mu;
+  static std::map<const Dict*, std::unique_ptr<FtsIndex>> all;
+  std::lock_guard<std::mutex> g(mu);
+  auto& p = all[&d];
+  if (!p) p = std::make_unique<FtsIndex>();
+  return *p;
+}
+// Brings ix up to date with d (caller holds ix.mu; the table is locked, so d does not change).
+static void ftsIndexUpdate(FtsIndex& ix, const Dict& d) {
+  if (ix.n > d.strs.size() || (ix.n > 0 && ix.first != d.strs[0])) {  // not the dictionary it was built for
+    ix.n = 0;
+    ix.post.clear();
+    ix.len.clear();
+    ix.total = 0;
+  }
+  if (ix.n == 0 && !d.strs.empty()) ix.first = d.strs[0];
+  const size_t from = ix.n, n = d.strs.size();
+  if (from >= n) return;
+  const size_t nth = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), (n - from) / 4096));
+  std::vector<std::vector<std::pair<std::string, std::pair<int32_t, uint32_t>>>> parts(nth);
+  std::vector<uint32_t> lens(n - from);
+  parallelFor(nth, [&](size_t b, size_t e) {
+    for (size_t t = b; t < e; ++t) {
+      const size_t lo = from + (n - from) * t / nth, hi = from + (n - from) * (t + 1) / nth;
+      std::unordered_map<std::string, uint32_t> tf;
+      for (size_t i = lo; i < hi; ++i) {
+        tf.clear();
+        auto w = ftsWords(d.strs[i]);
+        lens[i - from] = (uint32_t)w.size();
+        for (auto& x : w) ++tf[x];
+        for (auto& [term, cnt] : tf) parts[t].push_back({term, {(int32_t)i, cnt}});
+      }
+    }
+  }, 1);
+  for (auto& part : parts)  // in code order, so posting lists stay sorted
+    for (auto& [term, pc] : part) ix.post[term].push_back(pc);
+  for (uint32_t l : lens) ix.total += l;
+  ix.len.insert(ix.len.end(), lens.begin(), lens.end());
+  ix.n = n;
+}
+void ftsWarm(const Dict& d) {
+  FtsIndex& ix = ftsIndexFor(d);
+  std::lock_guard<std::mutex> g(ix.mu);
+  ftsIndexUpdate(ix, d);
+}
+const bool ftsWarmRegistered = (gFtsWarm = ftsWarm, true);
+// MATCH (col) AGAINST ('..' [IN BOOLEAN MODE]) for every code of col's dictionary, from the index
+// (the same BM25 as the per-document evaluation).
+static bool ftsMapFromIndex(const ExprP& e, const Dict& d, std::vector<double>& map) {
+  if (!(e->kind == Expr::FUNC && e->op == "MATCH_AGAINST" && e->args.size() == 2 && e->args[1]->kind == Expr::LIT)) return false;
+  const bool boolean = e->castType == "BOOLEAN";
+  const auto terms = ftsTerms(e->args[1]->lit.toString(), boolean);
+  FtsIndex& ix = ftsIndexFor(d);
+  std::lock_guard<std::mutex> g(ix.mu);
+  ftsIndexUpdate(ix, d);
+  const size_t N = ix.n;
+  map.assign(d.strs.size(), 0.0);
+  if (!N) return true;
+  const double avgdl = std::max(1.0, ix.total / (double)N), k1 = 1.2, b = 0.75;
+  std::vector<uint8_t> veto(boolean ? N : 0, 0);  // boolean mode: excluded by -term or missing a +term
+  auto docsOf = [&](const std::string& term, bool prefix, std::unordered_map<int32_t, uint32_t>& tf) {
+    if (!prefix) {
+      auto it = ix.post.find(term);
+      if (it != ix.post.end())
+        for (auto& [code, cnt] : it->second) tf[code] += cnt;
+      return;
+    }
+    for (auto it = ix.post.lower_bound(term); it != ix.post.end() && it->first.rfind(term, 0) == 0; ++it)
+      for (auto& [code, cnt] : it->second) tf[code] += cnt;
+  };
+  for (auto& [mod, term, prefix] : terms) {
+    std::unordered_map<int32_t, uint32_t> tf;
+    docsOf(term, prefix, tf);
+    if (mod == '-') {
+      for (auto& [code, cnt] : tf) veto[code] = 1;
+      continue;
+    }
+    if (mod == '+') {
+      std::vector<uint8_t> has(N, 0);
+      for (auto& [code, cnt] : tf) has[code] = 1;
+      for (size_t i = 0; i < N; ++i)
+        if (!has[i]) veto[i] = 1;
+    }
+    const double df = (double)tf.size();
+    const double idf = std::log(1 + ((double)N - df + 0.5) / (df + 0.5));
+    for (auto& [code, cnt] : tf)
+      map[code] += idf * cnt / (cnt + k1 * (1 - b + b * ix.len[code] / avgdl));
+  }
+  for (size_t i = 0; i < veto.size(); ++i)
+    if (veto[i]) map[i] = 0;
+  return true;
+}
+
 // BM25 corpus statistics for the MATCH .. AGAINST nodes of e over one column's dictionary: N,
 // average document length, df per query term (stored in the node's aux).
 void ftsStats(const ExprP& e, const Dict& d) {
@@ -2170,6 +2316,19 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     return Value::S(o + (obj ? "}" : "]"));
   }
   if (f == "JSON_QUOTE") return a[0].isNull() ? Value::Null() : Value::S(jsonQuoteStr(a[0].toString()));
+  if (f == "EMBED_TOKENS") {
+    if (a.empty() || a[0].isNull()) return Value::Null();
+    std::string o;
+    for (int t : embedTokens(a[0].toString())) o += (o.empty() ? "" : ",") + std::to_string(t);
+    return Value::S(o);
+  }
+  if (f == "EMBED") {  // EMBED(text): the sentence embedding as a VECTOR literal (GPU model, cached)
+    if (a.empty() || a[0].isNull()) return Value::Null();
+    std::vector<std::string> one{a[0].toString()};
+    std::vector<std::string> vec;
+    embedCached(one, vec);
+    return Value::S(vec[0]);
+  }
   if (anyNull()) return Value::Null();
   if (f == "CONCAT") {
     std::string r;
@@ -2536,6 +2695,7 @@ void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
 
 void encodeStrings(ExprP& e, BindCtx& c) {
   if (hasAgg(e)) return;
+  if (c.rowWise && e->str().find("EMBED(") != std::string::npos) return;
   std::set<std::pair<int, int>> cs;
   colsOf(e, cs);
   if (cs.size() != 1) return;  // several columns: evaluated per result row on the host
@@ -2547,7 +2707,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
   }
   const Dict& src = *t.dicts[bc];
   if (c.lazyStr && src.strs.size() > 4096) return;
-  if (e->str().find("MATCH") != std::string::npos) ftsStats(e, src);
+  if (e->str().find("MATCH") != std::string::npos && !(e->kind == Expr::FUNC && e->op == "MATCH_AGAINST")) ftsStats(e, src);
   PostCtx pc;
   std::vector<Value> row(1);
   pc.row = &row;
@@ -2618,7 +2778,34 @@ void encodeStrings(ExprP& e, BindCtx& c) {
     const bool directRegex = e->kind == Expr::FUNC && e->op == "REGEXP_REPLACE" && e->args.size() == 3 && e->args[0]->kind == Expr::COL &&
                              e->args[1]->kind == Expr::LIT && e->args[1]->lit.kind == Value::STR && e->args[2]->kind == Expr::LIT &&
                              e->args[2]->lit.kind == Value::STR;
-    parallelFor(N - from, [&, from](size_t b, size_t en) {
+    const bool directEmbed = e->kind == Expr::FUNC && e->op == "EMBED" && e->args.size() == 1;
+    if (directEmbed) {  // EMBED(f(col)): f per distinct value on the host, then one batched GPU pass
+      std::vector<std::string> texts(N - from);
+      std::vector<uint8_t> argNull(N - from, 0);
+      if (e->args[0]->kind == Expr::COL) {
+        std::copy(src.strs.begin() + from, src.strs.end(), texts.begin());
+      } else {
+        parallelFor(N - from, [&, from](size_t b, size_t en) {
+          PostCtx tpc;
+          std::vector<Value> trow(1);
+          tpc.row = &trow;
+          tpc.colSlot = pc.colSlot;
+          for (size_t i = b; i < en; ++i) {
+            trow[0] = Value::S(src.strs[i + from]);
+            Value v = evalPost(e->args[0], tpc);
+            if (v.isNull()) argNull[i] = 1;
+            else texts[i] = v.toString();
+          }
+        });
+      }
+      std::vector<std::string> vecs;
+      embedCached(texts, vecs);
+      for (size_t i = from; i < N; ++i) {
+        if (argNull[i - from]) nul[i] = 1;
+        else res[i] = std::move(vecs[i - from]);
+      }
+    }
+    if (!directEmbed) parallelFor(N - from, [&, from](size_t b, size_t en) {
       b += from, en += from;
       if (directRegex) {
         for (size_t i = b; i < en; ++i) res[i] = regexReplace(src.strs[i], e->args[1]->lit.s, e->args[2]->lit.s);
@@ -2684,6 +2871,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
       fprintf(stderr, "[trace]   evaluate %.1f ms, dictionary inserts %.1f ms (%zu distinct)\n",
               std::chrono::duration<double, std::milli>(tAdd - tEnc).count(),
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tAdd).count(), out->strs.size());
+  } else if (ftsMapFromIndex(e, src, map)) {  // MATCH .. AGAINST: from the inverted index
   } else {  // numeric results (length(), predicates, ..): every dictionary entry on all cores
     parallelFor(src.strs.size() - from, [&, from](size_t b, size_t en) {
       b += from, en += from;
@@ -3237,6 +3425,8 @@ bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi) {
 thread_local bool tJoinFilters = true;            // SET gpudb_join_filters = ON|OFF
 thread_local bool tAnn = true;                    // SET gpudb_vector_index = ON|OFF (OFF: exact GPU search)
 thread_local int tNprobe = 0;                     // SET gpudb_nprobe = N (0: index default)
+thread_local int tCagraItopk = 0;                 // SET gpudb_cagra_itopk = N (0: index default)
+
 thread_local int64_t tLazyRows = 2'000'000;        // SET gpudb_join_filter_rows = N (tables this big are filtered)
 
 // Would this expression compile for the GPU? (Host-only string functions over several columns don't.)
@@ -3670,7 +3860,9 @@ void Engine::vramBalance() {
         if (!sg.dev[c] || h.empty()) continue;
         const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
         sg.heat[c] = sg.heat[c] * 0.9f + (float)u;
-        const int hint = t->vramHint((int)c);
+        int hint = t->vramHint((int)c);
+        for (auto& ix : t->indexes)  // a CAGRA graph refers to the column's VRAM: it must stay there
+          if (ix.vec && ix.algo == 1 && ix.cols[0] == (int)c) hint = 1;
         anyMapped |= sg.mapped[c] != 0;
         neverResident |= hint == 2 && !sg.mapped[c];
         if (!sg.mapped[c]) resident += (int64_t)h.size();
@@ -4029,6 +4221,41 @@ void Engine::recover() {
     for (auto& t : all) warmDicts(t);
   }
   walOpen(false);
+  // CAGRA vector indexes: compile cuVS's kernels and build the segment graphs in the background, so
+  // the first vector query doesn't pay for either.
+  {
+    std::vector<std::shared_ptr<Table>> vt;
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      for (auto& [k, t] : cat_.tables)
+        for (auto& ix : t->indexes)
+          if (ix.vec && ix.algo == 1) { vt.push_back(t); break; }
+    }
+    if (!vt.empty()) std::thread([vt] {
+      try {
+        for (auto& t : vt) {
+          std::shared_lock<FairSharedMutex> lk(t->mu);
+          for (auto& ix : t->indexes) {
+            if (!(ix.vec && ix.algo == 1 && ix.cagra)) continue;
+            cagraWarm(ix.dim, ix.metric == 0);
+            const int vc = ix.cols[0];
+            for (auto& sp : t->segs) {
+              Segment& sg = *sp;
+              if (sg.n < 2048 || !sg.dev[vc] || sg.mapped[vc]) continue;
+              std::lock_guard<std::mutex> g(ix.cagra->mu);
+              if (ix.cagra->graphs.count(sg.id) || ix.cagra->failed.count(sg.id)) continue;
+              std::string err;
+              auto gr = cagraBuild((const float*)sg.dev[vc], sg.n, ix.dim, ix.metric == 0, ix.graphDegree, err);
+              if (gr) ix.cagra->graphs[sg.id] = gr;
+              else ix.cagra->failed.insert(sg.id);
+            }
+          }
+        }
+        fprintf(stderr, "[gpu-db] CAGRA vector indexes ready (%s)\n", cagraStatus().c_str());
+      } catch (...) {
+      }
+    }).detach();
+  }
   // Pipelines that were running when the server stopped resume now (after replay, so their
   // loads are logged and files loaded before the restart are not loaded again).
   std::vector<std::shared_ptr<Pipeline>> resume;
@@ -4093,6 +4320,10 @@ void clearTxnPending(Catalog& cat, const void* key) {
     for (auto& [k, t] : cat.tables) ts.push_back(t);
   }
   for (auto& t : ts) {
+    {  // most tables were not touched by this transaction: check under the shared lock first
+      std::shared_lock<FairSharedMutex> sl(t->mu);
+      if (!t->txnPending.count(key)) continue;
+    }
     std::unique_lock<FairSharedMutex> lk(t->mu);
     t->txnPending.erase(key);
   }
@@ -4110,6 +4341,10 @@ static void retireTxnPending(Catalog& cat, const void* key) {
     for (auto& [k, t] : cat.tables) ts.push_back(t);
   }
   for (auto& t : ts) {
+    {
+      std::shared_lock<FairSharedMutex> sl(t->mu);
+      if (!t->txnPending.count(key)) continue;
+    }
     std::unique_lock<FairSharedMutex> lk(t->mu);
     auto it = t->txnPending.find(key);
     if (it == t->txnPending.end()) continue;
@@ -4133,6 +4368,12 @@ static void gcRetired(Catalog& cat) {
     for (auto& [k, t] : cat.tables) ts.push_back(t);
   }
   for (auto& t : ts) {
+    {
+      std::shared_lock<FairSharedMutex> sl(t->mu);
+      bool any = false;
+      for (auto& [k, v] : t->txnPending) any |= v.commitSeq != 0;
+      if (!any) continue;
+    }
     std::unique_lock<FairSharedMutex> lk(t->mu);
     for (auto it = t->txnPending.begin(); it != t->txnPending.end();)
       if (it->second.commitSeq && (oldest == UINT64_MAX || it->second.commitSeq <= oldest)) it = t->txnPending.erase(it);
@@ -4485,6 +4726,7 @@ ResultSet Engine::execute(const std::string& sql) {
       else if (s.setName == "GPUDB_JOIN_FILTERS") tJoinFilters = on();
       else if (s.setName == "GPUDB_VECTOR_INDEX") tAnn = on();
       else if (s.setName == "GPUDB_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
+      else if (s.setName == "GPUDB_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
       else if (s.setName == "GPUDB_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
       else if (s.setName == "GPUDB_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
       else if (s.setName == "COLLATION_CONNECTION" || s.setName == "COLLATION_SERVER" || s.setName == "GPUDB_COLLATION")
@@ -4621,6 +4863,21 @@ static IndexMeta indexMetaOf(const IndexDef& ix, const Table& t, const std::vect
     m.metric = o.find("EUCLIDEAN") != std::string::npos ? 1 : 0;
     size_t p = ix.options.find("\"nprobe\"");
     m.nprobe = p == std::string::npos ? 0 : std::atoi(ix.options.c_str() + ix.options.find(':', p) + 1);
+    auto num = [&](const char* key) {
+      size_t q = ix.options.find(key);
+      return q == std::string::npos ? 0 : std::atoi(ix.options.c_str() + ix.options.find(':', q) + 1);
+    };
+    if (int g = num("\"graph_degree\"")) m.graphDegree = g;
+    m.itopk = num("\"itopk\"");
+    // index_type: CAGRA (and SingleStore's HNSW_* / AUTO, or no type) use the GPU graph when cuVS is
+    // installed and the dimension suits it; IVF_* and everything else the IVF lists.
+    const bool ivf = o.find("IVF") != std::string::npos;
+    const bool graph = o.find("CAGRA") != std::string::npos || o.find("HNSW") != std::string::npos || o.find("AUTO") != std::string::npos ||
+                       o.find("INDEX_TYPE") == std::string::npos;
+    if (!ivf && graph && m.dim % 4 == 0 && cagraAvailable()) {
+      m.algo = 1;
+      m.cagra = std::make_shared<CagraState>();
+    }
   }
   return m;
 }
@@ -4678,6 +4935,7 @@ ResultSet Engine::doCreate(Stmt& s) {
     nt->db = dbOf(s.table);
     nt->vram = o->vram;
     nt->fks = o->fks;
+    nt->fulltextCols = o->fulltextCols;
     cat_.tables[Catalog::key(s.table)] = nt;
     return okResult(0);
   }
@@ -4746,6 +5004,7 @@ ResultSet Engine::doCreate(Stmt& s) {
   auto nt = std::make_shared<Table>(plainName(s.table), cols, pk, sk, pkCols, shard, nparts_, s.reference);
   nt->db = dbOf(s.table);
   nt->vram = s.vram;
+  for (auto& c : s.fulltextCols) nt->fulltextCols.push_back(find(c));
   for (auto& f : s.fks) {
     for (auto& c : f.cols) find(c);
     Table::FkMeta m{f.name, f.refTable, f.onDelete, f.onUpdate, f.cols, f.refCols};
@@ -4883,6 +5142,7 @@ std::shared_ptr<Table> Engine::rebuild(Table& t, const std::vector<ColumnMeta>& 
   nt->db = t.db;
   nt->vram = t.vram;
   nt->fks = t.fks;
+  nt->fulltextCols = t.fulltextCols;
   for (auto& ix : t.indexes) {
     IndexMeta m = ix;
     m.map.clear();
@@ -5023,6 +5283,7 @@ ResultSet Engine::doTruncate(Stmt& s) {
   nt->db = t->db;
   nt->vram = t->vram;
   nt->fks = t->fks;
+  nt->fulltextCols = t->fulltextCols;
   nt->indexes = t->indexes;
   for (auto& ix : nt->indexes) ix.map.clear();
   std::lock_guard<std::mutex> g(cat_.mu);
@@ -5076,6 +5337,10 @@ std::string Engine::showCreate(const Table& t) {
   }
   // SHARD KEY only when it isn't the default (the primary key; keyless without one), so MySQL tools
   // reading SHOW CREATE TABLE see plain MySQL DDL.
+  if (!t.fulltextCols.empty()) {
+    std::vector<int> ft = t.fulltextCols;
+    r += "  FULLTEXT KEY (" + names(ft) + "),\n";
+  }
   if (!t.reference && t.shardKey != t.pkCols) r += "  SHARD KEY (" + names(t.shardKey) + "),\n";
   if (t.sortKey >= 0) r += "  SORT KEY (`" + t.cols[t.sortKey].name + "`),\n";
   r = r.substr(0, r.size() - 2) + "\n)";
@@ -5866,6 +6131,7 @@ ResultSet Engine::doModify(Stmt& s) {
   ctx.aliases = {t->name};
   if (s.where) bind(s.where, ctx);
   std::vector<std::pair<int, ExprP>> sets;
+  ctx.rowWise = true;
   for (auto& [name, e] : s.sets) {
     int c = t->colIndex(name);
     if (c < 0) throw SqlError("Unknown column '" + name + "' in 'field list'", 1054);
@@ -5938,6 +6204,31 @@ ResultSet Engine::doModify(Stmt& s) {
   // UPDATE = delete + re-insert of the modified row (like SingleStore's columnstore updates).
   std::vector<std::vector<Value>> newRows;
   if (s.type == Stmt::UPDATE) {
+    // EMBED(..) in SET: the texts of all matched rows go through the model in one batch first (the
+    // per-row evaluation below then finds them in the cache).
+    std::vector<ExprP> embeds;
+    std::function<void(const ExprP&)> findEmbed = [&](const ExprP& x) {
+      if (!x) return;
+      if (x->kind == Expr::FUNC && x->op == "EMBED" && x->args.size() == 1) embeds.push_back(x->args[0]);
+      for (auto& a : x->args) findEmbed(a);
+    };
+    for (auto& [c, e] : sets) findEmbed(e);
+    if (!embeds.empty() && !matched.empty()) {
+      std::vector<std::string> texts;
+      for (const Loc& l : matched) {
+        std::vector<Value> cur;
+        for (size_t c = 0; c < t->cols.size(); ++c) cur.push_back(cellValue(*t, l, (int)c));
+        PostCtx pc;
+        pc.row = &cur;
+        pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+        for (auto& a : embeds) {
+          Value v = evalPost(a, pc);
+          if (!v.isNull()) texts.push_back(v.toString());
+        }
+      }
+      std::vector<std::string> ignored;
+      embedCached(texts, ignored);
+    }
     for (const Loc& l : matched) {  // SET expressions are evaluated on the host against the old row
       std::vector<Value> cur;
       for (size_t c = 0; c < t->cols.size(); ++c) cur.push_back(cellValue(*t, l, (int)c));
@@ -6015,8 +6306,10 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     FairSharedMutex::barge = pkEq(s.where);
   }
   std::vector<std::shared_lock<FairSharedMutex>> locks;
+  const auto tLock = Clock::now();
   for (auto& t : lockOrder) locks.emplace_back(t->mu);
   FairSharedMutex::barge = false;
+  if (getenv("GPUDB_TRACE") && msSince(tLock) > 20) fprintf(stderr, "[trace] waited %.1f ms for table locks\n", msSince(tLock));
 
   // Expand * and bind the select list.
   std::vector<SelectItem> items;
@@ -6243,6 +6536,167 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     pl.done((int64_t)res.rows.size() + (int64_t)res.vals.size(), ixm->name);
     res.info = "cpu-index-lookup";
     return res;
+  }
+
+  // ---- Route 1b: ORDER BY v <*> q DESC / v <-> q LIMIT k on a CAGRA VECTOR INDEX: the GPU graph of
+  // every large VRAM-resident segment is searched in one call (deleted rows masked out), the write
+  // buffers and other segments exactly; candidates are re-scored exactly, then filtered by WHERE.
+  if (ctx.tabs.size() == 1 && !aggQuery && !anyOuter && orderBy.size() == 1 && s.limit >= 0 && s.limit + s.offset <= 1024 &&
+      orderBy[0].e->kind == Expr::FUNC && (orderBy[0].e->op == "#VDOT" || orderBy[0].e->op == "#VEUC") &&
+      orderBy[0].e->args[0]->kind == Expr::COL && (orderBy[0].e->op == "#VDOT") == orderBy[0].desc && tAnn &&
+      !foreignPending(*ctx.tabs[0])) {
+    Table& t = *ctx.tabs[0];
+    const ExprP& oe = orderBy[0].e;
+    const IndexMeta* vix = nullptr;
+    for (auto& ix : t.indexes)
+      if (ix.vec && ix.algo == 1 && ix.cagra && ix.cols[0] == oe->args[0]->bc) vix = &ix;
+    const std::vector<double>& qd = *oe->aux;
+    if (vix && (int)qd.size() == vix->dim) {
+      const bool dot = oe->op == "#VDOT";
+      const int d = vix->dim, vc = vix->cols[0];
+      const size_t want = (size_t)(s.limit + s.offset);
+      // WHERE the GPU can evaluate becomes a per-segment keep-bitset (filtered graph search);
+      // otherwise candidates are over-fetched and filtered on the host.
+      const bool gpuWhere = where && gpuCompilable(where, ctx);
+      Compiler wcomp(&ctx);
+      Prog wprog;
+      if (gpuWhere) {
+        wprog = wcomp.compile(where);
+        wcomp.uploadSets();
+      }
+      const int k = (int)std::min<size_t>(1024, where && !gpuWhere ? std::max<size_t>(want * 8, 64) : want);
+      const int itopk = std::max(k, tCagraItopk > 0 ? tCagraItopk : vix->itopk > 0 ? vix->itopk : 64);
+      std::vector<float> q(qd.begin(), qd.end());
+      ProfStage pl("vector index");
+      // Graphs for the segments that have (or can get) one; everything else is scored exactly.
+      std::vector<CagraGraph*> graphs;
+      std::vector<int> graphSeg;
+      std::vector<const uint32_t*> keep;
+      std::vector<std::shared_ptr<DevVec<uint32_t>>> keepBufs;
+      std::vector<int> exactSegs;
+      std::vector<std::shared_ptr<CagraGraph>> hold;
+      std::vector<std::pair<int, std::vector<uint32_t>>> selRows;  // gpuWhere: per graph segment, rows passing WHERE
+      int64_t selected = 0;
+      int built = 0;
+      for (size_t si = 0; si < t.segs.size(); ++si) {
+        Segment& sg = *t.segs[si];
+        if (sg.n == 0 || sg.ndel == sg.n) continue;
+        std::shared_ptr<CagraGraph> g;
+        if (sg.n >= 2048 && sg.dev[vc] && !sg.mapped[vc]) {
+          std::lock_guard<std::mutex> lk(vix->cagra->mu);
+          auto it = vix->cagra->graphs.find(sg.id);
+          if (it != vix->cagra->graphs.end()) g = it->second;
+          else if (!vix->cagra->failed.count(sg.id)) {
+            std::string err;
+            g = cagraBuild((const float*)sg.dev[vc], sg.n, d, dot, vix->graphDegree, err);
+            if (g) vix->cagra->graphs[sg.id] = g, ++built;
+            else {
+              vix->cagra->failed.insert(sg.id);
+              fprintf(stderr, "[gpu-db] CAGRA build failed for %s.%s: %s (exact search used)\n", t.name.c_str(), vix->name.c_str(), err.c_str());
+            }
+          }
+        }
+        if (!g) {
+          exactSegs.push_back((int)si);
+          continue;
+        }
+        if (gpuWhere) {  // rows passing WHERE (and not deleted) -> keep-bitset
+          const BatchRef br{sg.part, sg.n, &sg.dev, sg.delDev, &sg.enc, 0};
+          for (size_t kk = 0; kk < wcomp.slotCols.size(); ++kk) bindView(wcomp.env.cols[kk], br, wcomp.slotCols[kk].second);
+          DevVec<int32_t> idx(sg.n);
+          const int64_t m = gpuSelect(wcomp.env, true, wprog, sg.n, sg.delDev, idx.p);
+          if (m == 0) continue;
+          std::vector<uint32_t> bits((sg.n + 31) / 32, 0);
+          for (int32_t r : idx.download(m)) bits[r >> 5] |= 1u << (r & 31);
+          selected += m;
+          selRows.push_back({(int)si, std::move(bits)});
+          hold.push_back(g);
+          graphs.push_back(g.get());
+          graphSeg.push_back((int)si);
+          auto b = std::make_shared<DevVec<uint32_t>>((int64_t)selRows.back().second.size());
+          h2d(b->p, selRows.back().second.data(), selRows.back().second.size() * 4);
+          keepBufs.push_back(b);
+          keep.push_back(b->p);
+          continue;
+        }
+        hold.push_back(g);
+        graphs.push_back(g.get());
+        graphSeg.push_back((int)si);
+        if (sg.ndel > 0) {  // keep-bitset: the complement of the deleted-row bitmap
+          std::vector<uint32_t> bits(sg.delHost.size());
+          for (size_t w = 0; w < bits.size(); ++w) bits[w] = ~sg.delHost[w];
+          auto b = std::make_shared<DevVec<uint32_t>>((int64_t)bits.size());
+          h2d(b->p, bits.data(), bits.size() * 4);
+          keepBufs.push_back(b);
+          keep.push_back(b->p);
+        } else {
+          keep.push_back(nullptr);
+        }
+      }
+      notes.push_back("ANN via VECTOR INDEX " + vix->name + " (CAGRA GPU graph: " + std::to_string(graphs.size()) + " segment graphs" +
+                      (built ? " (" + std::to_string(built) + " built now)" : "") + ", itopk " + std::to_string(itopk) + ", " +
+                      std::to_string(exactSegs.size()) + " segments + write buffers exact) on " + t.name + "." + t.cols[vc].name);
+      if (explain) return explainResult();
+      std::vector<CagraHit> hits;
+      std::string err;
+      // A selective filter leaves few rows: scoring them exactly beats a graph walk that must skip
+      // most of its nodes.
+      const bool exactSelected = gpuWhere && selected < 8192;
+      if (exactSelected) notes.push_back("WHERE keeps " + std::to_string(selected) + " rows: scored exactly");
+      if (exactSelected || cagraSearch(graphs, keep, q.data(), d, k, itopk, hits, err)) {
+        auto score = [&](const float* v) {
+          double acc = 0;
+          for (int i = 0; i < d; ++i) acc += dot ? (double)v[i] * qd[i] : ((double)v[i] - qd[i]) * ((double)v[i] - qd[i]);
+          return dot ? -acc : acc;  // lower is better
+        };
+        std::vector<std::pair<double, Loc>> cand;
+        if (exactSelected) {
+          for (auto& [si, bits] : selRows)
+            for (size_t w = 0; w < bits.size(); ++w)
+              for (uint32_t m = bits[w]; m; m &= m - 1) {
+                const Loc l{si, (int32_t)(w * 32 + __builtin_ctz(m))};
+                cand.push_back({score((const float*)t.colData(l, vc).data() + (size_t)l.row * d), l});
+              }
+        }
+        for (auto& h : hits) {
+          const Loc l{graphSeg[h.graph], (int32_t)h.row};
+          cand.push_back({score((const float*)t.colData(l, vc).data() + (size_t)l.row * d), l});
+        }
+        auto exactRows = [&](Loc first, int64_t n, const std::vector<uint32_t>& del) {
+          for (int64_t r = 0; r < n; ++r) {
+            if ((del[r >> 5] >> (r & 31)) & 1u) continue;
+            const Loc l{first.seg, (int32_t)r};
+            cand.push_back({score((const float*)t.colData(l, vc).data() + (size_t)r * d), l});
+          }
+        };
+        for (int si : exactSegs) exactRows(Loc{si, 0}, t.segs[si]->n, t.segs[si]->delHost);
+        for (int p = 0; p < t.nparts; ++p) exactRows(bufLoc(p, 0), t.bufs[p]->n, t.bufs[p]->del);
+        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first < b.first; });
+        std::vector<std::vector<Value>> rows, keys;
+        for (auto& [sc, l] : cand) {
+          if (rows.size() >= want) break;
+          std::vector<Value> vals;
+          for (size_t c = 0; c < t.cols.size(); ++c) vals.push_back(cellValue(t, l, (int)c));
+          PostCtx pc;
+          pc.row = &vals;
+          pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+          if (where && !isTrue(evalPost(where, pc))) continue;
+          std::vector<Value> row;
+          for (auto& itm : items) row.push_back(evalPost(itm.e, pc));
+          rows.push_back(std::move(row));
+          keys.push_back({Value::D(dot ? -sc : std::sqrt(sc))});
+        }
+        if (rows.size() >= want || !where) {  // a selective WHERE that left too few: exact path below
+          finish(rows, keys);
+          pl.done((int64_t)cand.size(), vix->name);
+          res.info = "ann-cagra";
+          return res;
+        }
+        notes.push_back("CAGRA candidates too few after WHERE: exact search");
+      } else {
+        fprintf(stderr, "[gpu-db] CAGRA search failed: %s (exact search used)\n", err.c_str());
+      }
+    }
   }
 
   // ---- Route 1c: ORDER BY v <*> q DESC / v <-> q LIMIT k on a VECTOR INDEX: probe the nprobe
@@ -7789,6 +8243,17 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
         if (i < row.size() && !row[i].isNull() && row[i].scale >= 0) sc = std::max(sc, (int)row[i].scale);
       if (sc < 0) m.lt = LType::DOUBLE;
       else m.scale = sc;
+    }
+    if (m.lt == LType::VECTOR) {  // the dimension comes from the values (all NULL: kept as text)
+      m.lt = LType::VARCHAR;
+      for (auto& row : r.vals) {
+        std::vector<float> f;
+        if (i < row.size() && !row[i].isNull() && parseVector(row[i].toString(), f) && !f.empty()) {
+          m.lt = LType::VECTOR;
+          m.vecDim = (int)f.size();
+          break;
+        }
+      }
     }
     m.pt = physOf(m.lt);
     cols.push_back(m);
@@ -10505,17 +10970,36 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
 }
 
 // ---- Users: mysql_native_password (token = SHA1(pw) XOR SHA1(scramble + SHA1(SHA1(pw)))).
+static std::string sha256(const std::string& x) {
+  unsigned char d[32];
+  SHA256((const unsigned char*)x.data(), x.size(), d);
+  return std::string((const char*)d, 32);
+}
 static std::string sha1(const std::string& x) {
   unsigned char d[20];
   SHA1((const unsigned char*)x.data(), x.size(), d);
   return std::string((const char*)d, 20);
 }
 
+int Engine::checkAuthSha2(const std::string& user, const std::string& scramble, const std::string& token) {
+  std::lock_guard<std::mutex> g(usersMu_);
+  auto it = users_.find(user.empty() ? "root" : user);
+  if (it == users_.end() || it->second == "!role") return 0;
+  if (it->second.empty()) return token.empty() || (token.size() == 1 && token[0] == 0) ? 1 : 0;  // no password
+  if (it->second.size() != 52) return -1;  // created before SHA256 hashes were kept
+  const std::string stage2 = it->second.substr(20);
+  if (token.size() != 32) return 0;
+  const std::string x = sha256(stage2 + scramble);
+  std::string stage1(32, '\0');
+  for (int i = 0; i < 32; ++i) stage1[i] = (char)(token[i] ^ x[i]);
+  return sha256(stage1) == stage2 ? 1 : 0;
+}
+
 bool Engine::checkAuth(const std::string& user, const std::string& scramble, const std::string& token) {
   std::lock_guard<std::mutex> g(usersMu_);
   auto it = users_.find(user.empty() ? "root" : user);
   if (it == users_.end()) return false;
-  const std::string& stage2 = it->second;
+  const std::string stage2 = it->second.substr(0, std::min<size_t>(20, it->second.size()));
   if (stage2.empty()) return user == "root" || user.empty() ? true : token.empty();  // root without a password: open
   if (token.size() != 20) return false;
   std::string h = sha1(scramble + stage2), stage1(20, '\0');
@@ -10533,7 +11017,7 @@ bool Engine::checkPassword(const std::string& user, const std::string& pw) {
   std::lock_guard<std::mutex> g(usersMu_);
   auto it = users_.find(user.empty() ? "root" : user);
   if (it == users_.end() || it->second == "!role") return false;
-  return it->second.empty() ? pw.empty() : it->second == sha1(sha1(pw));
+  return it->second.empty() ? pw.empty() : it->second.substr(0, 20) == sha1(sha1(pw));
 }
 
 bool Engine::isSuper(const std::string& user) {
@@ -10663,7 +11147,8 @@ ResultSet Engine::doUser(Stmt& s) {
     return okResult(0);
   }
   const std::string u = s.table.empty() ? tUser : s.table;
-  const std::string hash = s.path == "\x01" || s.path.empty() ? "" : s.path == "\x03role" ? "!role" : sha1(sha1(s.path));
+  // Stored hash: SHA1(SHA1(pw)) (mysql_native_password) followed by SHA256(SHA256(pw)) (caching_sha2_password).
+  const std::string hash = s.path == "\x01" || s.path.empty() ? "" : s.path == "\x03role" ? "!role" : sha1(sha1(s.path)) + sha256(sha256(s.path));
   if (s.setName == "CREATE") {
     if (users_.count(u)) {
       if (s.ifNotExists) return okResult(0);

@@ -279,7 +279,7 @@ queries and `LOAD DATA LOCAL INFILE` are supported on the wire):
 | Queries | Inner / LEFT / RIGHT / FULL OUTER / CROSS / NATURAL joins, `JOIN .. USING`, any ON condition (equi-joins hash-join on the GPU, also on expressions of each side such as `a.x = b.y + 1` or `a.d = DATE(b.ts)`, whose keys are computed on the GPU, and on DOUBLE columns by bit pattern; non-equi and mixed ON conditions run as a GPU join or cross join plus a GPU filter over the pairs, outer joins then add the preserved side's unmatched rows); joins also work on string columns (codes are remapped between the tables' dictionaries on the GPU). Subqueries (scalar, IN, EXISTS; equality-correlated ones are decorrelated into joins, other correlated scalar subqueries run once per distinct outer value and are joined back), CTEs incl. `WITH RECURSIVE`, derived tables (simple projections/filters of one table are merged into the outer query), UNION [ALL] / INTERSECT / EXCEPT, DISTINCT, GROUP BY / HAVING, window functions (ranking, LAG/LEAD, FIRST/LAST/NTH_VALUE, NTILE, framed aggregates), full-text `MATCH .. AGAINST`, `FOR UPDATE` |
 | Aggregates | GPU: COUNT / SUM / AVG / MIN / MAX (+ DISTINCT). Host aggregation (GPU filters/joins, CPU groups): GROUP_CONCAT (ORDER BY, SEPARATOR), STRING_AGG, JSON_ARRAYAGG, JSON_OBJECTAGG, STDDEV / VARIANCE (POP / SAMP), MEDIAN, BIT_AND/OR/XOR, ANY_VALUE, DISTINCT aggregates over different columns, GROUP BY on multi-column string expressions |
 | Functions | ~100: math, string (CONCAT, SUBSTRING, REPLACE, LPAD, REGEXP_LIKE, ...), date/time (DATE_ADD, DATEDIFF, DATE_FORMAT, EXTRACT, TIMESTAMPDIFF, ...), JSON (`JSON_EXTRACT_*`, `->`, `->>`), CAST/CONVERT (strings to numbers MySQL-style: the leading numeric prefix, else 0; string = number comparisons and arithmetic on strings convert the same way), CASE/IF/COALESCE/NULLIF. String functions run once per distinct dictionary entry, on all cores; regexes use RE2 (linear time), and REGEXP_REPLACE with capture groups uses PCRE2's JIT when the runtime library is present (5x faster, RE2 semantics for `$`; RE2 takes over on errors or the backtracking limit) |
-| Vector search | `DOT_PRODUCT`, `EUCLIDEAN_DISTANCE`, `<*>`, `<->`, `JSON_ARRAY_PACK`; exact kNN on the GPU (top-5 over 100K x 64 in 0.8 ms); `VECTOR INDEX (col) INDEX_OPTIONS '{"metric_type":"DOT_PRODUCT","nlist":..,"nprobe":..}'` (IVF, k-means trained on flush / `OPTIMIZE TABLE`, maintained on writes) used for `ORDER BY v <*> q DESC LIMIT k`; `SET gpudb_nprobe = N`, `SET gpudb_vector_index = OFF` for exact |
+| Vector search | `DOT_PRODUCT`, `EUCLIDEAN_DISTANCE`, `<*>`, `<->`, `JSON_ARRAY_PACK`; exact kNN on the GPU; `VECTOR INDEX (col) INDEX_OPTIONS '{"index_type":..,"metric_type":"DOT_PRODUCT"}'`: with NVIDIA cuVS installed (`scripts/install-cuvs.sh`, loaded at run time) `CAGRA` / `HNSW_*` / `AUTO` (the default) build a CAGRA GPU graph per segment, searched together in one call with deleted rows masked out and WHERE evaluated on the GPU as a per-segment filter bitset (filtered ANN); without cuVS, or for `IVF_*`, the IVF index (k-means lists). `SET gpudb_cagra_itopk`, `gpudb_nprobe`, `gpudb_vector_index = OFF` for exact. `EMBED(text)`: sentence embeddings (all-MiniLM-L6-v2, 384 dims, `scripts/fetch-embed-model.sh`) computed by a BERT encoder on the GPU (cuBLAS, TF32), batched over columns: `UPDATE t SET v = EMBED(body)`, `ORDER BY v <*> EMBED('question') DESC LIMIT 10` |
 | Pipelines | `CREATE PIPELINE p AS LOAD DATA FS '/dir/*.csv' \| S3 'bucket/prefix*' CONFIG '{"region","endpoint_url"}' CREDENTIALS '{"aws_access_key_id",..}' \| KAFKA 'host:9092/topic' INTO TABLE t [FORMAT JSON (col <- a::b, ..)]`, START / STOP / DROP / SHOW PIPELINES. Each file / object loads once; Kafka offsets (all partitions; gzip / snappy / lz4 / zstd batches) survive restarts exactly once (they are recovered from the logged loads) |
 | Transactions | BEGIN / START TRANSACTION / COMMIT / ROLLBACK, `SET autocommit = 0`; a transaction is one WAL record written at COMMIT (replayed all or nothing), ROLLBACK replays an undo log. Durability works like SingleStore's: async by default (a commit is acknowledged once its WAL record is in the OS page cache, which survives a process crash; a background thread fdatasyncs every 10 ms, `GPUDB_FLUSH_MS`, so a power loss can lose the last few ms), sync where asked: `CREATE DATABASE d WITH SYNC DURABILITY`, `SET gpudb_sync_durability = ON` for a session, or `--sync-durability` for everything (group commit into a pre-zeroed WAL, so one fdatasync serves all waiting commits). WAL format 2: CRC32 per record; a torn or corrupt tail is cut off at recovery. SNAPSHOT writes the committed state only and rotates the WAL before installing itself, so a crash at any point recovers each change exactly once (checked with `kill -9` during transfers, inserts and snapshots). Read committed: other sessions don't see a transaction's inserts / updates / deletes until COMMIT (their scans get per-batch visibility bitmaps), and their writes to the same table wait for it (lock wait timeout 10 s). Long loads release the table lock every 256K rows, so queries keep running during them |
 | Procedural SQL | `CREATE [OR REPLACE] PROCEDURE p(a INT, ..) AS DECLARE .. BEGIN .. END` (MPSQL) or MySQL style: variables, `SET` / `:=`, IF / ELSEIF, WHILE, LOOP, REPEAT, `FOR i IN a .. b`, `FOR r IN SELECT ..` (cursor loops, `r.col`), EXIT / CONTINUE, `SELECT .. INTO`, `SCALAR(..)`, `ECHO SELECT`, RAISE / SIGNAL, `EXCEPTION WHEN OTHERS`, CALL, nested calls. `CREATE FUNCTION`: single-`RETURN` functions are inlined into queries (so they run on the GPU). Functions with procedural bodies also run over columns: the body runs once per distinct argument value, via a dictionary map for strings or a value-range map for INT / DATE, so it works in WHERE, GROUP BY and aggregates. CALL returns every `ECHO` / bare `SELECT` as a separate result set. Session `@variables` |
@@ -308,7 +308,7 @@ dictionary entry, and the GPU applies the resulting code map. Expressions the GP
   delay write-buffer flushes. Write conflicts are row-level: UPDATE / DELETE wait only when a target row
   has uncommitted changes from another transaction, and INSERTs wait only on tables with a primary or
   unique key.
-- **SQL**: triggers (SingleStore has none). Foreign keys are kept as metadata (SHOW CREATE TABLE, information_schema) but not enforced. LATERAL derived tables only for subqueries yielding at most one row (aggregates, LIMIT 1: what ORMs generate). (Queries whose WHERE / GROUP BY /
+- **SQL**: triggers (SingleStore has none). Readers still hold a table lock for a query's duration (a writer waits for the queries running when it arrives; not MVCC). Foreign keys are kept as metadata (SHOW CREATE TABLE, information_schema) but not enforced. LATERAL derived tables only for subqueries yielding at most one row (aggregates, LIMIT 1: what ORMs generate). (Queries whose WHERE / GROUP BY /
   aggregates use host-only functions over several columns, in joins too, are retried as a derived
   table that evaluates them on the host.)
 - **Types**: BIGINT arithmetic (+ - *) is exact in projections, filters and aggregates; DIV and
@@ -331,6 +331,27 @@ USING, db.table.column references, DATABASE(), CONSTRAINT .. UNIQUE / FOREIGN KE
 and nested JSON_ARRAYAGG, JSON result columns (MYSQL_TYPE_JSON), string comparisons across tables,
 COALESCE over aggregates in correlated subqueries, result column names, `SET @@session.x`, BINARY,
 prepared-statement result metadata at PREPARE.
+
+### Vector search and embeddings
+
+300K 128-dim vectors with local structure (a 16-dim manifold, like real embeddings), top 10:
+
+| | p50 | recall@10 |
+|---|---:|---:|
+| exact (GPU) | 41 ms | 1.000 |
+| IVF index | 3.6 ms | 0.90 |
+| CAGRA (cuVS), itopk 64 | 1.0 ms | 1.000 |
+| CAGRA + `WHERE cat = 3` / `id < 20000` / `id < 3000` | 2.2-2.4 ms | 1.000 |
+
+Graphs build in ~0.3 s per 37K-row segment (in the background after a restart). `EMBED()` matches
+ONNX Runtime's output for the same model (cosine 1.000000) and embeds ~9K short texts/s on the RTX 3080;
+`UPDATE docs SET v = EMBED(body)` over 20K rows takes 3.1 s, a semantic search ~10 ms.
+
+Also: MATCH .. AGAINST uses an inverted index per column (built on first use, or in the background for
+`FULLTEXT` columns, extended as rows arrive): a new search term costs ~1-9 ms instead of a scan of every
+document. `caching_sha2_password` (MySQL 8 / 9 clients' default) is supported next to
+mysql_native_password. The first query after a restart no longer waits for the background dictionary
+sort (connection close / COMMIT took every table's lock).
 
 ### VRAM placement hints
 
