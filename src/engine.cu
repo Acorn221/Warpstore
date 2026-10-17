@@ -4424,6 +4424,7 @@ void Engine::commitTxn() {
   retireTxnPending(cat_, &tTxn.undo);  // the changes become visible (to snapshots taken from now on)
   struct EndSnap { Catalog& c; ~EndSnap() { endSnapshot(c); } } endSnap{cat_};
   if (!replaying_ && !tTxn.wal.empty()) {
+    uint64_t myLsn;
     {
       std::lock_guard<std::mutex> g(walMu_);
       std::string bundle = "\x1eTXN";  // one WAL record: replayed all or nothing
@@ -4434,8 +4435,10 @@ void Engine::commitTxn() {
         bundle += rec;
       }
       walAppendLocked(tTxn.wal.size() == 1 ? tTxn.wal[0] : bundle);
+      myLsn = lsn_;
     }
     walDurable(tTxn.needSync || needsSync(""));
+    replWaitAck(myLsn);  // semi-sync replication
   }
   tTxn.needSync = false;
   tTxn.wal.clear();
@@ -4557,13 +4560,16 @@ void Engine::logWrite(const std::string& sql, const std::string& db) {
     tTxn.needSync = tTxn.needSync || sync;
     return;
   }
+  uint64_t myLsn;
   {
     std::lock_guard<std::mutex> g(walMu_);
     const std::string rec = currentDb() + "\x1f" + sql;
     replAppend(rec);
     walAppendLocked(rec);
+    myLsn = lsn_;
   }
   walDurable(sync);
+  replWaitAck(myLsn);  // semi-sync replication
 }
 
 namespace {

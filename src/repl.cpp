@@ -55,11 +55,45 @@ std::string Engine::replSnapshot() {
     replFiles_.insert(base);
     replFiles_.insert(base + ".users");
   }
-  return "{\"lsn\":" + std::to_string(lsn) + ",\"main\":\"" + base + "\",\"users\":\"" + base + ".users\"}";
+  return "{\"lsn\":" + std::to_string(lsn) + ",\"epoch\":\"" + std::to_string(replEpoch_) + "\",\"main\":\"" + base + "\",\"users\":\"" + base + ".users\"}";
 }
 
-std::string Engine::replSince(uint64_t from, int waitMs, int& status) {
+int gSyncReplicas = 0;
+int gSyncReplicaTimeoutMs = 2000;
+double gFailoverTimeoutS = 0;
+
+void Engine::replWaitAck(uint64_t lsn) {
+  if (gSyncReplicas <= 0 || tApplying) return;
+  std::unique_lock<std::mutex> lk(replMu_);
+  auto enough = [&] {
+    int n = 0;
+    for (auto& [id, a] : replAcks_) n += a.first >= lsn;
+    return n >= gSyncReplicas;
+  };
+  if (enough()) return;
+  if (!ackCv_.wait_for(lk, std::chrono::milliseconds(gSyncReplicaTimeoutMs), enough)) {
+    static std::atomic<int64_t> lastWarn{0};
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (now - lastWarn.exchange(now) >= 10)
+      fprintf(stderr, "[gpu-db] semi-sync replication: no acknowledgement from %d replica(s) within %d ms; committing anyway\n",
+              gSyncReplicas, gSyncReplicaTimeoutMs);
+  }
+}
+
+std::string Engine::replSince(uint64_t from, int waitMs, int& status, const std::string& replicaId, const std::string& epoch) {
+  if (!epoch.empty() && epoch != std::to_string(replEpoch_)) {
+    status = 410;
+    return "positions from another primary incarnation; re-bootstrap";
+  }
   std::unique_lock<std::mutex> lk(walMu_);
+  if (!replicaId.empty() && from > 0 && from <= lsn_ + 1) {  // (a position from before a restart is no acknowledgement)
+    std::lock_guard<std::mutex> g(replMu_);
+    const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    replAcks_[replicaId] = {from - 1, now};
+    for (auto it = replAcks_.begin(); it != replAcks_.end();)  // forget replicas gone for a minute
+      it = now - it->second.second > 60000000 ? replAcks_.erase(it) : std::next(it);
+    ackCv_.notify_all();
+  }
   if (from > lsn_ + 1) {
     status = 410;
     return "replica is ahead of the primary";
@@ -94,6 +128,9 @@ bool Engine::replFileAllowed(const std::string& path) {
 bool Engine::isReplica() const { return isReplica_; }
 
 namespace {
+int64_t nowUsR() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 std::string urlEsc(const std::string& s) {
   static const char* hex = "0123456789ABCDEF";
   std::string o;
@@ -124,14 +161,27 @@ void Engine::startReplica(const std::string& url) {
       if (!err.empty()) replError_ = err;
     };
     const std::string stage = (dir_.empty() ? std::string("/tmp/gpudb-replica-") : dir_ + "/replica-") + std::to_string(getpid());
-    bool needBootstrap = true;
+    char host[256] = "";
+    gethostname(host, sizeof host - 1);
+    const std::string myId = std::string(host) + "-" + std::to_string(getpid()) + "-" + std::to_string(nowUsR());
+    bool needBootstrap = true, bootstrapped = false;
+    std::string epoch;  // the primary incarnation our positions belong to
     uint64_t next = 0;
+    replLastContactUs_ = nowUsR();
     while (replRun_) {
+      if (gFailoverTimeoutS > 0 && bootstrapped && nowUsR() - replLastContactUs_ > (int64_t)(gFailoverTimeoutS * 1e6)) {
+        fprintf(stderr, "[gpu-db] primary unreachable for %.0f s: promoting this replica to primary\n", gFailoverTimeoutS);
+        isReplica_ = false;
+        replRun_ = false;
+        setState("Promoted (primary unreachable)");
+        break;
+      }
       try {
         if (needBootstrap) {
           setState("Bootstrapping");
           std::string info = httpGet(base + "/replication/snapshot");
           uint64_t lsn = std::strtoull(jsonField(info, "lsn").c_str(), nullptr, 10);
+          epoch = jsonField(info, "epoch");
           writeFile(stage + ".snap", httpGet(base + "/replication/file?path=" + urlEsc(jsonField(info, "main"))));
           writeFile(stage + ".snap.users", httpGet(base + "/replication/file?path=" + urlEsc(jsonField(info, "users"))));
           {
@@ -166,18 +216,22 @@ void Engine::startReplica(const std::string& url) {
           next = lsn + 1;
           appliedLsn_ = lsn;
           needBootstrap = false;
+          bootstrapped = true;
           setState("Streaming");
         }
         std::string body;
         try {
-          body = httpGet(base + "/replication/wal?from=" + std::to_string(next));
+          body = httpGet(base + "/replication/wal?from=" + std::to_string(next) + "&id=" + urlEsc(myId) + "&epoch=" + epoch);
+          replLastContactUs_ = nowUsR();
         } catch (SqlError& e) {
           if (std::string(e.what()).find("HTTP 410") != std::string::npos) {
+            replLastContactUs_ = nowUsR();
             needBootstrap = true;
             continue;
           }
           throw;
         }
+        if (body.empty()) replCaughtUpUs_ = nowUsR();  // nothing new: caught up
         size_t p = 0;
         tApplying = true;
         while (p + 12 <= body.size()) {
@@ -222,24 +276,33 @@ void Engine::startReplica(const std::string& url) {
 ResultSet Engine::replicationStatus() {
   ResultSet r;
   r.isResult = true;
-  r.names = {"Role", "Primary", "State", "Applied_Lsn", "Primary_Lsn", "Last_Error"};
-  r.types = {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::BIGINT, LType::BIGINT, LType::VARCHAR};
+  r.names = {"Role", "Primary", "State", "Applied_Lsn", "Primary_Lsn", "Last_Error", "Lag_Ms", "Replicas", "Sync_Replicas"};
+  r.types = {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::BIGINT, LType::BIGINT, LType::VARCHAR, LType::BIGINT, LType::VARCHAR, LType::BIGINT};
   uint64_t lsn;
   {
     std::lock_guard<std::mutex> g(walMu_);
     lsn = lsn_;
   }
   std::lock_guard<std::mutex> g(replMu_);
-  if (isReplica_)
+  const int64_t now = nowUsR();
+  if (isReplica_) {
+    const int64_t cu = replCaughtUpUs_;
     r.rows.push_back({"REPLICA", replicaOf_.substr(replicaOf_.find('@') == std::string::npos ? 0 : replicaOf_.find('@') + 1), replState_,
-                      std::to_string((uint64_t)appliedLsn_), kNullCell, replError_.empty() ? kNullCell : replError_});
-  else
-    r.rows.push_back({"PRIMARY", kNullCell, replicaOf_.empty() ? "Online" : "Online (promoted)", std::to_string(lsn), std::to_string(lsn), kNullCell});
+                      std::to_string((uint64_t)appliedLsn_), kNullCell, replError_.empty() ? kNullCell : replError_,
+                      cu ? std::to_string(std::max<int64_t>(0, (now - cu) / 1000 - 1000)) : kNullCell, kNullCell, kNullCell});
+  } else {
+    // replicas seen in the last 10 s, with what they have applied
+    std::string reps;
+    for (auto& [id, a] : replAcks_)
+      if (now - a.second < 10000000) reps += (reps.empty() ? "" : ", ") + id + "@" + std::to_string(a.first);
+    r.rows.push_back({"PRIMARY", kNullCell, replicaOf_.empty() ? "Online" : "Online (promoted)", std::to_string(lsn), std::to_string(lsn), kNullCell,
+                      kNullCell, reps.empty() ? kNullCell : reps, std::to_string(gSyncReplicas)});
+  }
   return r;
 }
 
 void Engine::promote() {
-  if (!isReplica_) throw SqlError("this server is not a replica", 1105);
+  if (!isReplica_) throw SqlError("this server is not a replica", 1105);  // (also after an automatic failover)
   replRun_ = false;
   if (replThread_.joinable()) replThread_.join();
   isReplica_ = false;

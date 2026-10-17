@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdio>
 #include <map>
+#include <random>
 #include <thread>
 #include <atomic>
 #include <condition_variable>
@@ -66,7 +67,10 @@ struct Pipeline;  // CREATE PIPELINE: background file ingestion
 extern thread_local bool tLocalInfile;
 // Set while the server describes a prepared statement: SELECTs return their columns without rows.
 extern thread_local bool tDescribeOnly;
-extern std::string gWalArchive;  // --wal-archive: rotated-out WALs (and loaded files) are kept here
+extern std::string gWalArchive;
+extern int gSyncReplicas;             // --sync-replicas N: commits wait for N replicas
+extern int gSyncReplicaTimeoutMs;     // ... at most this long, then go on (logged)
+extern double gFailoverTimeoutS;      // replica: --failover-timeout S: promote itself after S s without the primary  // --wal-archive: rotated-out WALs (and loaded files) are kept here
 
 class Engine {
  public:
@@ -96,7 +100,8 @@ class Engine {
   std::string reshuffle(const std::string& body);
   // Replication (repl.cpp).
   std::string replSnapshot();
-  std::string replSince(uint64_t from, int waitMs, int& status);
+  // replicaId: the asking replica (it has applied everything before `from`: its acknowledgement).
+  std::string replSince(uint64_t from, int waitMs, int& status, const std::string& replicaId = "", const std::string& epoch = "");
   bool replFileAllowed(const std::string& path);
   void startReplica(const std::string& url);
   bool isReplica() const;
@@ -171,6 +176,13 @@ class Engine {
   std::string replicaOf_, replState_, replError_;
   std::atomic<bool> isReplica_{false}, replRun_{false};
   std::atomic<uint64_t> appliedLsn_{0};
+  // Semi-sync replication (--sync-replicas N): replica id -> {applied lsn, last seen (us)}; a commit
+  // waits until N live replicas have applied its record (or gSyncReplicaTimeoutMs passes).
+  std::map<std::string, std::pair<uint64_t, int64_t>> replAcks_;
+  const uint64_t replEpoch_ = std::random_device{}() * 4294967296ull + std::random_device{}();  // this primary incarnation (lsns restart with it)
+  std::condition_variable ackCv_;
+  void replWaitAck(uint64_t lsn);
+  std::atomic<int64_t> replCaughtUpUs_{0}, replLastContactUs_{0};  // replica side: lag / failover
   std::thread replThread_;
   ResultSet doPipeline(Stmt& s);
   // Remote sources (S3, Kafka, HTTP) and FORMAT JSON: fetched data is staged to a local file and
