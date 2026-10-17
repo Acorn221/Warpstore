@@ -21,6 +21,11 @@ def put(key, data: bytes):
     assert r.returncode == 0, r.stderr
 
 
+for _ in range(60):  # (the container may have just started)
+    if subprocess.run(["curl", "-s", "-o", "/dev/null", f"{EP}/"], capture_output=True).returncode == 0:
+        break
+    time.sleep(0.5)
+time.sleep(1)
 c = Checker()
 srv = Server(name="s3", http=False).start()
 cur = srv.cursor()

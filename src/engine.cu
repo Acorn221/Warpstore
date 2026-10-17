@@ -34,7 +34,7 @@ extern thread_local bool tApplying;  // applying replicated records (repl.cpp)
 // Read committed (see commitTxn): another session's open transaction has changes in this table.
 bool foreignPending(const Table& t) {
   for (auto& [k, v] : t.txnPending)
-    if (k != (const void*)undoLog() && !v.commitSeq && (!v.hidden.empty() || !v.ghosts.empty())) return true;
+    if (k != txnKey() && !v.commitSeq && (!v.hidden.empty() || !v.ghosts.empty())) return true;
   return false;
 }
 // Snapshot isolation (REPEATABLE READ): a snapshot transaction sees the commits up to tSnapSeq; the
@@ -3302,7 +3302,7 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
   // inserts hidden, their deletes still visible).
   std::map<int32_t, std::vector<std::pair<int32_t, bool>>> adjust;  // batch (segment, or -1-part) -> (row, hide)
   for (auto& [k, v] : t.txnPending) {
-    if (k == (const void*)undoLog()) continue;
+    if (k == txnKey()) continue;
     if (v.commitSeq && (!tSnapSeq || v.commitSeq <= tSnapSeq)) continue;  // committed before this snapshot
     for (auto& l : v.hidden) adjust[l.seg].push_back({l.row, true});
     for (auto& l : v.ghosts) adjust[l.seg].push_back({l.row, false});
@@ -4261,16 +4261,27 @@ void Engine::walWriteLocked(const std::string& rec) {
     const int64_t chunk = std::max<int64_t>(64ll << 20, need);
     static const std::vector<char> zeros(1 << 20, 0);
     fseeko(wal_, walCap_, SEEK_SET);
-    for (int64_t w = 0; w < chunk; w += (int64_t)zeros.size()) fwrite(zeros.data(), 1, (size_t)std::min<int64_t>(zeros.size(), chunk - w), wal_);
-    fflush(wal_);
-    fdatasync(fileno(wal_));
+    bool ok = true;
+    for (int64_t w = 0; w < chunk && ok; w += (int64_t)zeros.size()) {
+      const size_t k = (size_t)std::min<int64_t>(zeros.size(), chunk - w);
+      ok = fwrite(zeros.data(), 1, k, wal_) == k;
+    }
+    ok = ok && fflush(wal_) == 0 && fdatasync(fileno(wal_)) == 0;
+    if (!ok) {  // (a full disk shows here: records only ever go into space zeroed ahead)
+      const std::string why = strerror(errno);
+      clearerr(wal_);
+      throw SqlError("cannot extend the WAL: " + why + " (disk full?)", 1021);
+    }
     walCap_ += chunk;
   }
   fseeko(wal_, walOff_, SEEK_SET);
-  fwrite(&len, 4, 1, wal_);
-  fwrite(&crc, 4, 1, wal_);
-  fwrite(rec.data(), 1, rec.size(), wal_);
-  fflush(wal_);
+  const bool ok = fwrite(&len, 4, 1, wal_) == 1 && fwrite(&crc, 4, 1, wal_) == 1 && fwrite(rec.data(), 1, rec.size(), wal_) == rec.size() &&
+                  fflush(wal_) == 0;
+  if (!ok) {
+    const std::string why = strerror(errno);
+    clearerr(wal_);
+    throw SqlError("cannot write the WAL: " + why, 1021);
+  }
   walOff_ += need;
   ++walWritten_;
 }
@@ -4422,28 +4433,61 @@ thread_local Txn tTxn;
 // ---- Read committed: an open transaction's changes are applied to the tables (so it reads its own
 // writes) and recorded in Table::txnPending; other sessions' scans see the committed state through
 // per-batch visibility bitmaps, and their writes to those tables wait for the COMMIT / ROLLBACK.
-void waitTxnFree(Table& t, std::unique_lock<FairSharedMutex>& lk) {
+// Write conflicts wait for the blocking transactions (all open ones on the table, or only those that
+// changed the given rows). Waits are registered in a wait-for graph: a wait that would close a cycle
+// is a deadlock (1213, and the transaction is rolled back, as in MySQL); otherwise 10 s at most (1205).
+std::mutex gWaitMu;
+std::map<const void*, std::set<const void*>> gWaitsFor;  // waiting transaction -> transactions it waits for
+std::set<const void*> blockersOf(const Table& t, const std::vector<Loc>* rows) {
+  std::set<const void*> out;
+  std::unordered_set<uint64_t> want;
+  if (rows)
+    for (const Loc& l : *rows) want.insert(TxnPending::key(l));
+  for (auto& [k, v] : t.txnPending) {
+    if (k == txnKey() || v.commitSeq || (v.hidden.empty() && v.ghosts.empty())) continue;
+    bool hit = !rows;
+    for (size_t i = 0; !hit && i < v.hidden.size(); ++i) hit = want.count(TxnPending::key(v.hidden[i])) > 0;
+    for (size_t i = 0; !hit && i < v.ghosts.size(); ++i) hit = want.count(TxnPending::key(v.ghosts[i])) > 0;
+    if (hit) out.insert(k);
+  }
+  return out;
+}
+void waitTxnFree(Table& t, std::unique_lock<FairSharedMutex>& lk, const std::vector<Loc>* rows = nullptr) {
   const auto t0 = Clock::now();
-  while (foreignPending(t)) {
+  const void* me = txnKey();
+  struct Unregister {
+    const void* me;
+    ~Unregister() {
+      if (!me) return;
+      std::lock_guard<std::mutex> g(gWaitMu);
+      gWaitsFor.erase(me);
+    }
+  } unreg{me};
+  for (;;) {
+    const std::set<const void*> bl = blockersOf(t, rows);
+    if (bl.empty()) return;
+    if (me) {  // (outside a transaction a statement holds nothing anyone waits for: no cycle through it)
+      std::lock_guard<std::mutex> g(gWaitMu);
+      gWaitsFor[me] = bl;
+      std::set<const void*> seen;
+      std::vector<const void*> stack(bl.begin(), bl.end());
+      while (!stack.empty()) {
+        const void* x = stack.back();
+        stack.pop_back();
+        if (x == me) throw SqlError("Deadlock found when trying to get lock; try restarting transaction", 1213);
+        if (!seen.insert(x).second) continue;
+        auto it = gWaitsFor.find(x);
+        if (it != gWaitsFor.end()) stack.insert(stack.end(), it->second.begin(), it->second.end());
+      }
+    }
     if (msSince(t0) > 10000) throw SqlError("Lock wait timeout exceeded; another transaction has uncommitted changes to " + t.name, 1205);
     lk.unlock();
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
     lk.lock();
   }
 }
 // Row-level write conflicts: does another open transaction have uncommitted changes to these rows?
-bool rowsPending(const Table& t, const std::vector<Loc>& rows) {
-  std::unordered_set<int64_t> mine;
-  for (auto& [k, v] : t.txnPending) {
-    if (k == (const void*)undoLog() || v.commitSeq) continue;
-    for (const Loc& l : v.hidden) mine.insert((int64_t)l.seg << 32 | (uint32_t)l.row);
-    for (const Loc& l : v.ghosts) mine.insert((int64_t)l.seg << 32 | (uint32_t)l.row);
-  }
-  if (mine.empty()) return false;
-  for (const Loc& l : rows)
-    if (mine.count((int64_t)l.seg << 32 | (uint32_t)l.row)) return true;
-  return false;
-}
+bool rowsPending(const Table& t, const std::vector<Loc>& rows) { return !blockersOf(t, &rows).empty(); }
 // Inserts only conflict through unique keys (another transaction's uncommitted row with the same key).
 bool hasUniqueKey(const Table& t) {
   if (t.pk >= 0 || !t.pkCols.empty()) return true;
@@ -4452,55 +4496,24 @@ bool hasUniqueKey(const Table& t) {
   return false;
 }
 
-void clearTxnPending(Catalog& cat, const void* key) {
-  std::vector<std::shared_ptr<Table>> ts;
-  {
-    std::lock_guard<std::mutex> g(cat.mu);
-    for (auto& [k, t] : cat.tables) ts.push_back(t);
-  }
-  for (auto& t : ts) {
-    {  // most tables were not touched by this transaction: check under the shared lock first
-      std::shared_lock<FairSharedMutex> sl(t->mu);
-      if (!t->txnPending.count(key)) continue;
-    }
-    std::unique_lock<FairSharedMutex> lk(t->mu);
-    t->txnPending.erase(key);
-  }
-}
+// Commit gate: a COMMIT stamps all its change sets with its sequence number under the exclusive
+// gate (no table locks: the stamp is atomic), and statements reading several tables take all their
+// snapshots under the shared gate, so a transaction's commit shows in every table at once.
+std::shared_mutex gCommitGate;
 
-// COMMIT with snapshots running: the transaction's change set stays, tagged with its commit sequence
-// (under a key of its own), so the older snapshots keep not seeing it.
-static void retireTxnPending(Catalog& cat, const void* key) {
-  const uint64_t seq = ++gCommitSeq;
-  if (!snapshotsActive()) return clearTxnPending(cat, key);
-  static std::atomic<uintptr_t> next{1};
-  std::vector<std::shared_ptr<Table>> ts;
-  {
-    std::lock_guard<std::mutex> g(cat.mu);
-    for (auto& [k, t] : cat.tables) ts.push_back(t);
-  }
-  for (auto& t : ts) {
-    {
-      std::shared_lock<FairSharedMutex> sl(t->mu);
-      if (!t->txnPending.count(key)) continue;
-    }
-    std::unique_lock<FairSharedMutex> lk(t->mu);
-    auto it = t->txnPending.find(key);
-    if (it == t->txnPending.end()) continue;
-    TxnPending tp = std::move(it->second);
-    t->txnPending.erase(it);
-    if (tp.hidden.empty() && tp.ghosts.empty()) continue;
-    tp.commitSeq = seq;
-    t->txnPending[(const void*)(next++ * 2 + 1)] = std::move(tp);  // (odd: never an undo log's address)
-  }
+uint64_t oldestSnapshotSeq() {
+  std::lock_guard<std::mutex> g(gSnapMu);
+  return gSnaps.empty() ? UINT64_MAX : *gSnaps.begin();
 }
-// Drops retired change sets no active snapshot needs (committed before the oldest one).
+static void beginTxnState() {
+  static std::atomic<uintptr_t> n{0};
+  tTxn.active = true;
+  undoLog() = &tTxn.undo;
+  tTxnToken = (++n << 1) | 1;  // (odd: never an address)
+  tTxnEntries.clear();
+}
+// Drops committed change sets no snapshot needs, in every table (after a REPEATABLE READ snapshot ends).
 static void gcRetired(Catalog& cat) {
-  uint64_t oldest = UINT64_MAX;
-  {
-    std::lock_guard<std::mutex> g(gSnapMu);
-    if (!gSnaps.empty()) oldest = *gSnaps.begin();
-  }
   std::vector<std::shared_ptr<Table>> ts;
   {
     std::lock_guard<std::mutex> g(cat.mu);
@@ -4514,9 +4527,7 @@ static void gcRetired(Catalog& cat) {
       if (!any) continue;
     }
     std::unique_lock<FairSharedMutex> lk(t->mu);
-    for (auto it = t->txnPending.begin(); it != t->txnPending.end();)
-      if (it->second.commitSeq && (oldest == UINT64_MAX || it->second.commitSeq <= oldest)) it = t->txnPending.erase(it);
-      else ++it;
+    t->gcPending();
   }
 }
 static void endSnapshot(Catalog& cat) {
@@ -4533,25 +4544,41 @@ static void endSnapshot(Catalog& cat) {
 void Engine::commitTxn() {
   if (!tTxn.active) return;
   undoLog() = nullptr;
-  retireTxnPending(cat_, &tTxn.undo);  // the changes become visible (to snapshots taken from now on)
-  struct EndSnap { Catalog& c; ~EndSnap() { endSnapshot(c); } } endSnap{cat_};
+  // Durable (and acknowledged by semi-sync replicas) first, visible after: nobody reads a commit a
+  // crash could take back. A failed WAL write (disk full) rolls the transaction back.
   if (!replaying_ && !tTxn.wal.empty()) {
     uint64_t myLsn;
-    {
+    try {
       std::lock_guard<std::mutex> g(walMu_);
       std::string bundle = "\x1eTXN";  // one WAL record: replayed all or nothing
       for (auto& rec : tTxn.wal) {
-        replAppend(rec);
         const uint32_t l = (uint32_t)rec.size();
         bundle.append((const char*)&l, 4);
         bundle += rec;
       }
       walAppendLocked(tTxn.wal.size() == 1 ? tTxn.wal[0] : bundle);
+      for (auto& rec : tTxn.wal) replAppend(rec);
       myLsn = lsn_;
+    } catch (...) {
+      undoLog() = &tTxn.undo;
+      rollbackTxn();
+      throw;
     }
     walDurable(tTxn.needSync || needsSync(""));
     replWaitAck(myLsn);  // semi-sync replication
   }
+  {
+    std::unique_lock<std::shared_mutex> g(gCommitGate);
+    const uint64_t seq = ++gCommitSeq;
+    for (auto& [t, e] : tTxnEntries) e->commitSeq = seq;
+  }
+  for (auto& [t, e] : tTxnEntries) {  // tidy up now where the table is free (else later: flush, GC)
+    std::unique_lock<FairSharedMutex> lk(t->mu, std::try_to_lock);
+    if (lk.owns_lock()) t->gcPending();
+  }
+  tTxnEntries.clear();
+  tTxnToken = 0;
+  endSnapshot(cat_);
   tTxn.needSync = false;
   tTxn.wal.clear();
   tTxn.savepoints.clear();
@@ -4559,23 +4586,13 @@ void Engine::commitTxn() {
   tTxn.active = false;
 }
 
-// Replays undo records [mark, end) backwards (ROLLBACK: all of them; ROLLBACK TO SAVEPOINT: the
-// ones after it).
-// Replays undo records [mark, end) newest first. Every table involved stays locked for the whole
-// replay (and, with clearKey, while the transaction's change sets are dropped), so no reader sees a
-// half rolled back transaction.
-static void undoRecords(std::vector<UndoRec>& undo, size_t mark, const void* clearKey = nullptr) {
-  // Re-inserted rows join the transaction's hidden rows (and rows it inserted are already hidden),
-  // so other sessions keep seeing the pre-transaction state until the change sets are dropped.
-  struct KeyScope {
-    explicit KeyScope(const void* k) { tTxnKey = k; }
-    ~KeyScope() { tTxnKey = nullptr; }
-  } keyScope{clearKey};
-  std::vector<Table*> tabs;
+// Replays undo records [mark, end) newest first.
+static void undoRecords(std::vector<UndoRec>& undo, size_t mark) {
+  // Re-inserted rows join the transaction's hidden rows (txnKey() stays set; rows it inserted are
+  // hidden already), so other sessions keep seeing the pre-transaction state.
   for (size_t i = undo.size(); i-- > mark;) {
     UndoRec& u = undo[i];
     Table& t = *u.t;
-    if (std::find(tabs.begin(), tabs.end(), &t) == tabs.end()) tabs.push_back(&t);
     std::unique_lock<FairSharedMutex> lk(t.mu);
     if (!u.inserted) {
       t.appendRow(u.row);
@@ -4603,24 +4620,19 @@ static void undoRecords(std::vector<UndoRec>& undo, size_t mark, const void* cle
           done = true;
         }
   }
-  if (clearKey)
-    for (Table* t : tabs) {
-      std::unique_lock<FairSharedMutex> lk(t->mu);
-      t->txnPending.erase(clearKey);  // the rollback becomes visible (per table, as a commit)
-    }
 }
 
 void Engine::rollbackTxn() {
   if (!tTxn.active) return;
   undoLog() = nullptr;
-  struct ClearPending {  // after the undo log is replayed
-    Engine* e;
-    ~ClearPending() {
-      clearTxnPending(e->cat_, &tTxn.undo);
-      endSnapshot(e->cat_);
-    }
-  } clearPending{this};
-  undoRecords(tTxn.undo, 0, &tTxn.undo);
+  undoRecords(tTxn.undo, 0);  // (re-inserted rows join the transaction's hidden rows)
+  for (auto& [t, e] : tTxnEntries) {  // then the change sets go: the table shows its state from before
+    std::unique_lock<FairSharedMutex> lk(t->mu);
+    t->txnPending.erase(txnKey());
+  }
+  tTxnEntries.clear();
+  tTxnToken = 0;
+  endSnapshot(cat_);
   tTxn.wal.clear();
   tTxn.undo.clear();
   tTxn.savepoints.clear();
@@ -4633,9 +4645,9 @@ std::string isolationLevel() { return tIsoSnapshot ? "REPEATABLE-READ" : "READ-C
 ResultSet Engine::doTxn(const std::string& what) {
   if (what == "BEGIN" || what == "BEGIN SNAPSHOT") {
     commitTxn();  // MySQL: BEGIN implicitly commits an open transaction
-    tTxn.active = true;
-    undoLog() = &tTxn.undo;
+    beginTxnState();
     if (what == "BEGIN SNAPSHOT" || tIsoSnapshot) {  // the snapshot: every commit so far
+      std::shared_lock<std::shared_mutex> gate(gCommitGate);  // (no commit half published)
       std::lock_guard<std::mutex> g(gSnapMu);
       tSnapSeq = gCommitSeq.load();
       gSnaps.insert(tSnapSeq);
@@ -4668,10 +4680,7 @@ ResultSet Engine::doTxn(const std::string& what) {
     undoLog() = &tTxn.undo;
     return ResultSet{};
   }
-  if (!tTxn.autocommit && !tTxn.active) {  // autocommit = 0: the next transaction starts right away
-    tTxn.active = true;
-    undoLog() = &tTxn.undo;
-  }
+  if (!tTxn.autocommit && !tTxn.active) beginTxnState();  // autocommit = 0: the next transaction starts right away
   ResultSet r;
   return r;
 }
@@ -4744,8 +4753,13 @@ void Engine::logWrite(const std::string& sql, const std::string& db) {
   {
     std::lock_guard<std::mutex> g(walMu_);
     const std::string rec = currentDb() + "\x1f" + sql;
+    try {
+      walAppendLocked(rec);
+    } catch (SqlError& e) {  // the change is applied but not logged: refuse writes until a restart
+      walBroken_ = true;
+      throw SqlError(std::string(e.what()) + "; the server is read-only until it is restarted", e.code);
+    }
     replAppend(rec);
-    walAppendLocked(rec);
     myLsn = lsn_;
   }
   walDurable(sync);
@@ -4806,6 +4820,15 @@ ResultSet runSelect(Engine* e, const std::function<ResultSet()>& fn, const std::
 
 thread_local int tExecDepth = 0;
 ResultSet Engine::execute(const std::string& sql) {
+  try {
+    return executeStmt(sql);
+  } catch (SqlError& e) {
+    if (e.code == 1213 && tExecDepth == 0 && tTxn.active) rollbackTxn();  // deadlock victim: the whole transaction (MySQL)
+    throw;
+  }
+}
+
+ResultSet Engine::executeStmt(const std::string& sql) {
   if (tExecDepth == 0) tTxnViews.clear();  // visibility bitmaps of the previous statement
   ++tExecDepth;
   struct Depth { ~Depth() { --tExecDepth; } } depthGuard;
@@ -4870,14 +4893,15 @@ ResultSet Engine::execute(const std::string& sql) {
     ResultSet cr;
     if (clusterStatement(sql, s, cr)) return cr;
   }
-  if (isReplica_ && !tApplying) {
+  if ((isReplica_ && !tApplying) || (walBroken_ && !replaying_)) {
     switch (s.type) {
       case Stmt::SELECT: if (s.outfile.empty()) break; [[fallthrough]];
       case Stmt::INSERT: case Stmt::UPDATE: case Stmt::DELETE: case Stmt::LOAD: case Stmt::CREATE: case Stmt::DROP:
       case Stmt::ALTER: case Stmt::TRUNCATE: case Stmt::RENAME: case Stmt::CREATE_DB: case Stmt::DROP_DB:
       case Stmt::CREATE_VIEW: case Stmt::DROP_VIEW: case Stmt::PIPELINE: case Stmt::USER: case Stmt::BACKUP:
         if (s.type == Stmt::CREATE && s.temporary) break;
-        throw SqlError("The server is a read-only replica (--replica-of); run writes on the primary or PROMOTE it", 1290);
+        if (isReplica_) throw SqlError("The server is a read-only replica (--replica-of); run writes on the primary or PROMOTE it", 1290);
+        throw SqlError("The server is read-only: a WAL write failed (disk full?); free space and restart it", 1290);
       default: break;
     }
   }
@@ -4899,8 +4923,7 @@ ResultSet Engine::execute(const std::string& sql) {
       (s.type == Stmt::INSERT || s.type == Stmt::UPDATE || s.type == Stmt::DELETE || s.type == Stmt::LOAD) && snapshotsActive()) {
     tImplicitTxn = true;
     struct Flag { ~Flag() { tImplicitTxn = false; } } flag;
-    tTxn.active = true;
-    undoLog() = &tTxn.undo;
+    beginTxnState();
     try {
       --tExecDepth;  // (the nested execute counts again)
       struct Inc { ~Inc() { ++tExecDepth; } } inc;
@@ -4927,6 +4950,7 @@ ResultSet Engine::execute(const std::string& sql) {
     case Stmt::TXN: return doTxn(s.setName);
     case Stmt::SELECT: {
       SnapGuard snap;  // MVCC: the statement reads snapshots of its tables
+      snapshotStatement(s);
       if (s.outfile.empty()) return runSelect(this, [&] { return runStatementQuery(s, false); }, sql, false);
       ResultSet q = runStatementQuery(s, false);  // SELECT .. INTO OUTFILE: tab-separated, \N for NULL
       FILE* f = fopen(s.outfile.c_str(), "wx");
@@ -4944,10 +4968,12 @@ ResultSet Engine::execute(const std::string& sql) {
     }
     case Stmt::EXPLAIN: {
       SnapGuard snap;
+      if (s.inner) snapshotStatement(*s.inner);
       return runSelect(this, [&] { return runStatementQuery(*s.inner, true); }, sql, false);
     }
     case Stmt::PROFILE: {
       SnapGuard snap;
+      if (s.inner) snapshotStatement(*s.inner);
       return runSelect(this, [&] { return runStatementQuery(*s.inner, false); }, sql, true);
     }
     case Stmt::SHOW_PROFILE: {
@@ -6425,7 +6451,7 @@ ResultSet Engine::modifyViaSelect(Stmt& s) {
     }
   });
   if (rowsPending(*t, matched)) {  // another open transaction changed some of these rows: wait, then redo
-    waitTxnFree(*t, lk);
+    waitTxnFree(*t, lk, &matched);
     lk.unlock();
     return modifyViaSelect(s);
   }
@@ -6534,7 +6560,7 @@ ResultSet Engine::doModify(Stmt& s) {
   }
 
   if (rowsPending(*t, matched)) {  // row-level conflict with another open transaction: wait, then redo
-    waitTxnFree(*t, lk);
+    waitTxnFree(*t, lk, &matched);
     lk.unlock();
     return doModify(s);
   }
@@ -6614,6 +6640,81 @@ ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const 
 }
 
 // ------------------------------------------------------------------ SELECT
+
+// Every table a statement reads (FROM entries, derived tables, CTE bodies, subqueries, UNION arms,
+// views), as catalog keys.
+static void collectTables(const Stmt& s, const std::string& db, std::set<std::string>& keys, std::set<std::string> ctes, Catalog& cat, int depth);
+static void collectExpr(const ExprP& e, const std::string& db, std::set<std::string>& keys, const std::set<std::string>& ctes, Catalog& cat, int depth) {
+  if (!e) return;
+  if (e->sub) collectTables(*e->sub, db, keys, ctes, cat, depth);
+  for (auto& a : e->args) collectExpr(a, db, keys, ctes, cat, depth);
+  for (auto& a : e->partBy) collectExpr(a, db, keys, ctes, cat, depth);
+  for (auto& o : e->winOrder) collectExpr(o.first, db, keys, ctes, cat, depth);
+}
+static void collectTables(const Stmt& s, const std::string& db, std::set<std::string>& keys, std::set<std::string> ctes, Catalog& cat, int depth) {
+  if (depth > 8) return;
+  for (auto& [name, body] : s.ctes) {
+    if (body) collectTables(*body, db, keys, ctes, cat, depth + 1);
+    ctes.insert(lower(name));
+  }
+  for (auto& f : s.from) {
+    if (f.sub) collectTables(*f.sub, db, keys, ctes, cat, depth + 1);
+    else if (!f.name.empty() && !ctes.count(lower(f.name))) {
+      const std::string k = f.name.find('.') != std::string::npos ? lower(f.name) : db + "." + lower(f.name);
+      std::string view;
+      {
+        std::lock_guard<std::mutex> g(cat.mu);
+        auto it = cat.views.find(k);
+        if (it != cat.views.end()) view = it->second;
+      }
+      if (!view.empty()) {
+        if (view.rfind("/*cols:", 0) == 0) view = view.substr(view.find("*/") + 2);
+        try {
+          collectTables(parseSql(view), k.substr(0, k.find('.')), keys, {}, cat, depth + 1);
+        } catch (std::exception&) {
+        }
+      } else {
+        keys.insert(k);
+      }
+    }
+    collectExpr(f.on, db, keys, ctes, cat, depth + 1);
+  }
+  for (auto& it : s.items) collectExpr(it.e, db, keys, ctes, cat, depth + 1);
+  collectExpr(s.where, db, keys, ctes, cat, depth + 1);
+  collectExpr(s.having, db, keys, ctes, cat, depth + 1);
+  for (auto& g : s.groupBy) collectExpr(g, db, keys, ctes, cat, depth + 1);
+  for (auto& o : s.orderBy) collectExpr(o.e, db, keys, ctes, cat, depth + 1);
+  for (auto& j : s.joinConds) collectExpr(j, db, keys, ctes, cat, depth + 1);
+  if (s.unionNext) collectTables(*s.unionNext, db, keys, ctes, cat, depth + 1);
+}
+
+// A statement reading several tables takes all their snapshots at one moment (under the shared commit
+// gate), so it sees each transaction in all of its tables or in none. (One table: lazily, as read.)
+void Engine::snapshotStatement(const Stmt& s) {
+  if (!tSnapScope) return;
+  std::set<std::string> keys;
+  collectTables(s, lower(currentDb()), keys, {}, cat_, 0);
+  std::vector<std::shared_ptr<Table>> tabs;
+  for (auto& k : keys) {
+    if (k.rfind("information_schema.", 0) == 0) continue;
+    auto t = cat_.find(k);
+    if (t && t->db != "__tmp" && !t->isShadow() && !tSnapScope->shadows.count(t.get())) tabs.push_back(t);
+  }
+  if (tabs.size() + tSnapScope->shadows.size() < 2) return;
+  std::sort(tabs.begin(), tabs.end());
+  std::shared_lock<std::shared_mutex> gate(gCommitGate);
+  for (auto& t : tabs) {
+    std::shared_ptr<Table> sh;
+    {
+      FairSharedMutex::barge = true;
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      FairSharedMutex::barge = false;
+      sh = t->shadow();
+    }
+    tSnapScope->bases.push_back(t);
+    tSnapScope->shadows[t.get()] = sh;
+  }
+}
 
 std::shared_ptr<Table> Engine::tableForRead(const std::string& name, const Stmt& s) {
   auto t = cat_.get(name);
@@ -10152,6 +10253,7 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   ResultSet r = query(inner, q, false, true);
   const auto tW1 = Clock::now();
   const size_t n = r.vals.size(), base = r.names.size();
+  std::vector<size_t> lastOrder;  // rows in the last window's (PARTITION BY, ORDER BY) order
   for (size_t w = 0; w < wins.size(); ++w) {
     const Win& wn = wins[w];
     const std::string f = wn.node->op;
@@ -10327,6 +10429,7 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       }
     }
     }, std::max<size_t>(1, parts.size() / (4 * std::thread::hardware_concurrency())));
+    if (w + 1 == wins.size() && s.orderBy.empty() && !s.distinct && (!wn.part.empty() || !wn.ord.empty())) lastOrder = idx;
     r.names.push_back("__w" + std::to_string(w));
     r.types.push_back(ty);
     parallelFor(n, [&](size_t b, size_t e) {
@@ -10337,6 +10440,14 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     });
   }
   (void)base;
+  if (!lastOrder.empty()) {  // no ORDER BY: rows come out in window order, as in MySQL (ORMs rely on it)
+    std::vector<int64_t> pos(n);
+    for (size_t j = 0; j < n; ++j) pos[lastOrder[j]] = (int64_t)j;
+    r.names.push_back("__wpos");
+    r.types.push_back(LType::BIGINT);
+    for (size_t i = 0; i < n; ++i) r.vals[i].push_back(Value::I(pos[i]));
+    outer.orderBy.push_back({mkCol("__win", "__wpos"), false});
+  }
   const auto tW2 = Clock::now();
   std::string tmp = makeTemp(r, q, "win");
   if (getenv("GPUDB_TRACE"))

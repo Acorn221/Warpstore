@@ -110,5 +110,92 @@ for k in range(20):  # thousands of new strings while the reader decodes the dic
 w.execute("DROP TABLE tmp")
 th.join()
 c.eq("reader of a dropped table finishes on its snapshot", out["r"][0], ((5000, "v999"),))
+# 4. a commit shows in all of its tables at once; a statement reading two tables sees one moment
+cur.execute("CREATE TABLE ta (id INT PRIMARY KEY, v BIGINT)")
+cur.execute("CREATE TABLE tb (id INT PRIMARY KEY, v BIGINT)")
+cur.execute("INSERT INTO ta VALUES " + ",".join(f"({i}, 1000)" for i in range(200)))
+cur.execute("INSERT INTO tb VALUES " + ",".join(f"({i}, 1000)" for i in range(200)))
+cur.execute("OPTIMIZE TABLE ta")
+stop = threading.Event()
+
+
+def cross():
+    k = srv.connect("m", autocommit=False)
+    kc = k.cursor()
+    rnd = random.Random(3)
+    while not stop.is_set():
+        a, b = rnd.randrange(200), rnd.randrange(200)
+        try:
+            kc.execute("BEGIN")
+            kc.execute(f"UPDATE ta SET v = v - 5 WHERE id = {a}")
+            kc.execute(f"UPDATE tb SET v = v + 5 WHERE id = {b}")
+            k.commit()
+        except pymysql.MySQLError:
+            k.rollback()
+
+
+cross_reads = []
+
+
+def cross_reader(q):
+    r = srv.cursor("m")
+    while not stop.is_set():
+        r.execute(q)
+        cross_reads.append(r.fetchone()[0])
+
+
+ths = [threading.Thread(target=cross) for _ in range(2)]
+ths += [threading.Thread(target=cross_reader, args=("SELECT (SELECT SUM(v) FROM ta) + (SELECT SUM(v) FROM tb)",)),
+        threading.Thread(target=cross_reader, args=("SELECT SUM(ta.v + tb.v) FROM ta JOIN tb ON ta.id = tb.id",))]
+for x in ths:
+    x.start()
+time.sleep(4)
+stop.set()
+for x in ths:
+    x.join()
+bad = [x for x in cross_reads if int(x) != 400000]
+print(f"{len(cross_reads)} two-table reads during cross-table transfers, {len(bad)} inconsistent")
+c.check("cross-table commits are atomic for readers", not bad and len(cross_reads) > 20, str(bad[:5]))
+
+# 5. deadlocks are detected at once (not after the 10 s lock wait), the victim is rolled back
+cur.execute("SELECT (SELECT v FROM ta WHERE id = 1), (SELECT v FROM tb WHERE id = 1)")
+va0, vb0 = cur.fetchone()
+p1, p2 = srv.connect("m", autocommit=False), srv.connect("m", autocommit=False)
+k1, k2 = p1.cursor(), p2.cursor()
+k1.execute("BEGIN"); k1.execute("UPDATE ta SET v = v + 1 WHERE id = 1")
+k2.execute("BEGIN"); k2.execute("UPDATE tb SET v = v + 1 WHERE id = 1")
+res = {}
+
+
+def second():
+    try:
+        k1.execute("UPDATE tb SET v = v + 100 WHERE id = 1")  # waits for k2
+        res["k1"] = "ok"
+    except pymysql.MySQLError as e:
+        res["k1"] = e.args[0]
+
+
+th = threading.Thread(target=second)
+th.start()
+time.sleep(0.3)
+t0 = time.time()
+try:
+    k2.execute("UPDATE ta SET v = v + 100 WHERE id = 1")  # closes the cycle
+    res["k2"] = "ok"
+except pymysql.MySQLError as e:
+    res["k2"] = e.args[0]
+th.join(15)
+took = time.time() - t0
+print(f"deadlock outcome {res} in {took:.2f}s")
+c.check("deadlock found quickly (1213) and the other transaction goes on", sorted(map(str, res.values())) == ["1213", "ok"] and took < 3, str(res))
+for k, p in ((k1, p1), (k2, p2)):
+    try:
+        p.commit()
+    except pymysql.MySQLError:
+        pass
+cur.execute("SELECT (SELECT v FROM ta WHERE id = 1), (SELECT v FROM tb WHERE id = 1)")
+va, vb = cur.fetchone()
+want = (va0 + 1, vb0 + 100) if res.get("k1") == "ok" else (va0 + 100, vb0 + 1)  # only the winner's two updates
+c.eq("the victim's changes are rolled back", (va, vb), want)
 srv.stop()
 c.done()

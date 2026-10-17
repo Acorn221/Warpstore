@@ -409,7 +409,18 @@ struct TxnPending {
   std::vector<Loc> hidden, ghosts;
   std::unordered_set<uint64_t> hiddenIx;  // hidden, for lookups (big transactions)
   static uint64_t key(Loc l) { return (uint64_t)(uint32_t)l.seg << 32 | (uint32_t)l.row; }
-  uint64_t commitSeq = 0;  // 0: open; else committed, kept for older snapshots (REPEATABLE READ)
+  TxnPending() = default;
+  TxnPending(const TxnPending& o) : hidden(o.hidden), ghosts(o.ghosts), hiddenIx(o.hiddenIx), commitSeq(o.commitSeq.load()) {}
+  TxnPending& operator=(const TxnPending& o) {
+    hidden = o.hidden;
+    ghosts = o.ghosts;
+    hiddenIx = o.hiddenIx;
+    commitSeq = o.commitSeq.load();
+    return *this;
+  }
+  // 0: open; else the commit's global sequence number. Set for all of a transaction's tables at
+  // once (under the commit gate, without table locks), so a commit becomes visible atomically.
+  std::atomic<uint64_t> commitSeq{0};
 };
 
 // Table lock: readers / writer like std::shared_mutex, but a waiting writer blocks new readers, so
@@ -540,6 +551,8 @@ struct Table {
   void appendRaw(const std::vector<int64_t>& ints, const std::vector<double>& dbls);  // physical values
   void deleteAt(Loc l);
   void txnNoteDelete(Loc l);  // an open transaction deleted row l (read committed bookkeeping)
+  TxnPending& pendingOfMine();  // this transaction's change set here (created and registered on first use)
+  void gcPending();             // drops committed change sets no snapshot needs (caller holds the exclusive lock)
   void flush(bool force);  // all partitions' buffers -> sorted GPU segment(s)
   void flushPart(int part);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
@@ -570,11 +583,16 @@ struct UndoRec {
   std::vector<Value> row;
 };
 std::vector<UndoRec>*& undoLog();
-// The open transaction whose change sets (Table::txnPending) writes are recorded under: undoLog(),
-// or tTxnKey while a ROLLBACK replays the undo log (its re-inserted rows stay hidden until the
-// change sets are dropped, so the rollback shows all at once).
-extern thread_local const void* tTxnKey;
-inline const void* txnKey() { return tTxnKey ? tTxnKey : (const void*)undoLog(); }
+// The open transaction's key in Table::txnPending (null outside a transaction): unique per transaction
+// (an odd number, never an address). It stays set while COMMIT / ROLLBACK finish: a ROLLBACK's
+// re-inserted rows join the transaction's hidden rows, so the rollback shows all at once.
+extern thread_local uintptr_t tTxnToken;
+inline const void* txnKey() { return (const void*)tTxnToken; }
+struct Table;
+// The change sets the open transaction created (COMMIT stamps them; their map nodes are stable).
+extern thread_local std::vector<std::pair<Table*, TxnPending*>> tTxnEntries;
+// Oldest REPEATABLE READ snapshot (UINT64_MAX: none): committed change sets older than it can go.
+uint64_t oldestSnapshotSeq();
 
 // Current database of the calling connection (thread); "gpudb" by default.
 std::string& currentDb();

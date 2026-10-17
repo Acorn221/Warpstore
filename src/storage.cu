@@ -15,7 +15,8 @@ std::string lower(std::string s) {
   return s;
 }
 
-thread_local const void* tTxnKey = nullptr;
+thread_local uintptr_t tTxnToken = 0;
+thread_local std::vector<std::pair<Table*, TxnPending*>> tTxnEntries;
 
 std::vector<UndoRec>*& undoLog() {
   thread_local std::vector<UndoRec>* log = nullptr;
@@ -630,7 +631,7 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
   ++buf.n;
   ++buf.version;
   if (txnKey() && db != "__tmp") {  // invisible to others until COMMIT
-    TxnPending& tp = txnPending[txnKey()];
+    TxnPending& tp = pendingOfMine();
     tp.hidden.push_back(nl);
     tp.hiddenIx.insert(TxnPending::key(nl));
   }
@@ -721,8 +722,23 @@ void Table::appendRow(const std::vector<Value>& rowIn) {
   undo.ok = true;
 }
 
+TxnPending& Table::pendingOfMine() {
+  auto [it, fresh] = txnPending.try_emplace(txnKey());
+  if (fresh) tTxnEntries.push_back({this, &it->second});
+  return it->second;
+}
+
+void Table::gcPending() {
+  if (txnPending.empty()) return;
+  const uint64_t oldest = oldestSnapshotSeq();
+  for (auto it = txnPending.begin(); it != txnPending.end();) {
+    const uint64_t c = it->second.commitSeq;
+    it = c && (oldest == UINT64_MAX || c <= oldest) ? txnPending.erase(it) : std::next(it);
+  }
+}
+
 void Table::txnNoteDelete(Loc l) {
-  auto& tp = txnPending[undoLog()];
+  auto& tp = pendingOfMine();
   if (tp.hiddenIx.erase(TxnPending::key(l))) {  // a row this transaction inserted: just gone
     auto h = std::find(tp.hidden.begin(), tp.hidden.end(), l);
     if (h != tp.hidden.end()) tp.hidden.erase(h);
@@ -866,6 +882,7 @@ void Table::flushPart(int part) {
   const std::shared_ptr<WriteBuffer> hold = bufs[part];  // (replaced at the end; snapshots keep it)
   WriteBuffer& buf = *hold;
   if (buf.n == 0) return;
+  gcPending();
   if (!txnPending.empty()) return;  // open transactions refer to buffer rows by location: flush later
   // Live rows in buffer order, then sorted by the SORT KEY (on the GPU).
   std::vector<int32_t> live;

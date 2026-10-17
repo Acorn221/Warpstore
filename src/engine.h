@@ -125,6 +125,8 @@ class Engine {
   FILE* wal_ = nullptr;
   std::mutex walMu_;
   bool sync_;
+  std::atomic<bool> walBroken_{false};  // a WAL write failed: writes are refused until a restart
+  ResultSet executeStmt(const std::string& sql);
   // WAL (format 2: "GDBWAL2\n", then records of u32 length, u32 CRC32, payload). Group commit: a
   // committing writer waits until an fdatasync covers its record; one sync serves all waiters.
   void walAppendLocked(const std::string& rec);  // caller holds walMu_
@@ -239,6 +241,7 @@ class Engine {
   ResultSet doShowMisc(Stmt& s);
   ResultSet infoSchema(const std::string& table);
   std::shared_ptr<Table> tableForRead(const std::string& name, const Stmt& s);  // MVCC snapshot (see SnapScope)
+  void snapshotStatement(const Stmt& s);  // multi-table statements: all snapshots at one moment
   std::vector<std::vector<std::string>> processRows(bool truncateInfo);
   std::string showCreate(const Table& t);
   std::shared_ptr<Table> rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from);
