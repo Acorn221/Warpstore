@@ -6,7 +6,22 @@ column segments kept in GPU memory. Built in: vector search (GPU graph index), e
 full-text search, S3 / Kafka / MySQL change-data-capture ingest, replication with failover, backups
 with point-in-time restore, MVCC.
 
-> **Status: experimental alpha.** warpstore was developed as an experiment: how far can a GPU-first,
+### 13x faster than DuckDB, 24x faster than ClickHouse, 87x faster than SingleStore
+
+| ClickBench, all 43 queries (10M rows, hot) | Total time | Warpstore is faster by |
+|---|---:|---:|
+| **Warpstore** (one RTX 3080) | **0.23 s** | — |
+| DuckDB 1.5.6 | 6.2 s | **13.5x** |
+| ClickHouse 25.8 | 9.5 s | **24x** |
+| SingleStore 9.1 | 30.1 s | **87x** |
+| MySQL 8.4 (dashboard queries, 5M rows) | 1.2 to 16 s per query | **46x to 2,367x** |
+
+<sub>Same machine (Ryzen 5 5500, 12 threads, + RTX 3080), geometric mean per query, Warpstore won 42
+of 43 queries against DuckDB and all 43 against ClickHouse and SingleStore. At 10M rows the data fits
+in VRAM; larger datasets spill to host memory and the gap narrows. Full tables, methodology and
+caveats: [How it compares](#how-it-compares).</sub>
+
+> **Status: experimental alpha.** Warpstore was developed as an experiment: how far can a GPU-first,
 > MySQL-compatible database get, and how fast? It was built quickly, with heavy use of an AI coding
 > assistant. It passes TPC-H, ClickBench, a differential fuzzer and ORM suites (see [Tests](#tests)),
 > but it is young: NVIDIA GPUs only, one main developer, no production deployments. Don't make it
