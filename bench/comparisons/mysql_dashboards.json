@@ -1,0 +1,10 @@
+{"note": "dash_vs_mysql.py on 2026-10-18: 5M events, MySQL 8.4 (5 GB buffer pool, keys on ts and user_id) vs Warpstore (RTX 3080); milliseconds; hot = best of 3 (MySQL) / 6 (Warpstore)",
+ "rows": [
+  ["channel totals since May", 1420.0, 1453, 0.60, 5],
+  ["distinct users per country", 2825.4, 2924, 3.01, 5],
+  ["daily series (ios)", 1198.3, 1210, 5.10, 7],
+  ["top 10 users by spend", 7620.2, 7648, 7.26, 8],
+  ["one hour, by country+channel", 3.4, 4, 0.61, 1],
+  ["JSON field group-by", 4222.7, 4223, 4.76, 8],
+  ["window rank per country", 16461.4, 16774, 354.72, 662]],
+ "columns": ["query", "mysql_hot_ms", "mysql_first_ms", "warpstore_hot_ms", "warpstore_first_ms"]}

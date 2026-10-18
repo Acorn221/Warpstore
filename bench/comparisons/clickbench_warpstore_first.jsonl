@@ -1,0 +1,43 @@
+{"q": 1, "warpstore_first": 0.003997756983153522, "warpstore": 0.00027620798209682107, "duckdb": 0.0004074139869771898, "match": true}
+{"q": 2, "warpstore_first": 0.0011405590048525482, "warpstore": 0.0004061419749632478, "duckdb": 0.0015089700173120946, "match": true}
+{"q": 3, "warpstore_first": 0.0014482259866781533, "warpstore": 0.0005005789862480015, "duckdb": 0.004348704998847097, "match": true}
+{"q": 4, "warpstore_first": 0.0012628980039153248, "warpstore": 0.0004125540144741535, "duckdb": 0.008167275984305888, "match": true}
+{"q": 5, "warpstore_first": 0.006891775003168732, "warpstore": 0.0049639890203252435, "duckdb": 0.08744109299732372, "match": true}
+{"q": 6, "warpstore_first": 0.004066155990585685, "warpstore": 0.002898084989283234, "duckdb": 0.13861172698670998, "match": true}
+{"q": 7, "warpstore_first": 0.0014199830184224993, "warpstore": 0.0004448340041562915, "duckdb": 0.0005057889793533832, "match": true}
+{"q": 8, "warpstore_first": 0.0023736210132483393, "warpstore": 0.001300319010624662, "duckdb": 0.0023723490012343973, "match": true}
+{"q": 9, "warpstore_first": 0.007619970012456179, "warpstore": 0.006048622977687046, "duckdb": 0.10122058499837294, "match": true}
+{"q": 10, "warpstore_first": 0.011631011991994455, "warpstore": 0.009280414000386372, "duckdb": 0.1701731360226404, "match": true}
+{"q": 11, "warpstore_first": 0.002766407997114584, "warpstore": 0.0016267809842247516, "duckdb": 0.024303337006131187, "match": true}
+{"q": 12, "warpstore_first": 0.0030320660152938217, "warpstore": 0.0018488370114937425, "duckdb": 0.023571906000142917, "match": true}
+{"q": 13, "warpstore_first": 0.002682421007193625, "warpstore": 0.0013741570001002401, "duckdb": 0.13551118201576173, "match": true}
+{"q": 14, "warpstore_first": 0.006741933990269899, "warpstore": 0.0053777749999426305, "duckdb": 0.2343317759805359, "match": true}
+{"q": 15, "warpstore_first": 0.007690161990467459, "warpstore": 0.004310584015911445, "duckdb": 0.12397435601451434, "match": true}
+{"q": 16, "warpstore_first": 0.007016919000307098, "warpstore": 0.00657076301285997, "duckdb": 0.09655235998798162, "match": true}
+{"q": 17, "warpstore_first": 0.00914434899459593, "warpstore": 0.007784388988511637, "duckdb": 0.22231464000651613, "match": true}
+{"q": 18, "warpstore_first": 0.08627705098479055, "warpstore": 0.090280256990809, "duckdb": 0.15409371099667624, "match": false, "g": "[(-5467133939232195501, '', 9), (-8749307529807883443, 'rusradio+record.ru/~societi supra \u0432 \u0443\u0445\u0435 \u0447\u0435\u043b\u043e\u0432', 1)]", "d": "[(4610065868767472864, '', 12), (4619314082815858073, '', 3)]"}
+{"q": 19, "warpstore_first": 0.015328565990785137, "warpstore": 0.01420127201708965, "duckdb": 0.39185068098595366, "match": true}
+{"q": 20, "warpstore_first": 0.002644279011292383, "warpstore": 0.0006117070151958615, "duckdb": 0.0008677169971633703, "match": true}
+{"q": 21, "warpstore_first": 0.06121396800153889, "warpstore": 0.0003882880264427513, "duckdb": 0.09595878701657057, "match": true}
+{"q": 22, "warpstore_first": 0.007294349983567372, "warpstore": 0.0006853549857623875, "duckdb": 0.08377063000807539, "match": false, "g": "[('\u0437\u0430\u0447\u0430\u0442\u044c \u043e\u043d\u043b\u0430\u0439\u043d \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u043e', 'http://tienskaia-moda-brietielkakh-2%2F%2Fwww.google-poyasnuha-petersburg/detail.aspx?sort=newly&trafkey', 2), ('\u043a\u0430\u043a \u043c\u0438\u043a\u0441\u0435\u0442\u0438\u043d \u0438\u043d\u0441\u0442", "d": "[('\u0437\u0430\u0447\u0430\u0442\u044c \u043e\u043d\u043b\u0430\u0439\u043d \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u043e', 'http://tienskaia-moda-brietielkakh-2%2F%2Fwww.google-poyasnuha-petersburg/detail.aspx?sort=newly&trafkey', 2), ('\u043a\u0430\u043a \u043c\u0438\u043a\u0441\u0435\u0442\u0438\u043d \u0438\u043d\u0441\u0442"}
+{"q": 23, "warpstore_first": 0.1285482640087139, "warpstore": 0.0015652059810236096, "duckdb": 0.16826369499904104, "match": true}
+{"q": 24, "warpstore_first": 0.006719722005072981, "warpstore": 0.005304007005179301, "duckdb": 0.0830810870102141, "match": true}
+{"q": 25, "warpstore_first": 0.002560651977546513, "warpstore": 0.0013145760167390108, "duckdb": 0.007210122013930231, "match": true}
+{"q": 26, "warpstore_first": 0.006008749012835324, "warpstore": 0.0012323309783823788, "duckdb": 0.0314033429895062, "match": true}
+{"q": 27, "warpstore_first": 0.0023373340081889182, "warpstore": 0.0019951520080212504, "duckdb": 0.006952186988200992, "match": true}
+{"q": 28, "warpstore_first": 0.14429433300392702, "warpstore": 0.023871577985119075, "duckdb": 0.0655033320072107, "match": true}
+{"q": 29, "warpstore_first": 1.0012665939866565, "warpstore": 0.006880953995278105, "duckdb": 1.5598641840042546, "match": false, "g": "[('auto.ria.ua', 68.0, 156229, 'http://auto.ria.ua/&q=\u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u043e\u0432'), ('bdsmpeople.ru', 103.05, 113921, 'http://bdsmpeople.ru/')]", "d": "[('auto.ria.ua', 68.0, 156227, 'http://auto.ria.ua/&q=\u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u043e\u0432'), ('bdsmpeople.ru', 103.05, 113920, 'http://bdsmpeople.ru/')]"}
+{"q": 30, "warpstore_first": 0.002745888981735334, "warpstore": 0.0015699849755037576, "duckdb": 0.010849916987353936, "match": true}
+{"q": 31, "warpstore_first": 0.00697333799325861, "warpstore": 0.005898622010136023, "duckdb": 0.07854235501145013, "match": true}
+{"q": 32, "warpstore_first": 0.007312033005291596, "warpstore": 0.006260030000703409, "duckdb": 0.09997207298874855, "match": false, "g": "[(4849032548042526258, -1817982905, 1, 1, 1917.0), (5297405018721798728, 1804318700, 1, 0, 1638.0)]", "d": "[(4829475027606121545, 129952265, 1, 0, 785.0), (5697219411997795648, -872372913, 1, 0, 1828.0)]"}
+{"q": 33, "warpstore_first": 0.02498438401380554, "warpstore": 0.023483600991312414, "duckdb": 0.5516812700079754, "match": false, "g": "[(5742012846042011682, -588927354, 1, 1, 1368.0), (6621781808647265655, -675985346, 1, 0, 1368.0)]", "d": "[(5270393077753009254, 1839637578, 1, 0, 1368.0), (5617418085188025435, 967850970, 1, 0, 2038.0)]"}
+{"q": 34, "warpstore_first": 0.0042103659943677485, "warpstore": 0.0030561510066036135, "duckdb": 0.5526109329948667, "match": true}
+{"q": 35, "warpstore_first": 0.011646541999652982, "warpstore": 0.010233070002868772, "duckdb": 0.5646058580023237, "match": true}
+{"q": 36, "warpstore_first": 0.007690922997426242, "warpstore": 0.0062359049916267395, "duckdb": 0.09534181997878477, "match": true}
+{"q": 37, "warpstore_first": 0.0028077760071028024, "warpstore": 0.0009766409930307418, "duckdb": 0.03382261999649927, "match": true}
+{"q": 38, "warpstore_first": 0.0013796169951092452, "warpstore": 0.0009533269912935793, "duckdb": 0.006992794020334259, "match": true}
+{"q": 39, "warpstore_first": 0.002610796014778316, "warpstore": 0.0009616129973437637, "duckdb": 0.009182881010929123, "match": false, "g": "[('http://kinopoisk.ru/Web', 2), ('http://megaobzor.com/iframe-owa.html%3Fhtml%3Fhtml', 2)]", "d": "[('http%3A%252f110911.html', 2), ('http://bdsm_po_yers=0&with_video', 2)]"}
+{"q": 40, "warpstore_first": 0.02483344098436646, "warpstore": 0.003632801992353052, "duckdb": 0.07872862499789335, "match": false, "g": "[(-1, 0, 0, 'http://state=19945206/foto-4/login-116;19984/frl-29/tag/region=FS12_Kleider_by=2&price-platjie-temnja/spolnyaetsya-belyj', 'http://irr.ru/index.php", "d": "[(-1, 0, 0, 'http://state=19945206/foto-4/login-2006/makum', 'http://irr.ru/index.php?showalbum/login-nashieies.ru/sort/progs/page=0&damage=10533', 13), (-1, 0,"}
+{"q": 41, "warpstore_first": 0.0344506069959607, "warpstore": 0.0022824699990451336, "duckdb": 0.004861066001467407, "match": true}
+{"q": 42, "warpstore_first": 0.005603036988759413, "warpstore": 0.004030608979519457, "duckdb": 0.004462659009732306, "match": true}
+{"q": 43, "warpstore_first": 0.0035457089834380895, "warpstore": 0.0022525039967149496, "duckdb": 0.010740463010733947, "match": true}
