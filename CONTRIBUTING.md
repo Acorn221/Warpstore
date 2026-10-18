@@ -19,7 +19,7 @@ The ORM tests need Node.js (they install their packages on first run).
 
 ## Where things are
 
-See the "Layout" section of the README. Most query work happens in `src/engine.cu` (binding,
+See the "Layout" section of [docs/architecture.md](docs/architecture.md). Most query work happens in `src/engine.cu` (binding,
 planning, GPU execution), storage in `src/storage.*`, SQL parsing in `src/sql.cpp`, the MySQL
 protocol in `src/server.cpp`.
 
