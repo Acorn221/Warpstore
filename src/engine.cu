@@ -4130,6 +4130,7 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
     size_t sep = sql.find('\x1f');
     if (sep != std::string::npos) {  // "<db>\x1f<statement>"
       currentDb() = sql.substr(0, sep);
+      if (currentDb() == "gpudb") currentDb() = "warpstore";  // (WALs from before the rename)
       sql = sql.substr(sep + 1);
     }
     try {
@@ -12026,7 +12027,10 @@ void Engine::connectionClosed() {
 void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, const std::string& toDb, bool withUsers) {
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return;
-  auto mapDb = [&](const std::string& d) { return !fromDb.empty() && lower(d) == lower(fromDb) ? lower(toDb) : d; };
+  auto mapDb = [&](const std::string& d) {
+    if (fromDb.empty() && lower(d) == "gpudb") return std::string("warpstore");  // (data dirs from before the rename)
+    return !fromDb.empty() && lower(d) == lower(fromDb) ? lower(toDb) : d;
+  };
   auto t0 = Clock::now();
   const std::string savedDb = currentDb();
   char magic[8];
