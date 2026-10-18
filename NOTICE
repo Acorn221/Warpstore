@@ -1,0 +1,28 @@
+gpu-db
+Copyright (C) 2026 James Arnott and contributors
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU
+Affero General Public License as published by the Free Software Foundation, version 3 (see LICENSE).
+If you run a modified version as a network service, the AGPL requires you to offer its source to
+the service's users.
+
+Additional permission under GNU AGPL version 3 section 7:
+If you modify this program, or any covered work, by linking or combining it with the NVIDIA CUDA
+Toolkit libraries (CUDA runtime, driver API, NVRTC, cuBLAS) or NVIDIA cuVS / RAPIDS libraries (or
+modified versions of those libraries), containing parts covered by the terms of their respective
+licenses, the licensors of this program grant you additional permission to convey the resulting
+work. Corresponding Source for a non-source form of such a combination shall not include the source
+code for the parts of those libraries used as well as that of the covered work.
+
+Third-party components
+----------------------
+Included in this repository:
+  third_party/dlpack/dlpack.h   DLPack, Apache License 2.0, https://github.com/dmlc/dlpack
+
+Linked at build time (not included; installed from your system):
+  OpenSSL (Apache-2.0), libcurl (curl license), zstd (BSD), lz4 (BSD), snappy (BSD), zlib (zlib),
+  RE2 (BSD), PCRE2 (BSD, optional), NVIDIA CUDA Toolkit (NVIDIA license; see the exception above)
+
+Downloaded separately, only if you choose to (not included):
+  NVIDIA cuVS (Apache-2.0), scripts/install-cuvs.sh
+  sentence-transformers/all-MiniLM-L6-v2 model (Apache-2.0), scripts/fetch-embed-model.sh

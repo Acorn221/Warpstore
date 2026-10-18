@@ -6,10 +6,12 @@ column segments kept in GPU memory. Built in: vector search (GPU graph index), e
 full-text search, S3 / Kafka / MySQL change-data-capture ingest, replication with failover, backups
 with point-in-time restore, MVCC.
 
-> **Status: alpha.** It passes TPC-H, ClickBench, a differential fuzzer and ORM suites (see
-> [Tests](#tests)), but it is young software: NVIDIA GPUs only, one main developer, no production
-> deployments yet. Keep your data in a system of record (for instance as a live copy of MySQL, see
-> [MySQL change data capture](#mysql-change-data-capture-gpu-db-as-a-live-copy-of-mysql)).
+> **Status: experimental alpha.** gpu-db was developed as an experiment: how far can a GPU-first,
+> MySQL-compatible database get, and how fast? It was built quickly, with heavy use of an AI coding
+> assistant. It passes TPC-H, ClickBench, a differential fuzzer and ORM suites (see [Tests](#tests)),
+> but it is young: NVIDIA GPUs only, one main developer, no production deployments. Don't make it
+> the only home of data you care about; keep a system of record (for instance with gpu-db as a live
+> copy of MySQL, see [MySQL change data capture](#mysql-change-data-capture-gpu-db-as-a-live-copy-of-mysql)).
 
 ## Quick start
 
@@ -513,3 +515,9 @@ tests/             run.py (the suite), lib.py, fuzz.py, ORM projects in tests/or
 bench/             TPC-H, ClickBench, use-case and HTAP benchmarks (DuckDB / SingleStore comparisons)
 scripts/           install-deps.sh, test-containers.sh, install-cuvs.sh, fetch-embed-model.sh
 ```
+
+## License
+
+GNU Affero General Public License v3.0 (see [LICENSE](LICENSE)), with an additional permission for
+linking the NVIDIA CUDA and cuVS libraries (see [NOTICE](NOTICE), which also lists third-party
+components). Running a modified gpu-db as a network service means offering its source to its users.
