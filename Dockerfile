@@ -1,8 +1,8 @@
-# gpu-db in a container. Build:   docker build -t gpudb .
+# warpstore in a container. Build:   docker build -t warpstore .
 # Run (needs the NVIDIA Container Toolkit on the host):
-#   docker run --gpus all -p 3307:3307 -v gpudb-data:/data gpudb
+#   docker run --gpus all -p 3307:3307 -v warpstore-data:/data warpstore
 #   mysql -h 127.0.0.1 -P 3307 -u root
-# Options go after the image name, e.g. ... gpudb --root-password secret --bind 0.0.0.0
+# Options go after the image name, e.g. ... warpstore --root-password secret --bind 0.0.0.0
 ARG CUDA_VERSION=12.6.3
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -27,10 +27,10 @@ FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
       libssl3t64 libcurl4t64 libzstd1 liblz4-1 libsnappy1v5 zlib1g libre2-10 libpcre2-8-0 ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
-COPY --from=build /src/build/gpudb /usr/local/bin/gpudb
-COPY scripts/fetch-embed-model.sh /usr/local/bin/gpudb-fetch-embed-model
+COPY --from=build /src/build/warpstore /usr/local/bin/warpstore
+COPY scripts/fetch-embed-model.sh /usr/local/bin/warpstore-fetch-embed-model
 VOLUME /data
 EXPOSE 3307 9000
 # Listens on all interfaces inside the container: set a root password (or pass
 # --insecure-no-root-password for local experiments; the server refuses otherwise).
-ENTRYPOINT ["gpudb", "--data-dir", "/data", "--port", "3307", "--http-port", "9000", "--bind", "0.0.0.0"]
+ENTRYPOINT ["warpstore", "--data-dir", "/data", "--port", "3307", "--http-port", "9000", "--bind", "0.0.0.0"]

@@ -264,30 +264,30 @@ std::string prometheus() {
     std::lock_guard<std::mutex> g(s->mu);
     running += s->command != "Sleep";
   }
-  o += "# HELP gpudb_connections Open client connections.\n# TYPE gpudb_connections gauge\n";
-  line("gpudb_connections %zu\n", active);
-  o += "# HELP gpudb_running_statements Statements executing now.\n# TYPE gpudb_running_statements gauge\n";
-  line("gpudb_running_statements %zu\n", running);
-  o += "# HELP gpudb_connections_total Connections accepted since start.\n# TYPE gpudb_connections_total counter\n";
-  line("gpudb_connections_total %llu\n", (unsigned long long)connTotal.load());
-  o += "# HELP gpudb_statements_total Statements executed, by kind.\n# TYPE gpudb_statements_total counter\n";
-  for (int k = 0; k < 8; ++k) line("gpudb_statements_total{kind=\"%s\"} %llu\n", kKinds[k], (unsigned long long)stmtByKind[k].load());
-  o += "# HELP gpudb_statement_errors_total Statements that failed.\n# TYPE gpudb_statement_errors_total counter\n";
-  line("gpudb_statement_errors_total %llu\n", (unsigned long long)stmtErrors.load());
-  o += "# HELP gpudb_statement_duration_seconds Statement latency.\n# TYPE gpudb_statement_duration_seconds histogram\n";
+  o += "# HELP warpstore_connections Open client connections.\n# TYPE warpstore_connections gauge\n";
+  line("warpstore_connections %zu\n", active);
+  o += "# HELP warpstore_running_statements Statements executing now.\n# TYPE warpstore_running_statements gauge\n";
+  line("warpstore_running_statements %zu\n", running);
+  o += "# HELP warpstore_connections_total Connections accepted since start.\n# TYPE warpstore_connections_total counter\n";
+  line("warpstore_connections_total %llu\n", (unsigned long long)connTotal.load());
+  o += "# HELP warpstore_statements_total Statements executed, by kind.\n# TYPE warpstore_statements_total counter\n";
+  for (int k = 0; k < 8; ++k) line("warpstore_statements_total{kind=\"%s\"} %llu\n", kKinds[k], (unsigned long long)stmtByKind[k].load());
+  o += "# HELP warpstore_statement_errors_total Statements that failed.\n# TYPE warpstore_statement_errors_total counter\n";
+  line("warpstore_statement_errors_total %llu\n", (unsigned long long)stmtErrors.load());
+  o += "# HELP warpstore_statement_duration_seconds Statement latency.\n# TYPE warpstore_statement_duration_seconds histogram\n";
   uint64_t cum = 0;
   for (int i = 0; i < kNB; ++i) {
     cum += hist[i].load();
-    line("gpudb_statement_duration_seconds_bucket{le=\"%g\"} %llu\n", kBuckets[i] / 1000.0, (unsigned long long)cum);
+    line("warpstore_statement_duration_seconds_bucket{le=\"%g\"} %llu\n", kBuckets[i] / 1000.0, (unsigned long long)cum);
   }
   cum += hist[kNB].load();
-  line("gpudb_statement_duration_seconds_bucket{le=\"+Inf\"} %llu\n", (unsigned long long)cum);
-  line("gpudb_statement_duration_seconds_sum %.6f\n", histSumUs.load() / 1e6);
-  line("gpudb_statement_duration_seconds_count %llu\n", (unsigned long long)cum);
-  o += "# HELP gpudb_rows_total Rows returned or affected.\n# TYPE gpudb_rows_total counter\n";
-  line("gpudb_rows_total %llu\n", (unsigned long long)rowsTotal.load());
-  o += "# HELP gpudb_slow_queries_total Statements over the slow query threshold.\n# TYPE gpudb_slow_queries_total counter\n";
-  line("gpudb_slow_queries_total %llu\n", (unsigned long long)slowCount.load());
+  line("warpstore_statement_duration_seconds_bucket{le=\"+Inf\"} %llu\n", (unsigned long long)cum);
+  line("warpstore_statement_duration_seconds_sum %.6f\n", histSumUs.load() / 1e6);
+  line("warpstore_statement_duration_seconds_count %llu\n", (unsigned long long)cum);
+  o += "# HELP warpstore_rows_total Rows returned or affected.\n# TYPE warpstore_rows_total counter\n";
+  line("warpstore_rows_total %llu\n", (unsigned long long)rowsTotal.load());
+  o += "# HELP warpstore_slow_queries_total Statements over the slow query threshold.\n# TYPE warpstore_slow_queries_total counter\n";
+  line("warpstore_slow_queries_total %llu\n", (unsigned long long)slowCount.load());
   return o;
 }
 

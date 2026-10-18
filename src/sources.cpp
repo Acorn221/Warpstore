@@ -529,7 +529,7 @@ void s3PutFile(const std::string& bucket, const std::string& key, const std::str
   fseeko(f.get(), 0, SEEK_END);
   const int64_t size = ftello(f.get());
   fseeko(f.get(), 0, SEEK_SET);
-  static const int64_t kPart = getenv("GPUDB_S3_PART_BYTES") ? std::atoll(getenv("GPUDB_S3_PART_BYTES")) : 64ll << 20;  // (override: tests)
+  static const int64_t kPart = envSetting("S3_PART_BYTES") ? std::atoll(envSetting("S3_PART_BYTES")) : 64ll << 20;  // (override: tests)
   if (size <= kPart) {
     s3Call(c, "PUT", url, f.get(), size, nullptr, nullptr, nullptr, nullptr);
     return;
@@ -626,7 +626,7 @@ class Conn {
     h.i16(api);
     h.i16(ver);
     h.i32(++corr_);
-    h.str("gpudb");
+    h.str("warpstore");
     std::string msg = h.b + body;
     Buf sz;
     sz.i32((int32_t)msg.size());

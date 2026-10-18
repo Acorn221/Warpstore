@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build dependencies for gpu-db on Debian / Ubuntu (22.04+). The CUDA toolkit (12.x: nvcc, NVRTC,
+# Build dependencies for warpstore on Debian / Ubuntu (22.04+). The CUDA toolkit (12.x: nvcc, NVRTC,
 # cuBLAS) is not installed here: get it from NVIDIA (https://developer.nvidia.com/cuda-downloads) or
 # use the Docker build (see the README). Run as root or with sudo.
 set -e

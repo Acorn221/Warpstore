@@ -1,5 +1,5 @@
 // MySQL client/server protocol (v10 handshake, text protocol) so any MySQL client, driver or
-// BI tool can talk to gpu-db, the same way SingleStore is MySQL wire compatible.
+// BI tool can talk to warpstore, the same way SingleStore is MySQL wire compatible.
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -143,7 +143,7 @@ struct Conn {
     std::string p;
     {
       putLenStr(p, "def");
-      putLenStr(p, "gpudb");
+      putLenStr(p, "warpstore");
       putLenStr(p, "");
       putLenStr(p, "");
       putLenStr(p, r.names[i]);
@@ -674,7 +674,7 @@ void serveHttp(int fd, Engine* engine) {
     const char* msg = code == 200 ? "OK" : code == 404 ? "Not Found" : code == 400 ? "Bad Request" : code == 401 ? "Unauthorized"
                     : code == 410 ? "Gone" : "Internal Server Error";
     std::string r = "HTTP/1.1 " + std::to_string(code) + " " + msg + "\r\nContent-Type: " + ctype +
-                    (code == 401 ? "\r\nWWW-Authenticate: Basic realm=\"gpudb\"" : "") +
+                    (code == 401 ? "\r\nWWW-Authenticate: Basic realm=\"warpstore\"" : "") +
                     "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nConnection: keep-alive\r\n\r\n" + body;
     size_t o = 0;
     while (o < r.size()) {
@@ -777,7 +777,7 @@ void serveHttp(int fd, Engine* engine) {
       try {
         const std::string dir = g_dataDir.empty() ? std::string("/tmp") : g_dataDir + "/local-loads";
         if (!g_dataDir.empty()) mkdir(dir.c_str(), 0755);
-        std::string tmplS = dir + "/gpudb-leafload-XXXXXX";
+        std::string tmplS = dir + "/warpstore-leafload-XXXXXX";
         std::vector<char> tmpl(tmplS.begin(), tmplS.end());
         tmpl.push_back('\0');
         int tfd = mkstemp(tmpl.data());
@@ -944,7 +944,7 @@ static bool tlsInit(std::string cert, std::string key, const std::string& dataDi
     X509_gmtime_adj(X509_getm_notAfter(x), 10L * 365 * 24 * 3600);
     X509_set_pubkey(x, pk);
     X509_NAME* nm = X509_get_subject_name(x);
-    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (const unsigned char*)"gpudb_auto_generated_cert", -1, -1, 0);
+    X509_NAME_add_entry_by_txt(nm, "CN", MBSTRING_ASC, (const unsigned char*)"warpstore_auto_generated_cert", -1, -1, 0);
     X509_set_issuer_name(x, nm);
     X509_sign(x, pk, EVP_sha256());
     FILE* kf = fopen(key.c_str(), "wb");
@@ -953,7 +953,7 @@ static bool tlsInit(std::string cert, std::string key, const std::string& dataDi
     if (cf) { PEM_write_X509(cf, x); fclose(cf); }
     X509_free(x);
     EVP_PKEY_free(pk);
-    fprintf(stderr, "[gpu-db] generated a self-signed TLS certificate: %s\n", cert.c_str());
+    fprintf(stderr, "[warpstore] generated a self-signed TLS certificate: %s\n", cert.c_str());
   }
   if (cert.empty() || SSL_CTX_use_certificate_chain_file(ctx, cert.c_str()) != 1 ||
       SSL_CTX_use_PrivateKey_file(ctx, key.c_str(), SSL_FILETYPE_PEM) != 1) {
@@ -988,7 +988,7 @@ void serve(int fd, Engine* engine) {
   // ---- Handshake v10 (mysql_native_password advertised; caching_sha2_password via auth switch).
   std::string h;
   h += (char)0x0a;
-  h += "8.0.32-gpudb";
+  h += "8.0.32-warpstore";
   h += '\0';
   const uint32_t connId = g_connId++;
   putInt(h, connId, 4);
@@ -1302,7 +1302,7 @@ void serve(int fd, Engine* engine) {
           c.flush();
           std::string dir = g_dataDir.empty() ? "/tmp" : g_dataDir + "/local-loads";
           if (!g_dataDir.empty()) mkdir(dir.c_str(), 0755);
-          std::string tmplS = dir + "/gpudb-local-XXXXXX";
+          std::string tmplS = dir + "/warpstore-local-XXXXXX";
           std::vector<char> tmpl(tmplS.begin(), tmplS.end());
           tmpl.push_back('\0');
           int tfd = mkstemp(tmpl.data());
@@ -1368,7 +1368,7 @@ void serve(int fd, Engine* engine) {
     c.more = 0;
     if (g_verbose) {
       double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-      static const int maxLen = getenv("GPUDB_LOG_FULL") ? 1 << 20 : 200;
+      static const int maxLen = envSetting("LOG_FULL") ? 1 << 20 : 200;
       fprintf(stderr, "[%7.2f ms] %.*s\n", ms, maxLen, sql.c_str());
     }
     if (!c.flush()) break;
@@ -1384,7 +1384,7 @@ using gdb::g_redundancy;
 
 int main(int argc, char** argv) {
   int port = 3307;
-  std::string dataDir = "./gpudb-data";
+  std::string dataDir = "./warpstore-data";
   bool sync = false;  // async durability by default (SingleStore's default); --sync-durability: every commit waits for the disk
   int partitions = 8;
   double slowMsArg = 1000;
@@ -1451,24 +1451,24 @@ int main(int argc, char** argv) {
     fprintf(stderr, "GPU init failed: %s\n", e.what());
     return 1;
   }
-  fprintf(stderr, "[gpu-db] GPU: %s\n", gpuDescribe().c_str());
+  fprintf(stderr, "[warpstore] GPU: %s\n", gpuDescribe().c_str());
   if (!dataDir.empty()) mkdir(dataDir.c_str(), 0755);
   g_dataDir = dataDir;
-  // Compiled plans persist next to the data, or in ~/.cache/gpudb/plancache without a data dir.
+  // Compiled plans persist next to the data, or in ~/.cache/warpstore/plancache without a data dir.
   if (!planCacheDirSet) {
     const char* home = getenv("HOME");
-    planCacheDir = !dataDir.empty() ? dataDir + "/plancache" : home ? std::string(home) + "/.cache/gpudb/plancache" : "";
+    planCacheDir = !dataDir.empty() ? dataDir + "/plancache" : home ? std::string(home) + "/.cache/warpstore/plancache" : "";
   }
   jitSetCacheDir(planCacheDir);
-  if (!planCacheDir.empty()) fprintf(stderr, "[gpu-db] persistent plan cache: %s\n", planCacheDir.c_str());
+  if (!planCacheDir.empty()) fprintf(stderr, "[warpstore] persistent plan cache: %s\n", planCacheDir.c_str());
   // Slow query log: <data dir>/slow.log, statements over 1 s (--slow-query-ms, SET GLOBAL long_query_time).
   if (monitor::slowPath.empty() && !dataDir.empty()) monitor::slowPath = dataDir + "/slow.log";
   monitor::slowMs = monitor::slowPath.empty() ? -1 : slowMsArg;
   Engine engine(dataDir, sync, partitions);
-  fprintf(stderr, "[gpu-db] %d partitions per sharded table\n", partitions);
+  fprintf(stderr, "[warpstore] %d partitions per sharded table\n", partitions);
   engine.recover();
   if (rootPw.empty())
-    if (const char* e = getenv("GPUDB_ROOT_PASSWORD")) rootPw = e;
+    if (const char* e = envSetting("ROOT_PASSWORD")) rootPw = e;
   if (!rootPw.empty()) {
     std::string q;
     for (char ch : rootPw) q += ch == '\'' ? std::string("''") : ch == '\\' ? std::string("\\\\") : std::string(1, ch);
@@ -1477,27 +1477,27 @@ int main(int argc, char** argv) {
   const bool loopbackOnly = isLoopback(bindAddr);
   if (engine.checkPassword("root", "")) {
     if (!loopbackOnly && !insecure) {
-      fprintf(stderr, "[gpu-db] refusing to listen on %s: root has no password. Set one with --root-password / GPUDB_ROOT_PASSWORD "
+      fprintf(stderr, "[warpstore] refusing to listen on %s: root has no password. Set one with --root-password / WARPSTORE_ROOT_PASSWORD "
                       "(or pass --insecure-no-root-password)\n", bindAddr.c_str());
       return 1;
     }
-    fprintf(stderr, "[gpu-db] warning: root has no password%s\n", loopbackOnly ? " (listening on loopback only)" : "");
+    fprintf(stderr, "[warpstore] warning: root has no password%s\n", loopbackOnly ? " (listening on loopback only)" : "");
   }
   if (!noTls) {
-    if (tlsInit(tlsCert, tlsKey, dataDir)) fprintf(stderr, "[gpu-db] TLS enabled%s\n", g_requireTls ? " (required for remote clients)" : "");
-    else if (!tlsCert.empty()) { fprintf(stderr, "[gpu-db] cannot load TLS certificate %s / key %s\n", tlsCert.c_str(), tlsKey.c_str()); return 1; }
+    if (tlsInit(tlsCert, tlsKey, dataDir)) fprintf(stderr, "[warpstore] TLS enabled%s\n", g_requireTls ? " (required for remote clients)" : "");
+    else if (!tlsCert.empty()) { fprintf(stderr, "[warpstore] cannot load TLS certificate %s / key %s\n", tlsCert.c_str(), tlsKey.c_str()); return 1; }
   }
   in_addr bindIn{};
   if (inet_pton(AF_INET, bindAddr == "localhost" ? "127.0.0.1" : bindAddr.c_str(), &bindIn) != 1) {
-    fprintf(stderr, "[gpu-db] --bind: not an IPv4 address: %s\n", bindAddr.c_str());
+    fprintf(stderr, "[warpstore] --bind: not an IPv4 address: %s\n", bindAddr.c_str());
     return 1;
   }
   if (!leaves.empty()) {
     engine.setLeaves(leaves);
-    fprintf(stderr, "[gpu-db] cluster aggregator over %zu leaves\n", leaves.size());
+    fprintf(stderr, "[warpstore] cluster aggregator over %zu leaves\n", leaves.size());
   }
   if (!replicaOf.empty()) {
-    fprintf(stderr, "[gpu-db] read-only replica of %s\n", replicaOf.c_str());
+    fprintf(stderr, "[warpstore] read-only replica of %s\n", replicaOf.c_str());
     engine.startReplica(replicaOf);
   }
 
@@ -1512,7 +1512,7 @@ int main(int argc, char** argv) {
     perror("bind/listen");
     return 1;
   }
-  fprintf(stderr, "[gpu-db] listening on %s:%d (MySQL protocol)%s\n", bindAddr.c_str(), port,
+  fprintf(stderr, "[warpstore] listening on %s:%d (MySQL protocol)%s\n", bindAddr.c_str(), port,
           dataDir.empty() ? ", WAL disabled" : (", WAL in " + dataDir).c_str());
   if (httpPort > 0) {  // HTTP Data API
     int hs = socket(AF_INET, SOCK_STREAM, 0);
@@ -1525,7 +1525,7 @@ int main(int argc, char** argv) {
       perror("http bind/listen");
       return 1;
     }
-    fprintf(stderr, "[gpu-db] HTTP Data API on port %d (POST /api/v2/query/rows, /api/v2/query/tuples, /api/v2/exec)\n", httpPort);
+    fprintf(stderr, "[warpstore] HTTP Data API on port %d (POST /api/v2/query/rows, /api/v2/query/tuples, /api/v2/exec)\n", httpPort);
     std::thread([hs, &engine] {
       for (;;) {
         int fd = accept(hs, nullptr, nullptr);
@@ -1543,11 +1543,11 @@ int main(int argc, char** argv) {
     da.sin_port = htons((uint16_t)gDataPort);
     da.sin_addr = bindIn;
     if (bind(ds, (sockaddr*)&da, sizeof da) < 0 || listen(ds, 128) < 0) {
-      fprintf(stderr, "[gpu-db] data plane: cannot listen on port %d (cluster traffic uses HTTP)\n", gDataPort);
+      fprintf(stderr, "[warpstore] data plane: cannot listen on port %d (cluster traffic uses HTTP)\n", gDataPort);
       close(ds);
       gDataPort = 0;
     } else {
-      fprintf(stderr, "[gpu-db] cluster data plane on port %d\n", gDataPort);
+      fprintf(stderr, "[warpstore] cluster data plane on port %d\n", gDataPort);
       std::thread([ds, &engine] {
         for (;;) {
           int fd = accept(ds, nullptr, nullptr);

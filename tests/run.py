@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""gpu-db test suite.
+"""warpstore test suite.
 
   .venv/bin/python tests/run.py                 # everything that can run here
   .venv/bin/python tests/run.py smoke tpch     # by name (substring match)
   .venv/bin/python tests/run.py --list
 
-Tests that need a shared server get GPUDB_PORT (one server, --no-wal, started here). Tests marked
+Tests that need a shared server get WARPSTORE_PORT (one server, --no-wal, started here). Tests marked
 "own" start their own servers through tests/lib.py (crash, backup, replication, ...). A test is
 skipped when what it needs is missing (node, Docker containers, cuVS, the embedding model).
 """
@@ -44,7 +44,7 @@ def drizzle(port):
     c = lib.Server(data_dir=None, http=False)
     c.port = port
     c.cursor().execute("CREATE DATABASE IF NOT EXISTS app")
-    env = dict(os.environ, GPUDB_PORT=str(port))
+    env = dict(os.environ, WARPSTORE_PORT=str(port))
     r = subprocess.run(["npx", "drizzle-kit", "push", "--force"], cwd=d, env=env, capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stdout[-2000:], r.stderr[-2000:])
@@ -100,9 +100,9 @@ TESTS = [
     ("crash", "crash.py", None, True),
     ("backup", "backup.py", None, True),
     ("replication", "replication.py", None, True),
-    ("ingest-s3", "ingest_s3.py", lambda: docker_up("gpudb-s3"), True),
-    ("ingest-kafka", "ingest_kafka.py", lambda: docker_up("gpudb-redpanda"), True),
-    ("binlog", "binlog.py", lambda: docker_up("gpudb-mysql"), True),
+    ("ingest-s3", "ingest_s3.py", lambda: docker_up("warpstore-s3"), True),
+    ("ingest-kafka", "ingest_kafka.py", lambda: docker_up("warpstore-redpanda"), True),
+    ("binlog", "binlog.py", lambda: docker_up("warpstore-mysql"), True),
 ]
 
 
@@ -126,9 +126,9 @@ def main():
                 shared = lib.Server(data_dir=None, http=False, name="shared").start()
             print(f"=== {name}", flush=True)
             t0 = time.time()
-            env = dict(os.environ, GPUDB_TEST_TMP=lib.TMP)
+            env = dict(os.environ, WARPSTORE_TEST_TMP=lib.TMP)
             if not own:
-                env["GPUDB_PORT"] = str(shared.port)
+                env["WARPSTORE_PORT"] = str(shared.port)
             if callable(how):
                 rc = how(shared.port)
             else:

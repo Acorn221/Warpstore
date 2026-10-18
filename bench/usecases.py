@@ -1,10 +1,10 @@
-"""SingleStore's main use cases as small workloads, run the same way against gpu-db or SingleStore.
+"""SingleStore's main use cases as small workloads, run the same way against warpstore or SingleStore.
 
 Use cases: real-time dashboards (latency + concurrency), operational point reads / updates,
 streaming ingest, HTAP (dashboards while writes run), vector search (exact, filtered, ANN), full-text
 search, JSON analytics.
 
-usage: .venv/bin/python bench/usecases.py --port 3307 --name gpudb [--load]
+usage: .venv/bin/python bench/usecases.py --port 3307 --name warpstore [--load]
        .venv/bin/python bench/usecases.py --port 3316 --password bench --name s2 --docker s2bench [--load]
 Prints one JSON line per measurement.
 """
@@ -197,7 +197,7 @@ def vector_tests(vecs):
         ts.sort()
         out(test=test, p50_ms=round(ts[len(ts) // 2] * 1000, 2), recall=round(sum(rec) / len(rec), 3) if rec else None)
 
-    if not A.docker: c.execute("SET gpudb_vector_index = OFF")
+    if not A.docker: c.execute("SET warpstore_vector_index = OFF")
     try:
         bench("vector_exact_top10", lambda v: f"SELECT id FROM docs ORDER BY v <*> {cast(v)} DESC LIMIT 10")
         bench("vector_filtered_top10", lambda v: f"SELECT id FROM docs WHERE cat = 3 ORDER BY v <*> {cast(v)} DESC LIMIT 10", False)
@@ -208,7 +208,7 @@ def vector_tests(vecs):
         t = time.perf_counter()
         c.execute("ALTER TABLE docs ADD VECTOR INDEX vi (v) INDEX_OPTIONS '{\"index_type\":\"IVF_FLAT\",\"metric_type\":\"DOT_PRODUCT\",\"nlist\":316}'")
         if not A.docker:
-            c.execute("SET gpudb_vector_index = ON"); c.execute("OPTIMIZE TABLE docs")
+            c.execute("SET warpstore_vector_index = ON"); c.execute("OPTIMIZE TABLE docs")
         out(test="vector_index_build", s=round(time.perf_counter() - t, 2))
         bench("vector_ann_top10", lambda v: f"SELECT id FROM docs ORDER BY v <*> {cast(v)} DESC LIMIT 10")
     except Exception as e:
@@ -243,7 +243,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=3307)
     ap.add_argument("--password", default="")
-    ap.add_argument("--name", default="gpudb")
+    ap.add_argument("--name", default="warpstore")
     ap.add_argument("--docker", default="")
     ap.add_argument("--load", action="store_true")
     ap.add_argument("--only", default="")

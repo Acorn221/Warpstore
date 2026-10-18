@@ -51,7 +51,7 @@ def close(a, b):
 
 def same(sql):
     a, b = norm(gq(sql)), norm(d.execute(sql).fetchall())
-    check("same result: " + sql, close(a, b), f"gpu-db {a[:4]} vs duckdb {b[:4]}")
+    check("same result: " + sql, close(a, b), f"warpstore {a[:4]} vs duckdb {b[:4]}")
 
 
 def both(sql, duck_sql=None):
@@ -154,17 +154,17 @@ e = explain(q4)
 check("orders->items stays co-located after joining a reference table", "co-located" in e, e)
 
 # ---- the same joins with join filters forced on every table (normally only tables >= 2M rows)
-g.execute("SET gpudb_join_filter_rows = 0")
+g.execute("SET warpstore_join_filter_rows = 0")
 qsel = q.replace("o_total > 250", "o_total > 400")  # keeps ~20% of orders: selective enough to filter items
 e = explain(qsel)
 check("join filters are applied when enabled", "join filter" in e, e)
 for jq in (qsel, q, q2, q3, q4, q5, nq):
     same(jq)
-g.execute("SET gpudb_join_filters = OFF")
+g.execute("SET warpstore_join_filters = OFF")
 for jq in (q, q4):
     same(jq)
-g.execute("SET gpudb_join_filters = ON")
-g.execute("SET gpudb_join_filter_rows = 2000000")
+g.execute("SET warpstore_join_filters = ON")
+g.execute("SET warpstore_join_filter_rows = 2000000")
 
 # ---- DML across partitions: UPDATE of the shard key moves the row to its new partition
 both("UPDATE items_s SET i_order = 424242 WHERE i_order = 100 AND i_line = 0")

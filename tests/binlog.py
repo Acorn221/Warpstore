@@ -1,13 +1,13 @@
-# MySQL CDC against the local MySQL 8.4 container (gpudb-mysql, 127.0.0.1:13306, user cdc / cdcpw):
+# MySQL CDC against the local MySQL 8.4 container (warpstore-mysql, 127.0.0.1:13306, user cdc / cdcpw):
 # snapshot + binlog following of many column types, inserts / updates (also of the primary key) /
 # deletes / multi-table and rolled back transactions, DDL, a table without a primary key, a crash of
-# gpu-db while the source keeps changing, and a one-off LOAD DATA MYSQL copy.
+# warpstore while the source keeps changing, and a one-off LOAD DATA MYSQL copy.
 import datetime, decimal, json, os, random, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pymysql
 from lib import Checker, Server
 
-SRC = dict(host="127.0.0.1", port=13306, user="root", password="gpudbroot", autocommit=True, ssl={"check_hostname": False})
+SRC = dict(host="127.0.0.1", port=13306, user="root", password="warpstoreroot", autocommit=True, ssl={"check_hostname": False})
 DB = f"shop{os.getpid()}"
 URL = f"mysql://cdc:cdcpw@127.0.0.1:13306/{DB}"
 c = Checker()
@@ -117,7 +117,7 @@ a, b = same("newt", "k", "shop_copy")
 c.eq("CREATE TABLE on the source", b, a)
 check_all("after ALTER TABLE")
 
-# gpu-db crashes while the source keeps changing; it resumes from its saved position exactly once
+# warpstore crashes while the source keeps changing; it resumes from its saved position exactly once
 srv.kill()
 insert_orders(100)
 my.executemany("INSERT INTO nopk VALUES (%s,%s)", [(k, "aftercrash") for k in range(50)])

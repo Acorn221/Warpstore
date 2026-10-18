@@ -2,7 +2,7 @@
 #   * writers don't wait for a slow reader (and its result is the state when it started),
 #   * a reader sees each statement's state consistently while transfers run (sum invariant),
 #   * flushes (OPTIMIZE), DROP TABLE and string dictionary growth under a running reader are safe.
-# A slow reader is simulated with SET gpudb_debug_scan_delay_ms (it sleeps before each table scan).
+# A slow reader is simulated with SET warpstore_debug_scan_delay_ms (it sleeps before each table scan).
 import os, random, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pymysql
@@ -22,7 +22,7 @@ TOTAL = 2000 * 1000
 
 def slow(sql, delay, out, key):
     r = srv.cursor("m")
-    r.execute(f"SET gpudb_debug_scan_delay_ms = {delay}")
+    r.execute(f"SET warpstore_debug_scan_delay_ms = {delay}")
     t = time.time()
     r.execute(sql)
     out[key] = (r.fetchall(), time.time() - t)
@@ -75,7 +75,7 @@ def transfers():
 def reader(delay, sums):
     r = srv.cursor("m")
     if delay:
-        r.execute(f"SET gpudb_debug_scan_delay_ms = {delay}")
+        r.execute(f"SET warpstore_debug_scan_delay_ms = {delay}")
     while not stop.is_set():
         r.execute("SELECT SUM(v), COUNT(*) FROM acct")
         sums.append(tuple(r.fetchone()))

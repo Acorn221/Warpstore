@@ -1,4 +1,4 @@
-# Kafka ingest against the local Redpanda container (gpudb-redpanda, 127.0.0.1:19092): LOAD DATA
+# Kafka ingest against the local Redpanda container (warpstore-redpanda, 127.0.0.1:19092): LOAD DATA
 # KAFKA (JSON and delimited messages, several partitions) and a pipeline that keeps consuming, with
 # exactly-once offsets across a crash.
 import json, os, subprocess, sys, time
@@ -10,7 +10,7 @@ RUN = str(os.getpid())
 
 
 def rpk(*args, stdin=None):
-    r = subprocess.run(["docker", "exec", "-i", "gpudb-redpanda", "rpk", *args], input=stdin, capture_output=True, text=True)
+    r = subprocess.run(["docker", "exec", "-i", "warpstore-redpanda", "rpk", *args], input=stdin, capture_output=True, text=True)
     assert r.returncode == 0, r.stderr
     return r.stdout
 

@@ -1,4 +1,4 @@
-"""For ClickBench queries whose gpu-db result differs from DuckDB's: check that every gpu-db row is a
+"""For ClickBench queries whose warpstore result differs from DuckDB's: check that every warpstore row is a
 valid answer row (present in DuckDB's result without LIMIT/OFFSET) and that the ORDER BY value
 sequence is the same, i.e. the difference is only in how ties are broken (or, without ORDER BY,
 which rows LIMIT picks).  usage: python bench/clickbench/verify_ties.py bench/clickbench Q..."""

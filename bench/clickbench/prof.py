@@ -2,7 +2,7 @@ import pymysql, sys, time
 S=sys.argv[1]
 gq=[q.strip() for q in open(f"{S}/queries.sql") if q.strip()]
 c=pymysql.connect(host="127.0.0.1",port=3307,user="root",autocommit=True,read_timeout=300).cursor()
-c.execute("SET collation_connection = utf8mb4_bin"); c.execute("set gpudb_codegen = sync")
+c.execute("SET collation_connection = utf8mb4_bin"); c.execute("set warpstore_codegen = sync")
 for i in map(int, sys.argv[2:]):
     q=gq[i-1]
     c.execute(q); c.fetchall()

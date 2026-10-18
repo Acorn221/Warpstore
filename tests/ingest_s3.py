@@ -1,4 +1,4 @@
-# S3 ingest against the local SeaweedFS container (gpudb-s3, port 18333): LOAD DATA S3 for CSV, gzip
+# S3 ingest against the local SeaweedFS container (warpstore-s3, port 18333): LOAD DATA S3 for CSV, gzip
 # CSV, JSON lines (with column mapping) and Parquet; globs; a pipeline that picks up new objects and
 # loads each exactly once across a restart; errors for bad credentials / missing buckets.
 import gzip, io, json, os, subprocess, sys, time
@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from lib import TMP, Checker, Server
 
 EP = "http://127.0.0.1:18333"
-KEY, SECRET = "gpudbkey", "gpudbsecret"
+KEY, SECRET = "warpstorekey", "warpstoresecret"
 BUCKET = "events"  # (SeaweedFS in the container can't create new buckets: it has no free volumes)
 PFX = f"t{os.getpid()}"
 CFG = f"CONFIG '{{\"region\":\"us-east-1\",\"endpoint_url\":\"{EP}\"}}' CREDENTIALS '{{\"aws_access_key_id\":\"{KEY}\",\"aws_secret_access_key\":\"{SECRET}\"}}'"

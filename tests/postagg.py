@@ -60,7 +60,7 @@ for q in QUERIES:
     ok &= good
     print(("PASS " if good else "FAIL ") + q)
     if not good:
-        print("   gpu-db:", a[:5] if isinstance(a, list) else a)
+        print("   warpstore:", a[:5] if isinstance(a, list) else a)
         print("   duckdb:", b[:5])
 g.execute("DROP TABLE pa")
 sys.exit(0 if ok else 1)

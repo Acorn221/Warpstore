@@ -376,7 +376,7 @@ std::string quoteId(const std::string& s) {
   for (char c : s) o += c == '`' ? std::string("``") : std::string(1, c);
   return o + "`";
 }
-std::string sqlStr(const std::string& s) {  // gpu-db / MySQL string literal (backslash escapes)
+std::string sqlStr(const std::string& s) {  // warpstore / MySQL string literal (backslash escapes)
   std::string o = "'";
   for (char c : s) {
     switch (c) {
@@ -409,7 +409,7 @@ std::vector<std::string> parseEnumLabels(const std::string& columnType) {  // en
   return out;
 }
 
-// gpu-db column type for a MySQL column.
+// warpstore column type for a MySQL column.
 std::string targetType(const SrcCol& c) {
   const std::string& t = c.dataType;
   if (t == "tinyint" || t == "smallint" || t == "mediumint") return "INT";
@@ -468,7 +468,7 @@ std::string createSql(const SrcTable& t, const std::string& target) {
   return s + ")";
 }
 
-// SELECT list for the snapshot: values in the text form gpu-db loads.
+// SELECT list for the snapshot: values in the text form warpstore loads.
 std::string selectList(const SrcTable& t) {
   std::string s;
   for (size_t i = 0; i < t.cols.size(); ++i) {
@@ -866,7 +866,7 @@ class Cdc {
 
   void run(bool follow) {
     e_.execute("CREATE DATABASE IF NOT EXISTS " + quoteId(target_));
-    e_.execute("CREATE TABLE IF NOT EXISTS " + quoteId(target_) + "._gpudb_cdc_position (pipeline VARCHAR(128) PRIMARY KEY, file VARCHAR(255), pos BIGINT, "
+    e_.execute("CREATE TABLE IF NOT EXISTS " + quoteId(target_) + "._warpstore_cdc_position (pipeline VARCHAR(128) PRIMARY KEY, file VARCHAR(255), pos BIGINT, "
                "updated DATETIME)");
     bool first = true;
     while (running_) {
@@ -912,7 +912,7 @@ class Cdc {
   std::string tq(const std::string& t) const { return quoteId(target_) + "." + quoteId(t); }
 
   bool loadPosition(std::string& file, uint32_t& pos) {
-    ResultSet r = e_.execute("SELECT file, pos FROM " + quoteId(target_) + "._gpudb_cdc_position WHERE pipeline = " + sqlStr(pipe_));
+    ResultSet r = e_.execute("SELECT file, pos FROM " + quoteId(target_) + "._warpstore_cdc_position WHERE pipeline = " + sqlStr(pipe_));
     const auto rows = r.rows;
     if (rows.empty() || rows[0][0] == kNullCell) return false;
     file = rows[0][0];
@@ -920,7 +920,7 @@ class Cdc {
     return true;
   }
   std::string positionSql(const std::string& file, uint64_t pos) const {
-    return "REPLACE INTO " + quoteId(target_) + "._gpudb_cdc_position VALUES (" + sqlStr(pipe_) + ", " + sqlStr(file) + ", " + std::to_string(pos) + ", NOW())";
+    return "REPLACE INTO " + quoteId(target_) + "._warpstore_cdc_position VALUES (" + sqlStr(pipe_) + ", " + sqlStr(file) + ", " + std::to_string(pos) + ", NOW())";
   }
 
   // Initial copy: the binlog position first, then a consistent snapshot of every table (changes in
@@ -955,7 +955,7 @@ class Cdc {
   void copyTable(MyConn& c, const SrcTable& t) {
     e_.execute("DROP TABLE IF EXISTS " + tq(t.name));
     e_.execute(createSql(t, target_));
-    const std::string dir = (e_.dataDir().empty() ? std::string("/tmp/gpudb-cdc") : e_.dataDir() + "/pipeline-loads");
+    const std::string dir = (e_.dataDir().empty() ? std::string("/tmp/warpstore-cdc") : e_.dataDir() + "/pipeline-loads");
     mkdir(dir.c_str(), 0755);
     std::string chunk;
     int64_t inChunk = 0, part = 0;
@@ -995,7 +995,7 @@ class Cdc {
     flush();
   }
 
-  // Follows the binlog from file:pos; applies each source transaction as one gpu-db transaction.
+  // Follows the binlog from file:pos; applies each source transaction as one warpstore transaction.
   void stream(std::string file, uint32_t pos) {
     MyConn c = connect();
     auto cs = c.query("SELECT @@global.binlog_checksum");

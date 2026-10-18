@@ -67,7 +67,7 @@ bool diskLoad(const std::string& path, const std::string& key, std::string& imag
   uint64_t sum = 0;
   f.read((char*)&sum, 8);
   if (!f || sum != fnv64(image, 0xcbf29ce484222325ull)) {
-    fprintf(stderr, "[gpu-db] plan cache file %s is corrupt; recompiling\n", path.c_str());
+    fprintf(stderr, "[warpstore] plan cache file %s is corrupt; recompiling\n", path.c_str());
     return false;
   }
   return true;
@@ -366,11 +366,11 @@ PlanBuild planBuild(const JitProgram& p) {
   static const std::string prelude = stripPragmaOnce(kJitDevtypesSrc) + "\n" + stripPragmaOnce(kJitKernelsSrc) + "\n";
   PlanBuild b;
   b.src = prelude + p.source + kKernelMacro[p.fn_kind] + "(JitEv, extern \"C\")\n";
-  // Experiment hooks: GPUDB_NVRTC_PTX=1 emits PTX for the driver to assemble; GPUDB_NVRTC_OPTS adds flags.
-  b.ptx = getenv("GPUDB_NVRTC_PTX") != nullptr;
+  // Experiment hooks: WARPSTORE_NVRTC_PTX=1 emits PTX for the driver to assemble; WARPSTORE_NVRTC_OPTS adds flags.
+  b.ptx = envSetting("NVRTC_PTX") != nullptr;
   b.opts = {std::string("--gpu-architecture=") + (b.ptx ? "compute_" : "sm_") + std::to_string(gpuArch()), "--std=c++17", "--device-int128",
             "-DNDEBUG"};
-  if (const char* extra = getenv("GPUDB_NVRTC_OPTS")) {
+  if (const char* extra = envSetting("NVRTC_OPTS")) {
     std::istringstream is(extra);
     for (std::string o; is >> o;) b.opts.push_back(o);
   }
@@ -409,7 +409,7 @@ bool tryDisk(JitProgram& p) {
   }
   p.fromDisk = true;
   p.compileMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-  if (getenv("GPUDB_TRACE"))
+  if (envSetting("TRACE"))
     fprintf(stderr, "[codegen] plan #%d %s: loaded from disk cache in %.1f ms\n", p.id, kKernelName[p.fn_kind], p.compileMs);
   return true;
 }
@@ -421,12 +421,12 @@ bool compile(JitProgram& p) {
   auto ms = [](C::time_point a) { return std::chrono::duration<double, std::milli>(C::now() - a).count(); };
   PlanBuild b = planBuild(p);
   auto t0 = C::now();
-  if (const char* d = getenv("GPUDB_DUMP")) {
+  if (const char* d = envSetting("DUMP")) {
     FILE* f = fopen((std::string(d) + "/plan" + std::to_string(p.id) + ".cu").c_str(), "w");
     if (f) fwrite(b.src.data(), 1, b.src.size(), f), fclose(f);
   }
   nvrtcProgram prog;
-  if (nvrtcCreateProgram(&prog, b.src.c_str(), "gpudb_query.cu", 0, nullptr, nullptr) != NVRTC_SUCCESS) return false;
+  if (nvrtcCreateProgram(&prog, b.src.c_str(), "warpstore_query.cu", 0, nullptr, nullptr) != NVRTC_SUCCESS) return false;
   std::vector<const char*> opts;
   for (auto& o : b.opts) opts.push_back(o.c_str());
   nvrtcResult rc = nvrtcCompileProgram(prog, (int)opts.size(), opts.data());
@@ -436,7 +436,7 @@ bool compile(JitProgram& p) {
     nvrtcGetProgramLogSize(prog, &n);
     std::string log(n, '\0');
     nvrtcGetProgramLog(prog, log.data());
-    fprintf(stderr, "[gpu-db] codegen failed, using the interpreter:\n%s\n", log.c_str());
+    fprintf(stderr, "[warpstore] codegen failed, using the interpreter:\n%s\n", log.c_str());
     nvrtcDestroyProgram(&prog);
     return false;
   }
@@ -455,7 +455,7 @@ bool compile(JitProgram& p) {
   if (!b.path.empty()) diskStore(b.path, b.key, image);
   auto t1 = C::now();
   loadImage(p, image);
-  if (getenv("GPUDB_TRACE"))
+  if (envSetting("TRACE"))
     fprintf(stderr, "[codegen] plan #%d %s: nvrtc %.1f ms, load %.1f ms, %zu source bytes\n", p.id, kKernelName[p.fn_kind],
             tCompile, ms(t1), b.src.size());
   return true;
@@ -467,7 +467,7 @@ void compileAndPublish(const std::shared_ptr<JitProgram>& p) {
   try {
     ok = compile(*p);
   } catch (const std::exception& e) {
-    fprintf(stderr, "[gpu-db] codegen failed: %s\n", e.what());
+    fprintf(stderr, "[warpstore] codegen failed: %s\n", e.what());
   }
   p->compileMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   p->state.store(ok ? 1 : 2, std::memory_order_release);
@@ -488,7 +488,7 @@ void jitSetCacheDir(const std::string& dir) {
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   gDiskDir = ec ? "" : dir;
-  if (ec) fprintf(stderr, "[gpu-db] plan cache directory %s unusable (%s); compiled plans stay in memory\n", dir.c_str(), ec.message().c_str());
+  if (ec) fprintf(stderr, "[warpstore] plan cache directory %s unusable (%s); compiled plans stay in memory\n", dir.c_str(), ec.message().c_str());
 }
 
 bool progIsInt(const ExprEnv& env, Prog p) {

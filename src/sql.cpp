@@ -669,7 +669,7 @@ struct Parser {
           expectSym(")");
         }
         if (e->op == "DATABASE" || e->op == "SCHEMA") return mkLit(currentDb().empty() ? Value::Null() : Value::S(currentDb()));
-        if (e->op == "VERSION") return mkLit(Value::S("8.0.32-gpudb"));
+        if (e->op == "VERSION") return mkLit(Value::S("8.0.32-warpstore"));
         if (e->op == "USER" || e->op == "SESSION_USER" || e->op == "SYSTEM_USER") return mkLit(Value::S(sessionUser() + "@localhost"));
         if (e->op == "CURRENT_USER") return mkLit(Value::S(sessionUser()));
         if (e->op == "CONNECTION_ID") return mkLit(Value::I(tSession ? tSession->id : 1));

@@ -1,4 +1,4 @@
-"""Load TPC-H into gpu-db (over the MySQL protocol) and DuckDB, check results match, compare latency.
+"""Load TPC-H into warpstore (over the MySQL protocol) and DuckDB, check results match, compare latency.
 
 usage: python bench/bench.py --sf 1 [--port 3307] [--runs 5] [--skip-load]
 """
@@ -73,7 +73,7 @@ def main():
             n = gc.execute(f"LOAD DATA INFILE '{data}/{t}.tbl' INTO TABLE {t} FIELDS TERMINATED BY '|'")
             gc.execute(f"OPTIMIZE TABLE {t}")
             gc.fetchall()
-            print(f"gpu-db loaded {t}: {n:,} rows in {time.perf_counter() - t0:.1f}s")
+            print(f"warpstore loaded {t}: {n:,} rows in {time.perf_counter() - t0:.1f}s")
 
     # On-disk DuckDB with a hard memory cap: an in-memory SF10 database grew past 20 GB of RSS and
     # triggered the OOM killer on a shared machine. The file is built once and reused.
@@ -87,7 +87,7 @@ def main():
         b.execute("SET memory_limit='4GB'")
         b.execute(f"SET temp_directory='{data}/duckdb.tmp'")
         for t, (ddl, cols) in TABLES.items():
-            # Same column types as gpu-db (DOUBLE, not DECIMAL); drop gpu-db-only key clauses.
+            # Same column types as warpstore (DOUBLE, not DECIMAL); drop warpstore-only key clauses.
             coldefs = [c.strip() for c in ddl.split(",") if not c.strip().upper().startswith(("PRIMARY", "SORT", "SHARD", "KEY"))]
             coldefs = [c for c in coldefs if not c.rstrip(")").strip().isidentifier() or " " in c]
             b.execute(f"CREATE TABLE {t} ({', '.join(coldefs)})")
@@ -101,8 +101,8 @@ def main():
 
     # Steady state: compile each query's plan on its first (warm-up) run instead of in the background,
     # as a server that has seen the query before would (compiled plans also persist on disk).
-    gc.execute("SET gpudb_codegen = SYNC")
-    print(f"\n{'query':42} {'gpu-db ms':>10} {'duckdb ms':>10} {'speedup':>8}  result")
+    gc.execute("SET warpstore_codegen = SYNC")
+    print(f"\n{'query':42} {'warpstore ms':>10} {'duckdb ms':>10} {'speedup':>8}  result")
     rows = []
     for name, sql in QUERIES.items():
         def run_g():

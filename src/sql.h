@@ -1,4 +1,4 @@
-// SQL AST + recursive-descent parser for the MySQL-flavoured subset gpu-db understands.
+// SQL AST + recursive-descent parser for the MySQL-flavoured subset warpstore understands.
 #pragma once
 #include <memory>
 #include <string>
@@ -159,7 +159,7 @@ struct Stmt {
   std::string outfile;                  // SELECT .. INTO OUTFILE 'path'
   char outDelim = '\t';
   bool temporary = false;               // CREATE TEMPORARY TABLE
-  // SET name = value (only gpudb_* variables do anything); SHOW PLAN <id>
+  // SET name = value (only warpstore_* variables do anything); SHOW PLAN <id>
   std::string setName, setValue;
   std::string targetAlias;  // multi-table UPDATE / DELETE: the FROM entry that is modified
   int64_t planId = 0;

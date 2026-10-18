@@ -17,20 +17,20 @@ def norm(rows):
 res = {}
 g = pymysql.connect(host="127.0.0.1", port=3307, user="root", autocommit=True, read_timeout=90)
 gc = g.cursor()
-gc.execute("SET collation_connection = utf8mb4_bin"); gc.execute("SET gpudb_codegen = SYNC")
+gc.execute("SET collation_connection = utf8mb4_bin"); gc.execute("SET warpstore_codegen = SYNC")
 d = duckdb.connect("data/clickbench/hits10m.duckdb", read_only=True)
 d.execute("SET threads=12"); d.execute("SET memory_limit='4GB'")
 for i in only:
     q, qd = gq[i-1], dq[i-1]
     r = {"q": i}
     try:
-        t0 = time.perf_counter(); gc.execute(q); grow = gc.fetchall(); r["gpudb_first"] = time.perf_counter() - t0
+        t0 = time.perf_counter(); gc.execute(q); grow = gc.fetchall(); r["warpstore_first"] = time.perf_counter() - t0
         ts = []
         for _ in range(3):
             t = time.perf_counter(); gc.execute(q); gc.fetchall(); ts.append(time.perf_counter() - t)
-        r["gpudb"] = min(ts)
+        r["warpstore"] = min(ts)
     except Exception as e:
-        r["gpudb_err"] = str(e)[:120]; grow = None
+        r["warpstore_err"] = str(e)[:120]; grow = None
         if "Lost connection" in str(e): print(json.dumps(r)); sys.exit(2)
     try:
         drow = d.execute(qd).fetchall()

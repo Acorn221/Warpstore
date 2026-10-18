@@ -10,7 +10,7 @@ namespace gdb {
 
 struct CagraGraph;  // opaque: a built index plus the dataset view it searches
 
-// Loads cuVS once ($GPUDB_CUVS_DIR, else ~/.local/share/gpudb-cuvs). False if unavailable.
+// Loads cuVS once ($WARPSTORE_CUVS_DIR, else ~/.local/share/warpstore-cuvs). False if unavailable.
 bool cagraAvailable();
 std::string cagraStatus();  // why it is unavailable, or the loaded location
 // Graph over n x dim float32 rows at devData (device memory; dim % 4 == 0). dot: inner product,

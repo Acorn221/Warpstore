@@ -1,6 +1,7 @@
-// cuVS CAGRA through its C API, resolved with dlopen so gpu-db builds and runs without cuVS. The
+// cuVS CAGRA through its C API, resolved with dlopen so warpstore builds and runs without cuVS. The
 // headers are only needed for the struct layouts (GDB_HAVE_CUVS); without them this is a stub.
 #include "cagra.h"
+#include "common.h"
 
 #include <dlfcn.h>
 #include <cuda_runtime.h>
@@ -63,8 +64,8 @@ bool load() {
   static std::once_flag once;
   std::call_once(once, [] {
     std::string dir;
-    if (const char* e = getenv("GPUDB_CUVS_DIR")) dir = e;
-    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.local/share/gpudb-cuvs";
+    if (const char* e = envSetting("CUVS_DIR")) dir = e;
+    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.local/share/warpstore-cuvs";
     // Dependencies first (RTLD_GLOBAL, so later libraries bind to these by soname).
     const char* libs[] = {"rapids_logger/lib64/librapids_logger.so", "librmm/lib64/librmm.so", "nvidia/nvjitlink/lib/libnvJitLink.so.12",
                           "nvidia/nccl/lib/libnccl.so.2", "nvidia/cublas/lib/libcublasLt.so.12", "nvidia/cublas/lib/libcublas.so.12",

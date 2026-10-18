@@ -410,17 +410,21 @@ struct TxnPending {
   std::unordered_set<uint64_t> hiddenIx;  // hidden, for lookups (big transactions)
   static uint64_t key(Loc l) { return (uint64_t)(uint32_t)l.seg << 32 | (uint32_t)l.row; }
   TxnPending() = default;
-  TxnPending(const TxnPending& o) : hidden(o.hidden), ghosts(o.ghosts), hiddenIx(o.hiddenIx), commitSeq(o.commitSeq.load()) {}
+  TxnPending(const TxnPending& o) : hidden(o.hidden), ghosts(o.ghosts), hiddenIx(o.hiddenIx), commitSeq(o.commitSeq.load()), logged(o.logged.load()) {}
   TxnPending& operator=(const TxnPending& o) {
     hidden = o.hidden;
     ghosts = o.ghosts;
     hiddenIx = o.hiddenIx;
     commitSeq = o.commitSeq.load();
+    logged = o.logged.load();
     return *this;
   }
   // 0: open; else the commit's global sequence number. Set for all of a transaction's tables at
   // once (under the commit gate, without table locks), so a commit becomes visible atomically.
   std::atomic<uint64_t> commitSeq{0};
+  // The commit's WAL record is written (set under the WAL lock, before commitSeq): a SNAPSHOT, which
+  // holds that lock, counts the change set as committed, since the rotated-out WAL is gone after it.
+  std::atomic<bool> logged{false};
 };
 
 // Table lock: readers / writer like std::shared_mutex, but a waiting writer blocks new readers, so
@@ -487,7 +491,7 @@ class FairSharedMutex {
 struct Table {
   std::string name;
   std::map<const void*, TxnPending> txnPending;  // per open transaction (key: its undo log); guarded by mu
-  std::string db = "gpudb";
+  std::string db = "warpstore";
   std::vector<IndexMeta> indexes;  // secondary keys (KEY / UNIQUE KEY)
   struct FkMeta {  // FOREIGN KEY metadata (not enforced)
     std::string name, refTable, onDelete, onUpdate;
@@ -594,13 +598,13 @@ extern thread_local std::vector<std::pair<Table*, TxnPending*>> tTxnEntries;
 // Oldest REPEATABLE READ snapshot (UINT64_MAX: none): committed change sets older than it can go.
 uint64_t oldestSnapshotSeq();
 
-// Current database of the calling connection (thread); "gpudb" by default.
+// Current database of the calling connection (thread); "warpstore" by default.
 std::string& currentDb();
 
 struct Catalog {
   std::mutex mu;
   std::map<std::string, std::shared_ptr<Table>> tables;  // key: "db.table", lower case
-  std::set<std::string> dbs{"gpudb", "mysql", "sys", "performance_schema"};
+  std::set<std::string> dbs{"warpstore", "mysql", "sys", "performance_schema"};
   std::set<std::string> syncDbs;  // CREATE DATABASE .. WITH SYNC DURABILITY: commits wait for the disk  // the system schemas tools expect (empty)
   std::map<std::string, std::string> views;              // key -> SELECT text
   // "t" -> "<current db>.t", "db.t" -> "db.t" (lower case)

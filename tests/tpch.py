@@ -1,10 +1,10 @@
-# TPC-H: all 22 queries against DuckDB on generated data (SF 0.1 by default, GPUDB_TPCH_SF to change).
+# TPC-H: all 22 queries against DuckDB on generated data (SF 0.1 by default, WARPSTORE_TPCH_SF to change).
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import duckdb
 from lib import TMP, Checker, norm_rows, rows_close, server_from_env
 
-SF = float(os.environ.get("GPUDB_TPCH_SF", "0.1"))
+SF = float(os.environ.get("WARPSTORE_TPCH_SF", "0.1"))
 d = duckdb.connect()
 d.execute("INSTALL tpch; LOAD tpch")
 d.execute(f"CALL dbgen(sf={SF})")

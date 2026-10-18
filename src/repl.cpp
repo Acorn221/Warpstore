@@ -47,7 +47,7 @@ void Engine::replAppend(const std::string& rec) {  // walMu_ held
 }
 
 std::string Engine::replSnapshot() {
-  const std::string base = (dir_.empty() ? std::string("/tmp/gpudb") : dir_ + "/") + "repl-snapshot.bin";
+  const std::string base = (dir_.empty() ? std::string("/tmp/warpstore") : dir_ + "/") + "repl-snapshot.bin";
   uint64_t lsn = 0;
   writeSnapshot(base, "", &lsn);
   {
@@ -75,7 +75,7 @@ void Engine::replWaitAck(uint64_t lsn) {
     static std::atomic<int64_t> lastWarn{0};
     const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     if (now - lastWarn.exchange(now) >= 10)
-      fprintf(stderr, "[gpu-db] semi-sync replication: no acknowledgement from %d replica(s) within %d ms; committing anyway\n",
+      fprintf(stderr, "[warpstore] semi-sync replication: no acknowledgement from %d replica(s) within %d ms; committing anyway\n",
               gSyncReplicas, gSyncReplicaTimeoutMs);
   }
 }
@@ -160,7 +160,7 @@ void Engine::startReplica(const std::string& url) {
       replState_ = s;
       if (!err.empty()) replError_ = err;
     };
-    const std::string stage = (dir_.empty() ? std::string("/tmp/gpudb-replica-") : dir_ + "/replica-") + std::to_string(getpid());
+    const std::string stage = (dir_.empty() ? std::string("/tmp/warpstore-replica-") : dir_ + "/replica-") + std::to_string(getpid());
     char host[256] = "";
     gethostname(host, sizeof host - 1);
     const std::string myId = std::string(host) + "-" + std::to_string(getpid()) + "-" + std::to_string(nowUsR());
@@ -170,7 +170,7 @@ void Engine::startReplica(const std::string& url) {
     replLastContactUs_ = nowUsR();
     while (replRun_) {
       if (gFailoverTimeoutS > 0 && bootstrapped && nowUsR() - replLastContactUs_ > (int64_t)(gFailoverTimeoutS * 1e6)) {
-        fprintf(stderr, "[gpu-db] primary unreachable for %.0f s: promoting this replica to primary\n", gFailoverTimeoutS);
+        fprintf(stderr, "[warpstore] primary unreachable for %.0f s: promoting this replica to primary\n", gFailoverTimeoutS);
         isReplica_ = false;
         replRun_ = false;
         setState("Promoted (primary unreachable)");

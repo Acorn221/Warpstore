@@ -55,7 +55,7 @@ std::vector<Value> Table::rowValues(Loc l) const {
 }
 
 std::string& currentDb() {
-  thread_local std::string db = "gpudb";
+  thread_local std::string db = "warpstore";
   return db;
 }
 

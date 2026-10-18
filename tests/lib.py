@@ -4,8 +4,8 @@ import datetime, decimal, os, shutil, signal, socket, subprocess, sys, tempfile,
 import pymysql
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.environ.get("GPUDB_BIN", os.path.join(ROOT, "build", "gpudb"))
-TMP = os.environ.get("GPUDB_TEST_TMP") or tempfile.mkdtemp(prefix="gpudb-test-")
+BIN = os.environ.get("WARPSTORE_BIN", os.path.join(ROOT, "build", "warpstore"))
+TMP = os.environ.get("WARPSTORE_TEST_TMP") or tempfile.mkdtemp(prefix="warpstore-test-")
 os.makedirs(TMP, exist_ok=True)
 
 
@@ -18,9 +18,9 @@ def free_port():
 
 
 class Server:
-    """A gpu-db process on free ports with its own data dir (None: --no-wal)."""
+    """A warpstore process on free ports with its own data dir (None: --no-wal)."""
 
-    def __init__(self, *args, data_dir="auto", mem=os.environ.get("GPUDB_TEST_MEM", "6G"), name="srv", http=True):
+    def __init__(self, *args, data_dir="auto", mem=os.environ.get("WARPSTORE_TEST_MEM", "6G"), name="srv", http=True):
         self.args = list(args)
         self.name = name
         self.data_dir = os.path.join(TMP, name + "-" + str(os.getpid()) + "-" + str(free_port())) if data_dir == "auto" else data_dir
@@ -86,10 +86,10 @@ class Server:
 
 
 def server_from_env():
-    """The runner's shared server (GPUDB_PORT), or a fresh one when a test is run by hand."""
-    if os.environ.get("GPUDB_PORT"):
+    """The runner's shared server (WARPSTORE_PORT), or a fresh one when a test is run by hand."""
+    if os.environ.get("WARPSTORE_PORT"):
         s = Server(data_dir=None, http=False)
-        s.port = int(os.environ["GPUDB_PORT"])
+        s.port = int(os.environ["WARPSTORE_PORT"])
         return s
     return Server().start()
 
@@ -115,7 +115,7 @@ class Checker:
         if not cond:
             self.fails += 1
             print(f"FAIL {name} {detail}"[:2000])
-        elif os.environ.get("GPUDB_TEST_VERBOSE"):
+        elif os.environ.get("WARPSTORE_TEST_VERBOSE"):
             print(f"ok   {name}")
         return cond
 

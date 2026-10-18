@@ -161,7 +161,7 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
     order->insert(order->end(), prev->begin() + from, prev->end());
     auto rank = std::make_shared<std::vector<double>>(n);
     for (size_t r = 0; r < n; ++r) (*rank)[(*order)[r]] = (double)r;
-    if (getenv("GPUDB_TRACE"))
+    if (envSetting("TRACE"))
       fprintf(stderr, "[trace] sorted dictionary of %zu strings incrementally (+%zu) in %.1f ms\n", n, n - n0,
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
     d.setDerived(ckey, std::make_shared<E>(E{n, order, rank}));
@@ -251,14 +251,14 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
   size_t inRuns = 0, big = 0;
   for (auto& r : runs) inRuns += r.hi - r.lo, big = std::max(big, r.hi - r.lo);
   refineAll(runs);
-  if (getenv("GPUDB_TRACE")) {
+  if (envSetting("TRACE")) {
     auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     fprintf(stderr, "[trace]   keys %.1f ms, first sort %.1f ms, %zu runs (%zu strings, largest %zu), refine %.1f ms\n", ms(tStart, tK),
             ms(tK, tS), runs.size(), inRuns, big, ms(tS, std::chrono::steady_clock::now()));
   }
   auto rank = std::make_shared<std::vector<double>>(n);
   for (size_t r = 0; r < n; ++r) (*rank)[(*order)[r]] = (double)r;
-  if (getenv("GPUDB_TRACE"))
+  if (envSetting("TRACE"))
     fprintf(stderr, "[trace] sorted dictionary of %zu strings in %.1f ms\n", n,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tStart).count());
   d.setDerived(ckey, std::make_shared<E>(E{n, order, rank}));
@@ -944,7 +944,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
     if (!volatileFn) encodeStrings(e, c);
     return;
   }
-  throw SqlError("FUNCTION gpudb." + f + " does not exist", 1305);
+  throw SqlError("FUNCTION warpstore." + f + " does not exist", 1305);
 }
 
 // A string expression as a number (MySQL's implicit / CAST conversion): evaluated once per
@@ -2022,7 +2022,7 @@ void embedCached(const std::vector<std::string>& texts, std::vector<std::string>
   std::string err;
   const auto t0 = std::chrono::steady_clock::now();
   if (!embedBatch(todo, vecs, err)) throw SqlError("EMBED: " + err, 1105);
-  if (getenv("GPUDB_TRACE"))
+  if (envSetting("TRACE"))
     fprintf(stderr, "[trace] EMBED: %zu texts through the model in %.1f ms\n", todo.size(),
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   const int d = embedDim();
@@ -2627,7 +2627,7 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
   if (f == "REGEXP_REPLACE") {
     return Value::S(regexReplace(str(0), str(1), str(2)));
   }
-  throw SqlError("FUNCTION gpudb." + f + " does not exist", 1305);
+  throw SqlError("FUNCTION warpstore." + f + " does not exist", 1305);
 }
 
 ExprP boundCol(BindCtx& c, int bt, int bc) {
@@ -2780,7 +2780,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
     std::string what;
     ~EncTrace() {
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
-      if (ms > 20 && getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %s over %zu dictionary entries: %.1f ms\n", what.c_str(), n, ms);
+      if (ms > 20 && envSetting("TRACE")) fprintf(stderr, "[trace] %s over %zu dictionary entries: %.1f ms\n", what.c_str(), n, ms);
     }
   } encTrace{tEnc, src.strs.size() - from, e->str()};
   if (out) {  // string results: computed on all cores, then added to the new dictionary in order
@@ -2875,12 +2875,12 @@ void encodeStrings(ExprP& e, BindCtx& c) {
     for (size_t i = from; i < N; ++i)
       if (!nul[i] && code[i] < 0 && first[i] == i) code[i] = out->appendUnique(std::move(res[i]));
     const double tIns = tick();
-    if (getenv("GPUDB_TRACE"))
+    if (envSetting("TRACE"))
       fprintf(stderr, "[trace]   dedupe: hash %.1f, bucket %.1f, shards %.1f, inserts %.1f ms\n", tHash, tBucket, tShard, tIns);
     parallelFor(N - from, [&, from](size_t b, size_t en) {
       for (size_t i = b + from; i < en + from; ++i) map[i] = nul[i] ? nullv() : (double)(code[i] >= 0 ? code[i] : code[first[i]]);
     });
-    if (getenv("GPUDB_TRACE"))
+    if (envSetting("TRACE"))
       fprintf(stderr, "[trace]   evaluate %.1f ms, dictionary inserts %.1f ms (%zu distinct)\n",
               std::chrono::duration<double, std::milli>(tAdd - tEnc).count(),
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tAdd).count(), out->strs.size());
@@ -3213,7 +3213,7 @@ struct ProfRow {
 };
 thread_local bool tProfOn = false;
 thread_local std::vector<ProfRow> tProf, tLastProf;
-thread_local bool tDense = true;  // SET gpudb_dense_groupby
+thread_local bool tDense = true;  // SET warpstore_dense_groupby
 
 // Times one stage of a PROFILE'd query. It waits for the GPU at the end of the stage so time is
 // attributed to the stage that queued the work (only when profiling).
@@ -3281,7 +3281,7 @@ inline void bindView(ColView& v, const BatchRef& b, int c) {
 
 // Visits, partition by partition (ascending), every segment that survives min/max elimination and
 // then that partition's write buffer. Stops early when fn returns false.
-thread_local int tScanDelayMs = 0;  // SET gpudb_debug_scan_delay_ms (tests: a slow reader holding its snapshot)
+thread_local int tScanDelayMs = 0;  // SET warpstore_debug_scan_delay_ms (tests: a slow reader holding its snapshot)
 void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>& preds, ScanStats& st,
                const std::function<bool(const BatchRef&)>& fn, bool dryRun = false) {
   if (tScanDelayMs > 0 && !dryRun) std::this_thread::sleep_for(std::chrono::milliseconds(tScanDelayMs));
@@ -3439,12 +3439,12 @@ bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi) {
   return true;
 }
 
-thread_local bool tJoinFilters = true;            // SET gpudb_join_filters = ON|OFF
-thread_local bool tAnn = true;                    // SET gpudb_vector_index = ON|OFF (OFF: exact GPU search)
-thread_local int tNprobe = 0;                     // SET gpudb_nprobe = N (0: index default)
-thread_local int tCagraItopk = 0;                 // SET gpudb_cagra_itopk = N (0: index default)
+thread_local bool tJoinFilters = true;            // SET warpstore_join_filters = ON|OFF
+thread_local bool tAnn = true;                    // SET warpstore_vector_index = ON|OFF (OFF: exact GPU search)
+thread_local int tNprobe = 0;                     // SET warpstore_nprobe = N (0: index default)
+thread_local int tCagraItopk = 0;                 // SET warpstore_cagra_itopk = N (0: index default)
 
-thread_local int64_t tLazyRows = 2'000'000;        // SET gpudb_join_filter_rows = N (tables this big are filtered)
+thread_local int64_t tLazyRows = 2'000'000;        // SET warpstore_join_filter_rows = N (tables this big are filtered)
 
 // Would this expression compile for the GPU? (Host-only string functions over several columns don't.)
 bool gpuCompilable(const ExprP& e, BindCtx& ctx) {
@@ -3846,8 +3846,8 @@ std::string Engine::metrics() {
     snprintf(b, sizeof b, "%s%s %.17g\n", name, labels.empty() ? "" : ("{" + labels + "}").c_str(), v);
     o += b;
   };
-  metric("gpudb_up", "gauge", "1 while the server runs.", 1);
-  metric("gpudb_uptime_seconds", "gauge", "Seconds since start.", (nowUs() - gStartUs) / 1e6);
+  metric("warpstore_up", "gauge", "1 while the server runs.", 1);
+  metric("warpstore_uptime_seconds", "gauge", "Seconds since start.", (nowUs() - gStartUs) / 1e6);
   std::vector<std::shared_ptr<Table>> tabs;
   size_t dbs;
   {
@@ -3864,49 +3864,49 @@ std::string Engine::metrics() {
     segs += (int64_t)t->segs.size();
     for (auto& wb : t->bufs) bufRows += (int64_t)wb->n;
   }
-  metric("gpudb_databases", "gauge", "Databases.", (double)dbs);
-  metric("gpudb_tables", "gauge", "Tables.", (double)tabs.size());
-  metric("gpudb_rows", "gauge", "Live rows in all tables.", (double)rows);
-  metric("gpudb_segments", "gauge", "Columnar segments.", (double)segs);
-  metric("gpudb_write_buffer_rows", "gauge", "Rows not yet flushed to segments.", (double)bufRows);
+  metric("warpstore_databases", "gauge", "Databases.", (double)dbs);
+  metric("warpstore_tables", "gauge", "Tables.", (double)tabs.size());
+  metric("warpstore_rows", "gauge", "Live rows in all tables.", (double)rows);
+  metric("warpstore_segments", "gauge", "Columnar segments.", (double)segs);
+  metric("warpstore_write_buffer_rows", "gauge", "Rows not yet flushed to segments.", (double)bufRows);
   const int64_t lim = gpuVramLimit(), freeB = gpuVramFree();
-  metric("gpudb_vram_free_bytes", "gauge", "Free device memory.", (double)freeB);
-  if (lim != INT64_MAX) metric("gpudb_vram_limit_bytes", "gauge", "--vram-limit.", (double)lim);
+  metric("warpstore_vram_free_bytes", "gauge", "Free device memory.", (double)freeB);
+  if (lim != INT64_MAX) metric("warpstore_vram_limit_bytes", "gauge", "--vram-limit.", (double)lim);
   {
     std::lock_guard<std::mutex> g(walMu_);
-    metric("gpudb_wal_generation", "gauge", "Current WAL generation (goes up at each SNAPSHOT).", (double)walGen_);
-    metric("gpudb_wal_bytes", "gauge", "Bytes in the current WAL.", (double)walOff_);
-    metric("gpudb_wal_records_total", "counter", "WAL records written since start.", (double)walWritten_);
-    metric("gpudb_replication_lsn", "gauge", "Replication log position (primary).", (double)lsn_);
+    metric("warpstore_wal_generation", "gauge", "Current WAL generation (goes up at each SNAPSHOT).", (double)walGen_);
+    metric("warpstore_wal_bytes", "gauge", "Bytes in the current WAL.", (double)walOff_);
+    metric("warpstore_wal_records_total", "counter", "WAL records written since start.", (double)walWritten_);
+    metric("warpstore_replication_lsn", "gauge", "Replication log position (primary).", (double)lsn_);
   }
-  metric("gpudb_wal_syncs_total", "counter", "WAL fdatasync calls.", (double)gWalSyncs.load());
-  metric("gpudb_wal_sync_seconds_total", "counter", "Time spent in WAL fdatasync.", gWalSyncUs.load() / 1e6);
-  metric("gpudb_wal_sync_max_seconds", "gauge", "Slowest WAL fdatasync since start.", gWalSyncMaxUs.load() / 1e6);
-  metric("gpudb_replica", "gauge", "1 on a replica, 0 on a primary.", isReplica_ ? 1 : 0);
+  metric("warpstore_wal_syncs_total", "counter", "WAL fdatasync calls.", (double)gWalSyncs.load());
+  metric("warpstore_wal_sync_seconds_total", "counter", "Time spent in WAL fdatasync.", gWalSyncUs.load() / 1e6);
+  metric("warpstore_wal_sync_max_seconds", "gauge", "Slowest WAL fdatasync since start.", gWalSyncMaxUs.load() / 1e6);
+  metric("warpstore_replica", "gauge", "1 on a replica, 0 on a primary.", isReplica_ ? 1 : 0);
   if (isReplica_) {
-    metric("gpudb_replica_applied_lsn", "gauge", "Last applied primary log position.", (double)appliedLsn_.load());
+    metric("warpstore_replica_applied_lsn", "gauge", "Last applied primary log position.", (double)appliedLsn_.load());
     const int64_t cu = replCaughtUpUs_;
-    if (cu) metric("gpudb_replica_lag_seconds", "gauge", "Time since the replica was last caught up.", std::max<int64_t>(0, nowUs() - cu - 1000000) / 1e6);
+    if (cu) metric("warpstore_replica_lag_seconds", "gauge", "Time since the replica was last caught up.", std::max<int64_t>(0, nowUs() - cu - 1000000) / 1e6);
   } else {
     std::lock_guard<std::mutex> g(replMu_);
     int live = 0;
     for (auto& [id, a] : replAcks_) live += nowUs() - a.second < 10000000;
-    metric("gpudb_replicas_connected", "gauge", "Replicas seen in the last 10 s.", live);
+    metric("warpstore_replicas_connected", "gauge", "Replicas seen in the last 10 s.", live);
   }
   {
     auto pc = jitPlanCache();
     double compileMs = 0;
     for (auto& p : pc) compileMs += p.compileMs;
-    metric("gpudb_plan_cache_plans", "gauge", "Compiled query plans cached.", (double)pc.size());
-    metric("gpudb_plan_compile_seconds_total", "counter", "Time spent compiling the cached plans.", compileMs / 1000);
+    metric("warpstore_plan_cache_plans", "gauge", "Compiled query plans cached.", (double)pc.size());
+    metric("warpstore_plan_compile_seconds_total", "counter", "Time spent compiling the cached plans.", compileMs / 1000);
   }
   {
     std::lock_guard<std::mutex> g(pipesMu_);
-    metric("gpudb_pipelines", "gauge", "Pipelines defined.", (double)pipes_.size());
+    metric("warpstore_pipelines", "gauge", "Pipelines defined.", (double)pipes_.size());
   }
   if (FILE* f = fopen("/proc/self/statm", "r")) {
     long pages = 0, res = 0;
-    if (fscanf(f, "%ld %ld", &pages, &res) == 2) metric("gpudb_resident_memory_bytes", "gauge", "Resident host memory.", (double)res * sysconf(_SC_PAGESIZE));
+    if (fscanf(f, "%ld %ld", &pages, &res) == 2) metric("warpstore_resident_memory_bytes", "gauge", "Resident host memory.", (double)res * sysconf(_SC_PAGESIZE));
     fclose(f);
   }
   return o;
@@ -3921,7 +3921,7 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
     }
   });
   flushTh_ = std::thread([this] {  // async durability: everything committed is on disk within ~interval
-    const int ms = getenv("GPUDB_FLUSH_MS") ? std::max(1, atoi(getenv("GPUDB_FLUSH_MS"))) : 10;
+    const int ms = envSetting("FLUSH_MS") ? std::max(1, atoi(envSetting("FLUSH_MS"))) : 10;
     while (!vramStop_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(ms));
       bool behind;
@@ -3950,7 +3950,7 @@ void Engine::vramBalance() {
     float heat;  // ordering key: PIN first, NEVER last, otherwise the decayed read count
     int hint;    // 0 AUTO, 1 PIN, 2 NEVER
   };
-  static const bool off = getenv("GPUDB_NO_VRAM_CACHE") != nullptr;  // static placement (A/B comparisons)
+  static const bool off = envSetting("NO_VRAM_CACHE") != nullptr;  // static placement (A/B comparisons)
   if (off) return;
   std::vector<std::shared_ptr<Table>> tabs;
   {
@@ -4089,7 +4089,7 @@ void Engine::vramBalance() {
     done += (int64_t)e->bytes;
   }
   apply(ups, true);
-  if (getenv("GPUDB_TRACE") && (freed || done))
+  if (envSetting("TRACE") && (freed || done))
     fprintf(stderr, "[trace] vram cache: moved %.0f MB out, %.0f MB in (budget %.0f MB)\n", freed / 1048576.0, done / 1048576.0, budget / 1048576.0);
 }
 
@@ -4154,7 +4154,7 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
     std::string rec(len, '\0');
     if (fread(rec.data(), 1, len, f) != len) break;
     if (v2 && (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)len) != crc) {
-      fprintf(stderr, "[gpu-db] WAL %s: checksum mismatch at offset %lld; ignoring the rest\n", path.c_str(), (long long)at);
+      fprintf(stderr, "[warpstore] WAL %s: checksum mismatch at offset %lld; ignoring the rest\n", path.c_str(), (long long)at);
       break;
     }
     if (rec.rfind("\x1eTS", 0) == 0) {  // time marker
@@ -4186,7 +4186,7 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
         for (size_t i = 0; i < k && zeros; ++i) zeros = buf[i] == 0;
       fclose(g);
     }
-    if (!zeros) fprintf(stderr, "[gpu-db] WAL %s: dropping incomplete records at the end (offset %lld)\n", path.c_str(), (long long)good);
+    if (!zeros) fprintf(stderr, "[warpstore] WAL %s: dropping incomplete records at the end (offset %lld)\n", path.c_str(), (long long)good);
     if (truncate(path.c_str(), good) != 0) perror("truncate WAL");
   }
   if (repairTail && !v2 && size > 0) {  // upgrade a format-1 log: rewrite it in format 2
@@ -4289,8 +4289,8 @@ void Engine::walWriteLocked(const std::string& rec) {
 // Durability, as in SingleStore: async by default (a commit is acknowledged once it is in the WAL in
 // the OS page cache, which survives a process crash; a background thread makes it durable on disk
 // within ~10 ms, and writers are throttled if that falls behind), sync for databases created WITH
-// SYNC DURABILITY, sessions with SET gpudb_sync_durability = ON, or every write with --sync-durability.
-thread_local int tSyncDurability = -1;  // SET gpudb_sync_durability: -1 database / server default, 0 off, 1 on
+// SYNC DURABILITY, sessions with SET warpstore_sync_durability = ON, or every write with --sync-durability.
+thread_local int tSyncDurability = -1;  // SET warpstore_sync_durability: -1 database / server default, 0 off, 1 on
 bool Engine::needsSync(const std::string& db) {
   if (tSyncDurability >= 0) return tSyncDurability == 1;
   if (sync_) return true;
@@ -4360,7 +4360,7 @@ void Engine::recover() {
       archiveWal(old);
     }
     n += replayWal(path, true);
-    fprintf(stderr, "[gpu-db] replayed %lld WAL records in %.0f ms\n", (long long)n, msSince(t0));
+    fprintf(stderr, "[warpstore] replayed %lld WAL records in %.0f ms\n", (long long)n, msSince(t0));
   }
   {
     std::vector<std::shared_ptr<Table>> all;
@@ -4401,7 +4401,7 @@ void Engine::recover() {
             }
           }
         }
-        fprintf(stderr, "[gpu-db] CAGRA vector indexes ready (%s)\n", cagraStatus().c_str());
+        fprintf(stderr, "[warpstore] CAGRA vector indexes ready (%s)\n", cagraStatus().c_str());
       } catch (...) {
       }
     }).detach();
@@ -4415,7 +4415,7 @@ void Engine::recover() {
       if (p->wantRun) resume.push_back(p);
   }
   for (auto& p : resume) startPipeline(p);
-  if (!wal_) fprintf(stderr, "[gpu-db] warning: cannot open WAL %s\n", path.c_str());
+  if (!wal_) fprintf(stderr, "[warpstore] warning: cannot open WAL %s\n", path.c_str());
 }
 
 // Per-connection transaction: writes are visible immediately (read uncommitted), WAL records are
@@ -4557,6 +4557,7 @@ void Engine::commitTxn() {
         bundle += rec;
       }
       walAppendLocked(tTxn.wal.size() == 1 ? tTxn.wal[0] : bundle);
+      for (auto& [t, e] : tTxnEntries) e->logged = true;  // (under walMu_: see TxnPending::logged)
       for (auto& rec : tTxn.wal) replAppend(rec);
       myLsn = lsn_;
     } catch (...) {
@@ -4566,6 +4567,8 @@ void Engine::commitTxn() {
     }
     walDurable(tTxn.needSync || needsSync(""));
     replWaitAck(myLsn);  // semi-sync replication
+    static const int delayMs = envSetting("DEBUG_COMMIT_DELAY_MS") ? std::atoi(envSetting("DEBUG_COMMIT_DELAY_MS")) : 0;
+    if (delayMs) std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));  // (tests: widens logged -> visible)
   }
   {
     std::unique_lock<std::shared_mutex> g(gCommitGate);
@@ -4700,7 +4703,7 @@ struct SnapScope {
   }
 };
 thread_local SnapScope* tSnapScope = nullptr;
-const bool gMvcc = getenv("GPUDB_NO_MVCC") == nullptr;
+const bool gMvcc = envSetting("NO_MVCC") == nullptr;
 struct SnapGuard {  // a top-level SELECT statement: open a scope (nested queries share it)
   std::unique_ptr<SnapScope> own;
   SnapGuard() {
@@ -5002,16 +5005,17 @@ ResultSet Engine::executeStmt(const std::string& sql) {
     }
     case Stmt::DROP_PLANCACHE: jitClearCache(); return okResult(0);
     case Stmt::SET: {
+      if (s.setName.rfind("GPUDB_", 0) == 0) s.setName = "WARPSTORE_" + s.setName.substr(6);  // (pre-rename names)
       auto on = [&] { return s.setValue == "ON" || s.setValue == "1" || s.setValue == "TRUE"; };
-      if (s.setName == "GPUDB_CODEGEN") jitSetMode(s.setValue == "SYNC" ? JIT_SYNC : on() ? JIT_ON : JIT_OFF);
-      else if (s.setName == "GPUDB_DENSE_GROUPBY") tDense = on();
-      else if (s.setName == "GPUDB_JOIN_FILTERS") tJoinFilters = on();
-      else if (s.setName == "GPUDB_VECTOR_INDEX") tAnn = on();
-      else if (s.setName == "GPUDB_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
-      else if (s.setName == "GPUDB_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
-      else if (s.setName == "GPUDB_DEBUG_SCAN_DELAY_MS") tScanDelayMs = std::atoi(s.setValue.c_str());
-      else if (s.setName == "GPUDB_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
-      else if (s.setName == "GPUDB_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
+      if (s.setName == "WARPSTORE_CODEGEN") jitSetMode(s.setValue == "SYNC" ? JIT_SYNC : on() ? JIT_ON : JIT_OFF);
+      else if (s.setName == "WARPSTORE_DENSE_GROUPBY") tDense = on();
+      else if (s.setName == "WARPSTORE_JOIN_FILTERS") tJoinFilters = on();
+      else if (s.setName == "WARPSTORE_VECTOR_INDEX") tAnn = on();
+      else if (s.setName == "WARPSTORE_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
+      else if (s.setName == "WARPSTORE_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
+      else if (s.setName == "WARPSTORE_DEBUG_SCAN_DELAY_MS") tScanDelayMs = std::atoi(s.setValue.c_str());
+      else if (s.setName == "WARPSTORE_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
+      else if (s.setName == "WARPSTORE_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
       else if (s.setName == "LONG_QUERY_TIME" || s.setName == "SLOW_QUERY_LOG") {  // server-wide (SET GLOBAL)
         if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
         static double lastMs = 1000;
@@ -5022,7 +5026,7 @@ ResultSet Engine::executeStmt(const std::string& sql) {
           monitor::slowMs = on() ? lastMs : -1;
         }
       }
-      else if (s.setName == "COLLATION_CONNECTION" || s.setName == "COLLATION_SERVER" || s.setName == "GPUDB_COLLATION")
+      else if (s.setName == "COLLATION_CONNECTION" || s.setName == "COLLATION_SERVER" || s.setName == "WARPSTORE_COLLATION")
         tCi = s.setValue.find("_BIN") != std::string::npos || s.setValue == "BINARY" ? 0 : 1;
       else if (s.setName == "NAMES" && s.setValue.find("BIN") != std::string::npos) tCi = 0;
       else if (s.setName == "AUTOCOMMIT") {
@@ -5091,7 +5095,7 @@ ResultSet Engine::executeStmt(const std::string& sql) {
           it = it->first.rfind(db + ".", 0) == 0 ? cat_.views.erase(it) : std::next(it);
         cat_.dbs.erase(db);
         cat_.syncDbs.erase(db);
-        if (currentDb() == db) currentDb() = "gpudb";
+        if (currentDb() == db) currentDb() = "warpstore";
       }
       r = okResult(0);
       break;
@@ -5892,8 +5896,8 @@ ResultSet Engine::infoSchema(const std::string& table) {
       for (auto* c : {"utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_general_ci", "utf8mb4_unicode_ci"})
         row({c, "utf8mb4", "0", std::string(c) == "utf8mb4_0900_ai_ci" ? "Yes" : "", "Yes", "1", "PAD SPACE"});
     if (tn == "engines") {
-      row({"Columnstore", "DEFAULT", "gpu-db GPU columnstore with a row write buffer", "YES", "NO", "YES"});
-      row({"InnoDB", "YES", "Alias of the gpu-db columnstore", "YES", "NO", "YES"});
+      row({"Columnstore", "DEFAULT", "warpstore GPU columnstore with a row write buffer", "YES", "NO", "YES"});
+      row({"InnoDB", "YES", "Alias of the warpstore columnstore", "YES", "NO", "YES"});
     }
     if (tn == "global_variables" || tn == "session_variables")
       for (auto& [k, v] : systemVariables()) row({upper(k), v});
@@ -5916,11 +5920,11 @@ ResultSet Engine::infoSchema(const std::string& table) {
   return r;
 }
 
-// System variables (SHOW VARIABLES, @@name): MySQL 8 defaults where gpu-db behaves the same, the
-// session's settings, and gpudb_* knobs.
+// System variables (SHOW VARIABLES, @@name): MySQL 8 defaults where warpstore behaves the same, the
+// session's settings, and warpstore_* knobs.
 std::vector<std::pair<std::string, std::string>> systemVariables() {
   const std::string iso = tIsoSnapshot ? "REPEATABLE-READ" : "READ-COMMITTED";
-  return {{"version", "8.0.32-gpudb"}, {"version_comment", "gpu-db (GPU-accelerated HTAP)"}, {"version_compile_os", "Linux"},
+  return {{"version", "8.0.32-warpstore"}, {"version_comment", "warpstore (GPU-accelerated HTAP)"}, {"version_compile_os", "Linux"},
           {"version_compile_machine", "x86_64"}, {"protocol_version", "10"}, {"license", "GPL"}, {"autocommit", "ON"},
           {"character_set_client", "utf8mb4"}, {"character_set_connection", "utf8mb4"}, {"character_set_results", "utf8mb4"},
           {"character_set_server", "utf8mb4"}, {"character_set_database", "utf8mb4"}, {"character_set_system", "utf8mb3"},
@@ -5938,16 +5942,16 @@ std::vector<std::pair<std::string, std::string>> systemVariables() {
           {"default_week_format", "0"}, {"div_precision_increment", "4"}, {"group_concat_max_len", "1048576"},
           {"innodb_version", "8.0.32"}, {"warning_count", "0"}, {"error_count", "0"}, {"session_track_gtids", "OFF"},
           {"last_insert_id", std::to_string(tLastInsertId)}, {"identity", std::to_string(tLastInsertId)}, {"hostname", "localhost"},
-          {"port", "3306"}, {"socket", "/tmp/mysql.sock"}, {"datadir", "/var/lib/gpudb/"}, {"basedir", "/usr/"},
+          {"port", "3306"}, {"socket", "/tmp/mysql.sock"}, {"datadir", "/var/lib/warpstore/"}, {"basedir", "/usr/"},
           {"tmpdir", "/tmp"}, {"server_id", "1"}, {"log_bin", "OFF"}, {"binlog_format", "ROW"}, {"gtid_mode", "OFF"},
           {"read_only", "0"}, {"super_read_only", "0"}, {"max_execution_time", "0"}, {"innodb_lock_wait_timeout", "50"},
           {"lock_wait_timeout", "31536000"}, {"max_join_size", "18446744073709551615"}, {"sql_big_selects", "1"},
           {"local_infile", "ON"}, {"secure_file_priv", ""}, {"skip_name_resolve", "ON"}, {"require_secure_transport", "OFF"},
           {"default_collation_for_utf8mb4", "utf8mb4_0900_ai_ci"}, {"information_schema_stats_expiry", "86400"},
-          {"gpudb_sync_durability", tSyncDurability < 0 ? "DEFAULT" : tSyncDurability ? "ON" : "OFF"},
-          {"gpudb_codegen", jitMode() == JIT_OFF ? "OFF" : jitMode() == JIT_SYNC ? "SYNC" : "ON"},
-          {"gpudb_dense_groupby", tDense ? "ON" : "OFF"}, {"gpudb_join_filters", tJoinFilters ? "ON" : "OFF"},
-          {"gpudb_join_filter_rows", std::to_string(tLazyRows)}, {"gpudb_gpu", gpuDescribe()}};
+          {"warpstore_sync_durability", tSyncDurability < 0 ? "DEFAULT" : tSyncDurability ? "ON" : "OFF"},
+          {"warpstore_codegen", jitMode() == JIT_OFF ? "OFF" : jitMode() == JIT_SYNC ? "SYNC" : "ON"},
+          {"warpstore_dense_groupby", tDense ? "ON" : "OFF"}, {"warpstore_join_filters", tJoinFilters ? "ON" : "OFF"},
+          {"warpstore_join_filter_rows", std::to_string(tLazyRows)}, {"warpstore_gpu", gpuDescribe()}};
 }
 Value sysVarValue(const std::string& name) {
   const std::string n = lower(name);
@@ -6768,7 +6772,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   const auto tLock = Clock::now();
   for (auto& t : lockOrder) locks.emplace_back(t->mu);
   FairSharedMutex::barge = false;
-  if (getenv("GPUDB_TRACE") && msSince(tLock) > 20) fprintf(stderr, "[trace] waited %.1f ms for table locks\n", msSince(tLock));
+  if (envSetting("TRACE") && msSince(tLock) > 20) fprintf(stderr, "[trace] waited %.1f ms for table locks\n", msSince(tLock));
 
   // Expand * and bind the select list.
   std::vector<SelectItem> items;
@@ -7051,7 +7055,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
             if (g) vix->cagra->graphs[sg.id] = g, ++built;
             else {
               vix->cagra->failed.insert(sg.id);
-              fprintf(stderr, "[gpu-db] CAGRA build failed for %s.%s: %s (exact search used)\n", t.name.c_str(), vix->name.c_str(), err.c_str());
+              fprintf(stderr, "[warpstore] CAGRA build failed for %s.%s: %s (exact search used)\n", t.name.c_str(), vix->name.c_str(), err.c_str());
             }
           }
         }
@@ -7154,7 +7158,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         }
         notes.push_back("CAGRA candidates too few after WHERE: exact search");
       } else {
-        fprintf(stderr, "[gpu-db] CAGRA search failed: %s (exact search used)\n", err.c_str());
+        fprintf(stderr, "[warpstore] CAGRA search failed: %s (exact search used)\n", err.c_str());
       }
     }
   }
@@ -7941,7 +7945,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
                         (dspec.priv ? std::string("per-thread accumulators") : dspec.copies ? std::to_string(dspec.copies) + " shared-memory copies per block" : "global arrays") + ")"
                     : "hash GROUP BY";
     const JitProgram* jit = nullptr;
-    std::string codegen = jitEnabled() ? "compiled" : "interpreted (SET gpudb_codegen = OFF)";
+    std::string codegen = jitEnabled() ? "compiled" : "interpreted (SET warpstore_codegen = OFF)";
     if (!explain && !distX) {
       ProfStage pcg("codegen");
       const JitFn fn = !plan.nkeys ? JF_NOKEYS : dspec.G ? JF_DENSE : JF_GROUPED;
@@ -8398,7 +8402,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     finish(rows, noKeys);
     phost.done((int64_t)res.rows.size(), "HAVING / ORDER BY / LIMIT on the candidate groups, formatting");
     res.info = single ? "gpu-aggregate" : "gpu-join-aggregate";
-    if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
+    if (envSetting("TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
     return res;
   }
 
@@ -8632,7 +8636,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   }, 4096);
   pproj.done(cnt);
   res.info = ctx.tabs.size() == 1 ? "gpu-scan" : "gpu-join";
-  if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
+  if (envSetting("TRACE")) fprintf(stderr, "[trace] %.2f ms %s\n", msSince(t0), res.info.c_str());
   return res;
 }
 
@@ -10334,7 +10338,7 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
         }, 1);
       }
     }
-    if (getenv("GPUDB_TRACE")) fprintf(stderr, "[trace] window %zu: keys+sort %.1f ms (sort %.1f)\n", w, msSince(tW1), msSince(tK));
+    if (envSetting("TRACE")) fprintf(stderr, "[trace] window %zu: keys+sort %.1f ms (sort %.1f)\n", w, msSince(tW1), msSince(tK));
     std::vector<Value> out(n);
     LType ty = LType::BIGINT;
     const LType argTy = wn.args.empty() ? LType::BIGINT : r.types[wn.args[0]];
@@ -10450,7 +10454,7 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   }
   const auto tW2 = Clock::now();
   std::string tmp = makeTemp(r, q, "win");
-  if (getenv("GPUDB_TRACE"))
+  if (envSetting("TRACE"))
     fprintf(stderr, "[trace] windows: inner %.1f ms, compute %.1f ms, temp %.1f ms (%zu rows)\n", msSince(tW0) - msSince(tW1),
             msSince(tW1) - msSince(tW2), msSince(tW2), n);
   outer.from = {TableRef{tmp, "__win", nullptr, 0, nullptr}};
@@ -10649,7 +10653,7 @@ int64_t Engine::ingest(const std::string& table, char delim, int64_t skip, const
   }
   const std::string dir = dir_.empty() ? std::string("/tmp") : dir_ + "/pipeline-loads";
   if (!dir_.empty()) mkdir(dir.c_str(), 0755);
-  const std::string path = dir + "/" + (dir_.empty() ? "gpudb-" : "") + stagedName + ".tsv";  // (never re-routed by its name)
+  const std::string path = dir + "/" + (dir_.empty() ? "warpstore-" : "") + stagedName + ".tsv";  // (never re-routed by its name)
   {
     FILE* f = fopen(path.c_str(), "wb");
     if (!f) throw SqlError("cannot stage " + path, 1105);
@@ -10752,7 +10756,7 @@ void Engine::runRemotePipeline(const std::shared_ptr<Pipeline>& p) {
     std::lock_guard<std::mutex> lk(p->mu);
     for (auto& d : p->done) {
       std::string b = baseName(d);
-      if (b.rfind("gpudb-", 0) == 0) b = b.substr(6);
+      if (b.rfind("warpstore-", 0) == 0) b = b.substr(6);
       if (b.rfind(kpre, 0) != 0) continue;
       int part;
       long long from, nx;
@@ -10760,7 +10764,7 @@ void Engine::runRemotePipeline(const std::shared_ptr<Pipeline>& p) {
     }
   }
   auto stagedPath = [&](const std::string& name) {  // the file ingest() stages (and the WAL names)
-    return (dir_.empty() ? std::string("/tmp/gpudb-") : dir_ + "/pipeline-loads/") + name + ".tsv";
+    return (dir_.empty() ? std::string("/tmp/warpstore-") : dir_ + "/pipeline-loads/") + name + ".tsv";
   };
   auto fail = [&](const std::string& what) {
     std::lock_guard<std::mutex> lk(p->mu);
@@ -11205,7 +11209,7 @@ void writeColumnar(FILE* f, const Table& t) {
   // are kept (their WAL records only appear at COMMIT, so recovery stays consistent).
   std::set<std::pair<int32_t, int32_t>> hidden, ghosts;
   for (auto& [k, v] : t.txnPending) {
-    if (v.commitSeq) continue;
+    if (v.commitSeq || v.logged) continue;  // committed (or logged: its WAL record is rotated away with this snapshot)
     for (auto& l : v.hidden) hidden.insert({l.seg, l.row});
     for (auto& l : v.ghosts) ghosts.insert({l.seg, l.row});
   }
@@ -11556,7 +11560,7 @@ void Engine::archiveWal(const std::string& path) {
         const std::string to = gWalArchive + name;
         if (rename(path.c_str(), to.c_str()) != 0) copyFile(path, to);
       } catch (std::exception& e) {
-        fprintf(stderr, "[gpu-db] WAL archive: %s (keeping %s)\n", e.what(), path.c_str());
+        fprintf(stderr, "[warpstore] WAL archive: %s (keeping %s)\n", e.what(), path.c_str());
         return;
       }
     }
@@ -11584,7 +11588,7 @@ void Engine::archiveLoads(uint64_t belowGen) {
         const std::string to = gWalArchive + "/loads/" + n;
         if (rename(from.c_str(), to.c_str()) != 0) copyFile(from, to);
       } catch (std::exception& e) {
-        fprintf(stderr, "[gpu-db] WAL archive: %s\n", e.what());
+        fprintf(stderr, "[warpstore] WAL archive: %s\n", e.what());
         continue;
       }
     }
@@ -11805,7 +11809,7 @@ static std::string jsonEsc(const std::string& x) {
 ResultSet Engine::doBackup(Stmt& s) {
   const std::string db = lower(s.table);
   const bool s3 = s.setValue == "S3";
-  const std::string stage = (dir_.empty() ? std::string("/tmp/gpudb") : dir_) + "/backup-stage-" + std::to_string(nowUs());
+  const std::string stage = (dir_.empty() ? std::string("/tmp/warpstore") : dir_) + "/backup-stage-" + std::to_string(nowUs());
   struct Cleanup {
     std::vector<std::string> files;
     std::string dir;
@@ -11840,7 +11844,7 @@ ResultSet Engine::doBackup(Stmt& s) {
     auto t0 = Clock::now();
     writeSnapshot(file, db, nullptr, &pos);
     const int64_t now = nowUs();
-    const std::string man = "{\"format\":\"gpudb-backup-1\",\"database\":\"" + jsonEsc(db) + "\",\"created_us\":" + std::to_string(now) +
+    const std::string man = "{\"format\":\"warpstore-backup-1\",\"database\":\"" + jsonEsc(db) + "\",\"created_us\":" + std::to_string(now) +
                             ",\"created\":\"" + Value::Ts(now).toString() + "\",\"wal_gen\":" + std::to_string(pos.first) +
                             ",\"wal_offset\":" + std::to_string(pos.second) + ",\"data_dir\":\"" + jsonEsc(dir_) + "\"}\n";
     {
@@ -11962,7 +11966,7 @@ int64_t Engine::replayFrom(const std::string& db, const std::string& asDb, uint6
       execute(sql);
       ++applied;
     } catch (std::exception& e) {
-      fprintf(stderr, "[gpu-db] point-in-time restore: %s: %s\n", e.what(), sql.substr(0, 200).c_str());
+      fprintf(stderr, "[warpstore] point-in-time restore: %s: %s\n", e.what(), sql.substr(0, 200).c_str());
     }
   };
   bool done = false;
@@ -12114,7 +12118,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
           ResultSet rr;
           routineStatement(d, rr);
         } catch (std::exception& ex) {
-          fprintf(stderr, "[gpu-db] routine restore failed: %s\n", ex.what());
+          fprintf(stderr, "[warpstore] routine restore failed: %s\n", ex.what());
         }
       }
     if (getU64(uf, nu))
@@ -12128,7 +12132,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     fclose(uf);
   }
   currentDb() = savedDb;
-  fprintf(stderr, "[gpu-db] loaded snapshot: %llu tables, %lld rows in %.0f ms\n", (unsigned long long)ntables, (long long)total, msSince(t0));
+  fprintf(stderr, "[warpstore] loaded snapshot: %llu tables, %lld rows in %.0f ms\n", (unsigned long long)ntables, (long long)total, msSince(t0));
 }
 
 

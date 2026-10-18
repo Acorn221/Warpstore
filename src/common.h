@@ -1,5 +1,13 @@
 // Core types shared by host and device code.
 #pragma once
+#include <cstdlib>
+#include <string>
+
+// Environment settings: WARPSTORE_<name>, or the pre-rename GPUDB_<name>.
+inline const char* envSetting(const char* name) {
+  if (const char* v = std::getenv((std::string("WARPSTORE_") + name).c_str())) return v;
+  return std::getenv((std::string("GPUDB_") + name).c_str());
+}
 #include <cstdint>
 #include <cmath>
 #include <string>

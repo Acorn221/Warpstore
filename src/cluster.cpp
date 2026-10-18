@@ -1,4 +1,4 @@
-// Clustering: one aggregator + leaf nodes. Leaves are ordinary gpu-db servers;
+// Clustering: one aggregator + leaf nodes. Leaves are ordinary warpstore servers;
 // the aggregator (--leaves http://leaf1:port,http://leaf2:port[|http://leaf2-replica:port], their
 // HTTP API ports) keeps the catalog and talks to them over the HTTP Data API.
 //
@@ -504,7 +504,7 @@ static auto leafCall(std::vector<std::string>& leaves, size_t i, F&& fn, bool wr
         if (!connectionError(e)) throw;
         primaryOk = false;
         markFailed();
-        fprintf(stderr, "[gpu-db] leaf %zu: %s unreachable, writing to its mirror only\n", i, primary.c_str());
+        fprintf(stderr, "[warpstore] leaf %zu: %s unreachable, writing to its mirror only\n", i, primary.c_str());
       }
       if (!primaryOk) return onMirror(leaves, i, fn);
       {  // the mirror's leaf is failed: its copy is rebuilt when it is resynced
@@ -515,7 +515,7 @@ static auto leafCall(std::vector<std::string>& leaves, size_t i, F&& fn, bool wr
         onMirror(leaves, i, fn);
       } catch (const SqlError& e) {  // the mirror's leaf is down: the write stands, without its copy
         if (!connectionError(e)) throw;
-        fprintf(stderr, "[gpu-db] leaf %zu: mirror on %s unreachable, write not mirrored\n", i, mirrorUrl(leaves, i).c_str());
+        fprintf(stderr, "[warpstore] leaf %zu: mirror on %s unreachable, write not mirrored\n", i, mirrorUrl(leaves, i).c_str());
       }
       return r;
     }
@@ -524,7 +524,7 @@ static auto leafCall(std::vector<std::string>& leaves, size_t i, F&& fn, bool wr
     } catch (const SqlError& e) {
       if (!connectionError(e)) throw;
       markFailed();
-      fprintf(stderr, "[gpu-db] leaf %zu: %s unreachable, serving its shard from the mirror\n", i, primary.c_str());
+      fprintf(stderr, "[warpstore] leaf %zu: %s unreachable, serving its shard from the mirror\n", i, primary.c_str());
       return onMirror(leaves, i, fn);
     }
   }
@@ -543,7 +543,7 @@ static auto leafCall(std::vector<std::string>& leaves, size_t i, F&& fn, bool wr
       std::lock_guard<std::mutex> g(gLeavesMu);
       if (leaves[i] == spec) leaves[i] = replica;
     }
-    fprintf(stderr, "[gpu-db] leaf %zu: %s unreachable, failed over to %s\n", i, primary.c_str(), replica.c_str());
+    fprintf(stderr, "[warpstore] leaf %zu: %s unreachable, failed over to %s\n", i, primary.c_str(), replica.c_str());
     return fn(replica);
   }
 }
@@ -586,7 +586,7 @@ void Engine::startHealthChecks() {
             return 0;
           });
         } catch (const std::exception& e) {
-          fprintf(stderr, "[gpu-db] leaf %zu health check failed: %s\n", i, e.what());
+          fprintf(stderr, "[warpstore] leaf %zu health check failed: %s\n", i, e.what());
         }
       }
     }
@@ -1970,14 +1970,14 @@ void Engine::resyncLeaf(size_t i) {
   auto url = [&](size_t k) { return ls[k].substr(0, ls[k].find('|')); };
   const size_t m = (i + 1) % n, p = (i + n - 1) % n;
   std::unique_lock<std::shared_mutex> wl(gResyncMu);  // writes wait until the leaf is back in sync
-  fprintf(stderr, "[gpu-db] leaf %zu: back online, resyncing from its mirror on leaf %zu\n", i, m);
+  fprintf(stderr, "[warpstore] leaf %zu: back online, resyncing from its mirror on leaf %zu\n", i, m);
   copyLeafTables(url(m), "__r" + std::to_string(i), url(i), "");
   if (p != i) copyLeafTables(url(p), "", url(i), "__r" + std::to_string(p));
   {
     std::lock_guard<std::mutex> g(gFailedMu);
     gFailed.erase(url(i));
   }
-  fprintf(stderr, "[gpu-db] leaf %zu: resynced\n", i);
+  fprintf(stderr, "[warpstore] leaf %zu: resynced\n", i);
 }
 
 // Rebuilds every leaf's mirror from its primary (after ADD LEAF / REBALANCE moved rows).
@@ -2032,7 +2032,7 @@ ResultSet Engine::clusterAdmin(const std::string& sql) {
   };
   if (!added.empty()) {
     const std::string url = added.substr(0, added.find('|'));
-    for (auto& d : dbs) leafExecUrl(url, "gpudb", "CREATE DATABASE IF NOT EXISTS " + quoteId(d));
+    for (auto& d : dbs) leafExecUrl(url, "warpstore", "CREATE DATABASE IF NOT EXISTS " + quoteId(d));
     for (auto* group : {&sharded, &refs})
       for (auto& t : *group) {
         ResultSet c = local("SHOW CREATE TABLE " + quoteId(lower(t->db)) + "." + quoteId(lower(t->name)));
@@ -2107,7 +2107,7 @@ ResultSet Engine::clusterAdmin(const std::string& sql) {
   // The binary inserts have no WAL records: checkpoint the leaves that persist (others ignore it).
   onLeaves(nl, [&](size_t i) {
     try {
-      leafCall(leaves_, i, [&](const std::string& url) { return leafExecUrl(url, "gpudb", "SNAPSHOT"); }, true);
+      leafCall(leaves_, i, [&](const std::string& url) { return leafExecUrl(url, "warpstore", "SNAPSHOT"); }, true);
     } catch (...) {
     }
   });
@@ -2134,7 +2134,7 @@ int64_t Engine::insertBinary(const std::string& db, const std::string& table, co
     std::vector<int> need;
     for (auto& n : f.names) need.push_back(t->colIndex(n));
     appendFetched(*t, f, need);
-    if (getenv("GPUDB_TRACE"))
+    if (envSetting("TRACE"))
       fprintf(stderr, "[trace] insert %zu rows (%zu bytes): parse %.1f ms, append %.1f ms\n", f.nrows, body.size(),
               std::chrono::duration<double, std::milli>(t1 - t0).count(),
               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count());

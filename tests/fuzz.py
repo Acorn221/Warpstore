@@ -1,5 +1,5 @@
-# Differential fuzzing: random queries over the same random data in gpu-db and DuckDB; any result
-# difference or unexpected error fails. GPUDB_FUZZ_N queries (default 400), GPUDB_FUZZ_SEED.
+# Differential fuzzing: random queries over the same random data in warpstore and DuckDB; any result
+# difference or unexpected error fails. WARPSTORE_FUZZ_N queries (default 400), WARPSTORE_FUZZ_SEED.
 # Avoided on purpose (MySQL and DuckDB legitimately differ): case-insensitive string collation,
 # division by zero, ROUND half cases, integer overflow, float formatting.
 import os, random, sys, time
@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import duckdb, pymysql
 from lib import Checker, norm_rows, rows_close, server_from_env
 
-N = int(os.environ.get("GPUDB_FUZZ_N", "400"))
-SEED = int(os.environ.get("GPUDB_FUZZ_SEED", "12345"))
+N = int(os.environ.get("WARPSTORE_FUZZ_N", "400"))
+SEED = int(os.environ.get("WARPSTORE_FUZZ_SEED", "12345"))
 R = random.Random(SEED)
 WORDS = ["ant", "bee", "cat", "dog", "eel", "fox", "gnu", "hen", "ibis", "jay", "kiwi", "lark"]
 
@@ -17,7 +17,7 @@ g = srv.cursor()
 g.execute("DROP DATABASE IF EXISTS fuzz")
 g.execute("CREATE DATABASE fuzz")
 g.execute("USE fuzz")
-KEEP = os.environ.get("GPUDB_FUZZ_KEEP")  # path: keep the data (DuckDB file + gpu-db database) for debugging
+KEEP = os.environ.get("WARPSTORE_FUZZ_KEEP")  # path: keep the data (DuckDB file + warpstore database) for debugging
 if KEEP and os.path.exists(KEEP):
     os.unlink(KEEP)
 d = duckdb.connect(KEEP or ":memory:")
@@ -314,7 +314,7 @@ for i in range(N):
         coarse = lambda r: tuple((x is None, str(type(x)), round(x, 2) if isinstance(x, float) else x if x is not None else 0) for x in r)
         a, b = sorted(a, key=coarse), sorted(b, key=coarse)
     # 1.5e-4: MySQL rounds DECIMAL division to 4 places, DuckDB keeps more digits
-    c.check(f"q{i}", a == b or rows_close(a, b, 1e-6, 1.5e-4), f"\n  {my}\n  gpu-db {len(a)} rows {a[:4]}\n  duckdb {len(b)} rows {b[:4]}")
+    c.check(f"q{i}", a == b or rows_close(a, b, 1e-6, 1.5e-4), f"\n  {my}\n  warpstore {len(a)} rows {a[:4]}\n  duckdb {len(b)} rows {b[:4]}")
 print(f"{N} queries in {time.time() - t0:.1f}s, seed {SEED}")
 for k, v in sorted(errors.items(), key=lambda kv: -kv[1]):
     print(f"  {v:4d} x {k}")

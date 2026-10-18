@@ -1,7 +1,7 @@
-// MySQL change data capture: gpu-db as a live copy of a MySQL database. A consistent snapshot of the
+// MySQL change data capture: warpstore as a live copy of a MySQL database. A consistent snapshot of the
 // source's tables is loaded first, then the source's binary log (row format) is followed and every
-// source transaction is applied as one gpu-db transaction, together with the binlog position it
-// reached (table _gpudb_cdc_position in the target database), so a restart resumes exactly once.
+// source transaction is applied as one warpstore transaction, together with the binlog position it
+// reached (table _warpstore_cdc_position in the target database), so a restart resumes exactly once.
 //
 //   CREATE PIPELINE p AS LOAD DATA MYSQL 'mysql://user:pw@host:3306/db' INTO DATABASE copy; START PIPELINE p
 //   LOAD DATA MYSQL 'mysql://user:pw@host:3306/db' INTO DATABASE copy      (one-off copy, no follow)

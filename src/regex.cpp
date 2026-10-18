@@ -269,7 +269,7 @@ Value geoFunction(const std::string& f, const std::vector<Value>& a) {
     if (ring.size() < 3 || !wktPoint(pt, x1, y1)) return Value::Null();
     return Value::I(inRing(ring, x1, y1));
   }
-  throw SqlError("FUNCTION gpudb." + f + " does not exist (or wrong arguments)", 1305);
+  throw SqlError("FUNCTION warpstore." + f + " does not exist (or wrong arguments)", 1305);
 }
 
 }  // namespace gdb

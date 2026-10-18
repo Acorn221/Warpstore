@@ -14,7 +14,7 @@ async function t(name: string, fn: () => Promise<any>, check?: (r: any) => boole
 }
 
 async function main() {
-  const pool = mysql.createPool({ host: "127.0.0.1", port: Number(process.env.GPUDB_PORT || 3307), user: "root", database: "app", connectionLimit: 4 });
+  const pool = mysql.createPool({ host: "127.0.0.1", port: Number(process.env.WARPSTORE_PORT || 3307), user: "root", database: "app", connectionLimit: 4 });
   const db = drizzle(pool, { schema, mode: "default" });
   await t("delete all", async () => { await db.delete(tags); await db.delete(posts); await db.delete(users); });
   await t("insert users", () => db.insert(users).values([

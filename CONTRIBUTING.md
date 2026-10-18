@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for looking! gpu-db is alpha software; bug reports with a reproducing SQL script are the most
+Thanks for looking! warpstore is alpha software; bug reports with a reproducing SQL script are the most
 useful contribution.
 
 ## Build and test
@@ -14,7 +14,7 @@ scripts/test-containers.sh            # optional: S3 / Kafka / MySQL containers 
 ```
 
 `tests/run.py --list` shows the tests; pass names to run a subset. Before sending a change to the
-engine, run the whole suite and a longer fuzz run, e.g. `GPUDB_FUZZ_N=5000 .venv/bin/python tests/run.py fuzz`.
+engine, run the whole suite and a longer fuzz run, e.g. `WARPSTORE_FUZZ_N=5000 .venv/bin/python tests/run.py fuzz`.
 The ORM tests need Node.js (they install their packages on first run).
 
 ## Where things are

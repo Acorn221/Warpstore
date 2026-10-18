@@ -1,5 +1,5 @@
 """Runs ClickBench on a local SingleStore (the free singlestoredb-dev image) on this machine:
-load the same 10M-row TSV gpu-db loads, then each query once (first) + best of 3 (hot).
+load the same 10M-row TSV warpstore loads, then each query once (first) + best of 3 (hot).
 usage: python bench/clickbench/singlestore_local.py bench/clickbench [load] > results_singlestore_local.jsonl
 The container (8 cores is the license-free limit):
   docker run -d --name s2bench --cpus=8 --memory=16g -e ROOT_PASSWORD=bench -p 3316:3306 \

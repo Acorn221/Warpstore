@@ -2,6 +2,7 @@
 // with cuBLAS GEMMs (attention as strided-batched GEMMs per sequence) and small fused kernels,
 // mean pooling + L2 normalization (sentence-transformers' recipe for all-MiniLM-L6-v2).
 #include "embed.h"
+#include "common.h"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -314,8 +315,8 @@ bool loadModel() {
   static std::once_flag once;
   std::call_once(once, [] {
     std::string dir;
-    if (const char* e = getenv("GPUDB_EMBED_MODEL")) dir = e;
-    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.cache/gpudb/models/all-MiniLM-L6-v2";
+    if (const char* e = envSetting("EMBED_MODEL")) dir = e;
+    else if (const char* h = getenv("HOME")) dir = std::string(h) + "/.cache/warpstore/models/all-MiniLM-L6-v2";
     auto m = std::make_unique<Model>();
     std::ifstream cf(dir + "/config.json");
     if (!cf) {
@@ -331,7 +332,7 @@ bool loadModel() {
     m->inter = (int)jsonNum(cfg, "intermediate_size", 1536);
     m->maxPos = (int)jsonNum(cfg, "max_position_embeddings", 512);
     m->eps = (float)jsonNum(cfg, "layer_norm_eps", 1e-12);
-    m->maxLen = std::min(m->maxPos, (int)jsonNum(cfg, "gpudb_max_tokens", 256));
+    m->maxLen = std::min(m->maxPos, (int)jsonNum(cfg, "warpstore_max_tokens", 256));
     if (!m->tok.load(dir + "/vocab.txt")) {
       gStatus = "cannot read " + dir + "/vocab.txt";
       return;
@@ -396,7 +397,7 @@ bool loadModel() {
     cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking);
     cublasSetStream(m->blas, m->stream);
     // TF32 tensor cores for the GEMMs (Ampere+): several times faster, cosine to fp32 output ~1 - 1e-6.
-    if (!getenv("GPUDB_EMBED_FP32")) cublasSetMathMode(m->blas, CUBLAS_TF32_TENSOR_OP_MATH);
+    if (!envSetting("EMBED_FP32")) cublasSetMathMode(m->blas, CUBLAS_TF32_TENSOR_OP_MATH);
     gStatus = "embedding model " + dir + " (" + std::to_string(m->H) + " dims, " + std::to_string(m->layers) + " layers)";
     gModel = m.release();
   });

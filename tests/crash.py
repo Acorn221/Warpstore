@@ -1,13 +1,13 @@
 # Crash safety: concurrent transfers (sum invariant) and acknowledged inserts while SNAPSHOTs run,
 # kill -9 at random moments (sometimes with garbage appended to the WAL), restart, verify.
-# GPUDB_CRASH_CYCLES (default 5). A process kill keeps the OS page cache, so every acknowledged
+# WARPSTORE_CRASH_CYCLES (default 5). A process kill keeps the OS page cache, so every acknowledged
 # write must survive even with the default async durability.
 import multiprocessing as mp, os, random, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pymysql
 from lib import TMP, Checker, Server
 
-CYCLES = int(os.environ.get("GPUDB_CRASH_CYCLES", "5"))
+CYCLES = int(os.environ.get("WARPSTORE_CRASH_CYCLES", "5"))
 ACK = os.path.join(TMP, f"crash-acks-{os.getpid()}")
 
 
@@ -56,6 +56,7 @@ def snapper(port, stop):
 
 
 def main():
+    os.environ.setdefault("WARPSTORE_DEBUG_COMMIT_DELAY_MS", "3")  # widen the WAL-written -> visible window snapshots race with
     srv = Server(name="crash", http=False).start()
     cur = srv.cursor()
     cur.execute("CREATE DATABASE bank")

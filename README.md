@@ -1,4 +1,4 @@
-# gpu-db
+# Warpstore
 
 **A GPU-accelerated, MySQL-compatible HTAP database.** Speak the MySQL protocol to it from any
 driver or ORM; transactional writes land in a CPU write buffer, analytics run as CUDA kernels over
@@ -6,20 +6,20 @@ column segments kept in GPU memory. Built in: vector search (GPU graph index), e
 full-text search, S3 / Kafka / MySQL change-data-capture ingest, replication with failover, backups
 with point-in-time restore, MVCC.
 
-> **Status: experimental alpha.** gpu-db was developed as an experiment: how far can a GPU-first,
+> **Status: experimental alpha.** warpstore was developed as an experiment: how far can a GPU-first,
 > MySQL-compatible database get, and how fast? It was built quickly, with heavy use of an AI coding
 > assistant. It passes TPC-H, ClickBench, a differential fuzzer and ORM suites (see [Tests](#tests)),
 > but it is young: NVIDIA GPUs only, one main developer, no production deployments. Don't make it
-> the only home of data you care about; keep a system of record (for instance with gpu-db as a live
-> copy of MySQL, see [MySQL change data capture](#mysql-change-data-capture-gpu-db-as-a-live-copy-of-mysql)).
+> the only home of data you care about; keep a system of record (for instance with warpstore as a live
+> copy of MySQL, see [MySQL change data capture](#mysql-change-data-capture-warpstore-as-a-live-copy-of-mysql)).
 
 ## Quick start
 
 **Docker** (needs an NVIDIA GPU and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)):
 
 ```bash
-docker build -t gpudb .                      # ~10-20 min the first time (--build-arg JOBS=2 on small machines)
-docker run --gpus all -p 3307:3307 -v gpudb-data:/data -e GPUDB_ROOT_PASSWORD=change-me gpudb
+docker build -t warpstore .                      # ~10-20 min the first time (--build-arg JOBS=2 on small machines)
+docker run --gpus all -p 3307:3307 -v warpstore-data:/data -e WARPSTORE_ROOT_PASSWORD=change-me warpstore
 mysql -h 127.0.0.1 -P 3307 -u root -p        # or any MySQL driver / ORM
 ```
 
@@ -35,7 +35,7 @@ mysql -h 127.0.0.1 -P 3307 -u root -p        # or any MySQL driver / ORM
 ```bash
 sudo scripts/install-deps.sh                 # Debian / Ubuntu; CUDA from https://developer.nvidia.com/cuda-downloads
 cmake -S . -B build && cmake --build build -j
-./build/gpudb --port 3307 --data-dir ./gpudb-data
+./build/warpstore --port 3307 --data-dir ./warpstore-data
 mysql -h 127.0.0.1 -P 3307 -u root
 ```
 
@@ -44,10 +44,10 @@ cmake afterwards) and `scripts/fetch-embed-model.sh` (the ~90 MB model behind `E
 them vector indexes fall back to IVF and `EMBED()` reports that the model is missing.
 
 By default the server listens on 127.0.0.1 only and root has no password; it refuses to listen on
-other addresses until root has one (`--root-password` / `GPUDB_ROOT_PASSWORD`). TLS is on with a
-generated certificate. `./build/gpudb --help` lists the options.
+other addresses until root has one (`--root-password` / `WARPSTORE_ROOT_PASSWORD`). TLS is on with a
+generated certificate. `./build/warpstore --help` lists the options.
 
-SingleStore is a trademark of SingleStore, Inc. gpu-db is an independent project, not affiliated
+SingleStore is a trademark of SingleStore, Inc. warpstore is an independent project, not affiliated
 with or endorsed by SingleStore; it supports much of SingleStore's SQL dialect (SHARD KEY, SORT KEY,
 REFERENCE tables, pipelines, vector and JSON syntax) and is benchmarked against it below.
 
@@ -76,7 +76,7 @@ REFERENCE tables, pipelines, vector and JSON syntax) and is benchmarked against 
 
 ## Compared with SingleStore's architecture
 
-| SingleStore | gpu-db |
+| SingleStore | warpstore |
 |---|---|
 | MySQL wire protocol | Same (v10 handshake, text protocol): any MySQL client/driver works |
 | In-memory rowstore on top of the columnstore LSM | CPU write buffer; flushed to segments at 1M rows or `OPTIMIZE TABLE` |
@@ -96,7 +96,7 @@ REFERENCE tables, pipelines, vector and JSON syntax) and is benchmarked against 
 ## Usage
 
 ```bash
-./build/gpudb --port 3307 --data-dir ./gpudb-data     # or --no-wal; --partitions N; --codegen on|sync|off;
+./build/warpstore --port 3307 --data-dir ./warpstore-data     # or --no-wal; --partitions N; --codegen on|sync|off;
                                                       # --plancache-dir DIR (default <data-dir>/plancache); -v
 ```
 
@@ -117,10 +117,10 @@ SHOW SEGMENTS FROM events;   -- per partition: segments + write buffer
 ## Results (RTX 3080 10 GB vs DuckDB 1.5.6 on 12 CPU threads, same machine, same data)
 
 `python bench/bench.py --sf 10`: TPC-H scale factor 10 (60M lineitem rows, about 5.2 GB in VRAM).
-Medians of 5 warm runs, measured end to end through the MySQL protocol for gpu-db (in-process for
+Medians of 5 warm runs, measured end to end through the MySQL protocol for warpstore (in-process for
 DuckDB, on-disk database, 4 GB memory limit). **All results are checked against DuckDB and match.**
 
-| query | gpu-db | DuckDB | speedup |
+| query | warpstore | DuckDB | speedup |
 |---|---:|---:|---:|
 | Q1 pricing summary (scan + group by) | 14 ms | 287 ms | 20x |
 | Q3 shipping priority (3-way join, 114K groups) | 8.4 ms | 173 ms | 21x |
@@ -207,8 +207,8 @@ MySQL client parsing its 18K result rows; the server side takes 28 ms.
 
 ### ClickBench against SingleStore itself
 
-The 43 ClickBench queries on the first 10M rows of `hits`, run on the same machine. gpu-db runs on
-the RTX 3080; SingleStore 9.1 runs in its free developer image on 8 of the Ryzen 5 5500's 12 hardware threads. gpu-db is about
+The 43 ClickBench queries on the first 10M rows of `hits`, run on the same machine. warpstore runs on
+the RTX 3080; SingleStore 9.1 runs in its free developer image on 8 of the Ryzen 5 5500's 12 hardware threads. warpstore is about
 **95x faster hot and 94x on first runs** (geometric mean), and faster on all 43 queries. The sums
 are 0.27 s vs 30.1 s hot and 2.6 s vs 49.6 s on first runs. The developer image is limited (2
 partitions, 8 cores), so the conservative estimate, bridged through SingleStore's tuned published
@@ -234,11 +234,11 @@ the cache, the same as with everything in VRAM (the hot columns fit). TPC-H SF1 
 
 SingleStore markets itself for real-time dashboards, operational (OLTP) lookups, streaming ingest,
 HTAP, vector / hybrid search, full-text search and JSON analytics. `bench/usecases.py` runs one small
-workload per use case, with the same SQL, against gpu-db and the local SingleStore 9.1 dev container
+workload per use case, with the same SQL, against warpstore and the local SingleStore 9.1 dev container
 (8 threads, see above). Data: 5M events (id, user, ts, channel, country, DECIMAL amount, JSON) and 100K
 docs (30-word text, VECTOR(128)). Clients are Python processes on the same machine; results match.
 
-| use case | test | gpu-db | SingleStore | |
+| use case | test | warpstore | SingleStore | |
 |---|---|---:|---:|---:|
 | dashboards | 6 aggregations, hot (filtered sum, COUNT DISTINCT, TIME_BUCKET series, top users, last hour, JSON group) | 0.4-7 ms | 4-181 ms | 9-86x |
 | | window RANK per group over 353K groups | 249 ms | 250 ms | 1x |
@@ -255,7 +255,7 @@ docs (30-word text, VECTOR(128)). Clients are Python processes on the same machi
 | full-text | MATCH .. AGAINST count / BM25 top-10 / group by, hot | 0.2-0.6 ms | 4-26 ms | 16-100x |
 | | first query of a new term (no inverted index) | 230 ms | 5-220 ms | slower |
 
-Write numbers with the default async durability on the final build: 48K single-row inserts/s (8 clients), about 950 inserts + 900 updates/s in the HTAP mix. With sync durability (fdatasync per group commit, this machine's consumer NVMe): 12.6K single-row inserts/s and about 470 + 470/s in the HTAP mix; a single client gets 3.3K commits/s. BM25 scores match SingleStore's (Lucene's formula). Getting here fixed three gpu-db problems the
+Write numbers with the default async durability on the final build: 48K single-row inserts/s (8 clients), about 950 inserts + 900 updates/s in the HTAP mix. With sync durability (fdatasync per group commit, this machine's consumer NVMe): 12.6K single-row inserts/s and about 470 + 470/s in the HTAP mix; a single client gets 3.3K commits/s. BM25 scores match SingleStore's (Lucene's formula). Getting here fixed three warpstore problems the
 benchmark exposed: writers starved behind streams of analytic queries (the table lock now makes new
 readers wait behind a waiting writer, PK point lookups excepted), every query after a write re-uploaded
 the whole write buffer and rescanned it for key ranges (now incremental), and `std::regex_search` over
@@ -294,7 +294,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 scripts/test-containers.sh                 # optional: S3 / Kafka / MySQL containers for the ingest and CDC tests
 .venv/bin/python tests/run.py              # everything that can run on this machine (~2-3 min)
 .venv/bin/python tests/run.py fuzz tpch    # by name
-GPUDB_FUZZ_N=5000 GPUDB_FUZZ_SEED=7 .venv/bin/python tests/run.py fuzz
+WARPSTORE_FUZZ_N=5000 WARPSTORE_FUZZ_SEED=7 .venv/bin/python tests/run.py fuzz
 ```
 
 The runner starts throwaway servers on free ports (one shared server for the SQL tests, own servers
@@ -303,15 +303,15 @@ with data dirs for the rest) and skips what the machine can't run:
 | Test | What it checks |
 |---|---|
 | smoke, postagg, sharding | basic SQL, post-aggregation expressions, partition pruning / co-located joins against DuckDB |
-| tpch | all 22 TPC-H queries against DuckDB on generated data (SF 0.1, `GPUDB_TPCH_SF`) |
-| fuzz | random queries (expressions, CASE, COALESCE, NULLs, DECIMAL, joins, GROUP BY / HAVING, windows, subqueries, UNION, derived tables, CTEs, ORDER BY .. LIMIT) on the same random data in gpu-db and DuckDB; it found five wrong-result bugs on its first run |
+| tpch | all 22 TPC-H queries against DuckDB on generated data (SF 0.1, `WARPSTORE_TPCH_SF`) |
+| fuzz | random queries (expressions, CASE, COALESCE, NULLs, DECIMAL, joins, GROUP BY / HAVING, windows, subqueries, UNION, derived tables, CTEs, ORDER BY .. LIMIT) on the same random data in warpstore and DuckDB; it found five wrong-result bugs on its first run |
 | orm-sqlalchemy, orm-drizzle, orm-prisma | the ORM suites (SQLAlchemy on pymysql and mysql-connector; the Node projects install themselves on first run) |
 | mvcc | writers don't wait for a slow reader, consistent reads under concurrent transfers, flush / DROP / dictionary growth under a reader |
 | crash | `kill -9` during transfers, inserts and snapshots: every acknowledged write survives, sums stay exact |
 | backup | full restore, restore under another name, point-in-time restore over a WAL rotation, S3, deleted LOAD DATA files |
 | replication | WAL-tailing replica, primary restart, semi-sync read-your-writes, automatic failover, replica of the promoted primary |
 | observability | processlist, KILL, query stats, slow log, /metrics |
-| ingest-s3, ingest-kafka, binlog | S3 / Kafka / MySQL CDC against local containers `gpudb-s3` (SeaweedFS), `gpudb-redpanda`, `gpudb-mysql` (MySQL 8.4) when they exist |
+| ingest-s3, ingest-kafka, binlog | S3 / Kafka / MySQL CDC against local containers `warpstore-s3` (SeaweedFS), `warpstore-redpanda`, `warpstore-mysql` (MySQL 8.4) when they exist |
 
 ## Measuring query speed
 
@@ -325,10 +325,10 @@ EXPLAIN SELECT ...;        -- the plan: routing, segment elimination, join order
 SHOW PLANCACHE;            -- compiled plans: origin (compiled / disk), compile time, executions, avg time
 SHOW PLAN 3;               -- the generated CUDA source of plan 3
 DROP ALL FROM PLANCACHE;
-SET gpudb_codegen = ON | SYNC | OFF;      -- ON: interpret first, compile in background (default)
-SET gpudb_dense_groupby = ON | OFF;       -- A/B switches for the optimizations
-SET gpudb_join_filters = ON | OFF;
-SET gpudb_join_filter_rows = 2000000;     -- tables at least this big are scanned with join filters
+SET warpstore_codegen = ON | SYNC | OFF;      -- ON: interpret first, compile in background (default)
+SET warpstore_dense_groupby = ON | OFF;       -- A/B switches for the optimizations
+SET warpstore_join_filters = ON | OFF;
+SET warpstore_join_filter_rows = 2000000;     -- tables at least this big are scanned with join filters
 ```
 
 `python bench/qtime.py "SELECT ..." [--compare]` wraps these: min/median/p95 over N runs, the
@@ -350,17 +350,17 @@ queries and `LOAD DATA LOCAL INFILE` are supported on the wire):
 | Queries | Inner / LEFT / RIGHT / FULL OUTER / CROSS / NATURAL joins, `JOIN .. USING`, any ON condition (equi-joins hash-join on the GPU, also on expressions of each side such as `a.x = b.y + 1` or `a.d = DATE(b.ts)`, whose keys are computed on the GPU, and on DOUBLE columns by bit pattern; non-equi and mixed ON conditions run as a GPU join or cross join plus a GPU filter over the pairs, outer joins then add the preserved side's unmatched rows); joins also work on string columns (codes are remapped between the tables' dictionaries on the GPU). Subqueries (scalar, IN, EXISTS; equality-correlated ones are decorrelated into joins, other correlated scalar subqueries run once per distinct outer value and are joined back), CTEs incl. `WITH RECURSIVE`, derived tables (simple projections/filters of one table are merged into the outer query), UNION [ALL] / INTERSECT / EXCEPT, DISTINCT, GROUP BY / HAVING, window functions (ranking, LAG/LEAD, FIRST/LAST/NTH_VALUE, NTILE, framed aggregates), full-text `MATCH .. AGAINST`, `FOR UPDATE` |
 | Aggregates | GPU: COUNT / SUM / AVG / MIN / MAX (+ DISTINCT). Host aggregation (GPU filters/joins, CPU groups): GROUP_CONCAT (ORDER BY, SEPARATOR), STRING_AGG, JSON_ARRAYAGG, JSON_OBJECTAGG, STDDEV / VARIANCE (POP / SAMP), MEDIAN, BIT_AND/OR/XOR, ANY_VALUE, DISTINCT aggregates over different columns, GROUP BY on multi-column string expressions |
 | Functions | ~100: math, string (CONCAT, SUBSTRING, REPLACE, LPAD, REGEXP_LIKE, ...), date/time (DATE_ADD, DATEDIFF, DATE_FORMAT, EXTRACT, TIMESTAMPDIFF, ...), JSON (`JSON_EXTRACT_*`, `->`, `->>`), CAST/CONVERT (strings to numbers MySQL-style: the leading numeric prefix, else 0; string = number comparisons and arithmetic on strings convert the same way), CASE/IF/COALESCE/NULLIF. String functions run once per distinct dictionary entry, on all cores; regexes use RE2 (linear time), and REGEXP_REPLACE with capture groups uses PCRE2's JIT when the runtime library is present (5x faster, RE2 semantics for `$`; RE2 takes over on errors or the backtracking limit) |
-| Vector search | `DOT_PRODUCT`, `EUCLIDEAN_DISTANCE`, `<*>`, `<->`, `JSON_ARRAY_PACK`; exact kNN on the GPU; `VECTOR INDEX (col) INDEX_OPTIONS '{"index_type":..,"metric_type":"DOT_PRODUCT"}'`: with NVIDIA cuVS installed (`scripts/install-cuvs.sh`, loaded at run time) `CAGRA` / `HNSW_*` / `AUTO` (the default) build a CAGRA GPU graph per segment, searched together in one call with deleted rows masked out and WHERE evaluated on the GPU as a per-segment filter bitset (filtered ANN); without cuVS, or for `IVF_*`, the IVF index (k-means lists). `SET gpudb_cagra_itopk`, `gpudb_nprobe`, `gpudb_vector_index = OFF` for exact. `EMBED(text)`: sentence embeddings (all-MiniLM-L6-v2, 384 dims, `scripts/fetch-embed-model.sh`) computed by a BERT encoder on the GPU (cuBLAS, TF32), batched over columns: `UPDATE t SET v = EMBED(body)`, `ORDER BY v <*> EMBED('question') DESC LIMIT 10` |
+| Vector search | `DOT_PRODUCT`, `EUCLIDEAN_DISTANCE`, `<*>`, `<->`, `JSON_ARRAY_PACK`; exact kNN on the GPU; `VECTOR INDEX (col) INDEX_OPTIONS '{"index_type":..,"metric_type":"DOT_PRODUCT"}'`: with NVIDIA cuVS installed (`scripts/install-cuvs.sh`, loaded at run time) `CAGRA` / `HNSW_*` / `AUTO` (the default) build a CAGRA GPU graph per segment, searched together in one call with deleted rows masked out and WHERE evaluated on the GPU as a per-segment filter bitset (filtered ANN); without cuVS, or for `IVF_*`, the IVF index (k-means lists). `SET warpstore_cagra_itopk`, `warpstore_nprobe`, `warpstore_vector_index = OFF` for exact. `EMBED(text)`: sentence embeddings (all-MiniLM-L6-v2, 384 dims, `scripts/fetch-embed-model.sh`) computed by a BERT encoder on the GPU (cuBLAS, TF32), batched over columns: `UPDATE t SET v = EMBED(body)`, `ORDER BY v <*> EMBED('question') DESC LIMIT 10` |
 | Pipelines | `CREATE PIPELINE p AS LOAD DATA FS '/dir/*.csv' \| S3 'bucket/prefix*' CONFIG '{"region","endpoint_url"}' CREDENTIALS '{"aws_access_key_id",..}' \| KAFKA 'host:9092/topic' INTO TABLE t [FORMAT JSON (col <- a::b, ..)]`, or `.. AS LOAD DATA MYSQL 'mysql://user:pw@host:3306/db' INTO DATABASE copy` (a live copy of a MySQL database, see below), START / STOP / DROP / SHOW PIPELINES (passwords masked). Each file / object loads once and Kafka offsets (all partitions; gzip / snappy / lz4 / zstd batches) survive crashes exactly once (both are recovered from the logged loads) |
-| Transactions | BEGIN / START TRANSACTION / COMMIT / ROLLBACK, `SET autocommit = 0`; a transaction is one WAL record written at COMMIT (replayed all or nothing), ROLLBACK replays an undo log. Durability works like SingleStore's: async by default (a commit is acknowledged once its WAL record is in the OS page cache, which survives a process crash; a background thread fdatasyncs every 10 ms, `GPUDB_FLUSH_MS`, so a power loss can lose the last few ms), sync where asked: `CREATE DATABASE d WITH SYNC DURABILITY`, `SET gpudb_sync_durability = ON` for a session, or `--sync-durability` for everything (group commit into a pre-zeroed WAL, so one fdatasync serves all waiting commits). WAL format 2: CRC32 per record; a torn or corrupt tail is cut off at recovery. SNAPSHOT writes the committed state only and rotates the WAL before installing itself, so a crash at any point recovers each change exactly once (checked with `kill -9` during transfers, inserts and snapshots). Read committed: other sessions don't see a transaction's inserts / updates / deletes until COMMIT (their scans get per-batch visibility bitmaps), and their writes to the same table wait for it (lock wait timeout 10 s). Long loads release the table lock every 256K rows. **MVCC**: a SELECT reads a per-statement snapshot of each table (copy-on-write deleted-row bitmaps, immutable segments, append-only write buffers, refcounted VRAM mirrors) and holds no table lock while it runs, so writers never wait for readers: with dashboards running, single-row inserts and updates went from ~1.2K/s (p99 15 ms) to ~8K/s (p99 2 ms). Key lookups (PRIMARY KEY / secondary index equality) still take a microsecond lock on the live table; `GPUDB_NO_MVCC=1` turns snapshots off. **Atomic commits**: a COMMIT is made durable (and acknowledged by semi-sync replicas) first, then stamped with one global sequence number in all of its tables at once, and a statement reading several tables takes all its snapshots at one moment, so readers see a transaction everywhere or nowhere. Write conflicts wait only for the transactions that hold the rows; deadlocks are detected through a wait-for graph (error 1213, the victim's transaction is rolled back, as in MySQL) instead of waiting out the 10 s lock timeout. A failed WAL write (disk full) fails the COMMIT and rolls it back; an autocommit write that can't be logged turns the server read-only until a restart |
+| Transactions | BEGIN / START TRANSACTION / COMMIT / ROLLBACK, `SET autocommit = 0`; a transaction is one WAL record written at COMMIT (replayed all or nothing), ROLLBACK replays an undo log. Durability works like SingleStore's: async by default (a commit is acknowledged once its WAL record is in the OS page cache, which survives a process crash; a background thread fdatasyncs every 10 ms, `WARPSTORE_FLUSH_MS`, so a power loss can lose the last few ms), sync where asked: `CREATE DATABASE d WITH SYNC DURABILITY`, `SET warpstore_sync_durability = ON` for a session, or `--sync-durability` for everything (group commit into a pre-zeroed WAL, so one fdatasync serves all waiting commits). WAL format 2: CRC32 per record; a torn or corrupt tail is cut off at recovery. SNAPSHOT writes the committed state only and rotates the WAL before installing itself, so a crash at any point recovers each change exactly once (checked with `kill -9` during transfers, inserts and snapshots). Read committed: other sessions don't see a transaction's inserts / updates / deletes until COMMIT (their scans get per-batch visibility bitmaps), and their writes to the same table wait for it (lock wait timeout 10 s). Long loads release the table lock every 256K rows. **MVCC**: a SELECT reads a per-statement snapshot of each table (copy-on-write deleted-row bitmaps, immutable segments, append-only write buffers, refcounted VRAM mirrors) and holds no table lock while it runs, so writers never wait for readers: with dashboards running, single-row inserts and updates went from ~1.2K/s (p99 15 ms) to ~8K/s (p99 2 ms). Key lookups (PRIMARY KEY / secondary index equality) still take a microsecond lock on the live table; `WARPSTORE_NO_MVCC=1` turns snapshots off. **Atomic commits**: a COMMIT is made durable (and acknowledged by semi-sync replicas) first, then stamped with one global sequence number in all of its tables at once, and a statement reading several tables takes all its snapshots at one moment, so readers see a transaction everywhere or nowhere. Write conflicts wait only for the transactions that hold the rows; deadlocks are detected through a wait-for graph (error 1213, the victim's transaction is rolled back, as in MySQL) instead of waiting out the 10 s lock timeout. A failed WAL write (disk full) fails the COMMIT and rolls it back; an autocommit write that can't be logged turns the server read-only until a restart |
 | Procedural SQL | `CREATE [OR REPLACE] PROCEDURE p(a INT, ..) AS DECLARE .. BEGIN .. END` (MPSQL) or MySQL style: variables, `SET` / `:=`, IF / ELSEIF, WHILE, LOOP, REPEAT, `FOR i IN a .. b`, `FOR r IN SELECT ..` (cursor loops, `r.col`), EXIT / CONTINUE, `SELECT .. INTO`, `SCALAR(..)`, `ECHO SELECT`, RAISE / SIGNAL, `EXCEPTION WHEN OTHERS`, CALL, nested calls. `CREATE FUNCTION`: single-`RETURN` functions are inlined into queries (so they run on the GPU). Functions with procedural bodies also run over columns: the body runs once per distinct argument value, via a dictionary map for strings or a value-range map for INT / DATE, so it works in WHERE, GROUP BY and aggregates. CALL returns every `ECHO` / bare `SELECT` as a separate result set. Session `@variables` |
-| Security | `CREATE USER .. IDENTIFIED BY` (mysql_native_password), roles (`CREATE ROLE`, `GRANT role TO u`), `GRANT / REVOKE` SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, ALL on `*.*`, `db.*`, `db.table` (enforced per statement, incl. subqueries), SHOW GRANTS. Row-level security through views filtered on `CURRENT_USER()`. HTTP Data API with Basic auth. Server-side `LOAD DATA INFILE` and `SELECT .. INTO OUTFILE` need the FILE (SUPER) privilege (`LOAD DATA LOCAL` doesn't); information_schema shows only what the user may read. Listens on 127.0.0.1 by default (`--bind`), and refuses a non-loopback address while root has no password (`--root-password` / `GPUDB_ROOT_PASSWORD`). TLS on the MySQL protocol with a self-signed certificate generated in the data dir (or `--tls-cert` / `--tls-key`), `--require-secure-transport`; random handshake challenges (OpenSSL), failed-login throttling (10 per minute per address), `--max-connections` |
+| Security | `CREATE USER .. IDENTIFIED BY` (mysql_native_password), roles (`CREATE ROLE`, `GRANT role TO u`), `GRANT / REVOKE` SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, ALL on `*.*`, `db.*`, `db.table` (enforced per statement, incl. subqueries), SHOW GRANTS. Row-level security through views filtered on `CURRENT_USER()`. HTTP Data API with Basic auth. Server-side `LOAD DATA INFILE` and `SELECT .. INTO OUTFILE` need the FILE (SUPER) privilege (`LOAD DATA LOCAL` doesn't); information_schema shows only what the user may read. Listens on 127.0.0.1 by default (`--bind`), and refuses a non-loopback address while root has no password (`--root-password` / `WARPSTORE_ROOT_PASSWORD`). TLS on the MySQL protocol with a self-signed certificate generated in the data dir (or `--tls-cert` / `--tls-key`), `--require-secure-transport`; random handshake challenges (OpenSSL), failed-login throttling (10 per minute per address), `--max-connections` |
 | Clustering | `--leaves http://leaf1:httpport,http://leaf2:httpport|http://leaf2-replica:httpport` makes a server an aggregator over leaf servers (SingleStore's aggregator / leaf split). DDL runs everywhere; REFERENCE tables are replicated to every leaf. INSERT rows and LOAD DATA lines go to leaf hash(shard key); UPDATE / DELETE are broadcast. Co-located queries (one sharded table, or sharded tables joined on their shard keys, plus reference tables) run on the leaves: aggregations as partial aggregates combined on the aggregator's GPU, other queries with ORDER BY / LIMIT merged there. Joins of sharded tables on other columns are made co-located stage by stage: a table is reshuffled leaf to leaf by its join key, or a co-located group is joined on the leaves and its result reshuffled by the next join key (filters pushed into the shuffles; `EXPLAIN` lists the stages). Joins where neither side is on its shard key reshuffle both sides; joins on expressions (`a.x = b.y + 1000`, `a.v * 2 = b.w + 1`, `LOWER(a.s) = b.t`, `ABS(a.n - 250) = b.m`, DATE columns, string = number) reshuffle the tables with the expression values as computed shard keys (integers hashed as integers; other numbers normalized to DOUBLE and strings / dates hashed as text on both sides), also when a side is a co-located group joined on the leaves first. Other queries fetch each sharded table's needed columns (WHERE conjuncts pushed down) and finish on the aggregator. Results and shuffled rows travel in a columnar binary format (typed int64 / float64 arrays, NULL flags, strings), appended to the receiving tables without per-cell parsing, over a dedicated data plane: each server listens on `--data-port` (default HTTP port + 10000; `-1` disables it) for length-prefixed binary frames on persistent, authenticated TCP connections, and leaves without one are called over HTTP. A leaf runs its part of a shuffle one partition at a time (the scans of partitioned tables restricted to that partition; co-located joins stay correct partition by partition) and sends each partition's rows in 256K-row chunks, so it holds about 1/partitions of its shuffle output at once. 4M-row joins that reshuffle one or both sides by the join key run in 0.3 s on 2 local leaves. `ADD LEAF 'url'` / `REBALANCE PARTITIONS` move rows to the new hash layout with binary bulk inserts; a leaf with a replica fails over to it (`PROMOTE`) when the primary is down, found by queries or by health checks every 2 s. `SHOW LEAVES`; `EXPLAIN` shows the leaf SQL |
 | Replication / HA | `--replica-of http://user:pw@primary:httpport`: a replica bootstraps from a snapshot of the primary, then tails its WAL over HTTP (incl. the files of LOAD DATA / pipelines); it is read-only, `SHOW REPLICATION STATUS` (lag, the primary's replicas), `PROMOTE` for failover. `--failover-timeout S` on a replica promotes it by itself when the primary has been unreachable for S seconds (2 s in the tests); `--sync-replicas N` on the primary makes a commit wait until N replicas have applied it (semi-sync; falls back to async after `--sync-replica-timeout-ms`, default 2000), so a failover loses no acknowledged commit. A primary restart is detected (incarnation epoch) and replicas re-bootstrap |
 | Backups | `BACKUP DATABASE d TO '/dir'` or `TO S3 'bucket/prefix' CONFIG .. CREDENTIALS ..` (streamed, multipart above 64 MB): a consistent snapshot plus a manifest with its WAL position. `RESTORE DATABASE d [AS other] FROM '/dir' \| S3 .. [UNTIL TIMESTAMP '2026-10-17 12:00:00']`: with `--wal-archive DIR` rotated WALs are kept (they carry a time marker every second), so a restore can replay up to any point in time. Server-side `LOAD DATA INFILE` loads a copy kept in the data dir, so deleting the source file doesn't lose data on a crash |
 | Observability | `GET /metrics` on the HTTP port (Prometheus: statements by kind, latency histogram, errors, connections, rows, tables / segments / write buffers, VRAM, WAL size / fsyncs / fsync time, replication role / lag / replicas, plan cache, RSS). `SHOW [FULL] PROCESSLIST` / `information_schema.PROCESSLIST` (real sessions), `KILL [QUERY \| CONNECTION] id` (queries stop between execution stages and during loads), `information_schema.QUERY_STATS` (count / errors / total / avg / max ms / rows per statement shape, literals replaced; `FLUSH QUERY_STATS`), slow query log in MySQL's format (`<data dir>/slow.log`, over 1 s by default; `--slow-query-ms`, `SET GLOBAL long_query_time / slow_query_log`), `SELECT SLEEP(n)` |
 | Metadata | information_schema with MySQL 8's column layouts (TABLES, COLUMNS, STATISTICS, KEY_COLUMN_USAGE, TABLE_CONSTRAINTS, REFERENTIAL_CONSTRAINTS, ROUTINES, ...; upper-case column labels like MySQL), system variables with MySQL defaults (`@@sql_mode`, `@@lower_case_table_names`, ..), `mysql` / `sys` / `performance_schema` schemas, SHOW CREATE TABLE / INDEX / FULL TABLES / VARIABLES / TABLE STATUS / PIPELINES, DESCRIBE |
-| Storage | Tables larger than VRAM: segments beyond `--vram-limit` (or when VRAM is full) stay in pinned host RAM and are read over PCIe. `SNAPSHOT` checkpoints and `BACKUP DATABASE .. TO` / `RESTORE` files are columnar (dictionaries + physical column bytes per partition) and zstd-compressed: ClickBench 10M rows snapshot in 10 s to 0.99 GB and restart in 25 s (the earlier row format: 62 s, 1.9 GB, 99 s restart). Older row-format snapshots still load. After loads and restarts, large string dictionaries are sorted in the background (MIN/MAX/ORDER BY on strings), and dictionary-derived caches (sort order, LIKE bitmaps, string-function maps) are extended incrementally when inserts add strings instead of being rebuilt. VRAM cache: when columns spill to the host tier, scans count reads per segment column and a background thread (every 250 ms) keeps the hottest columns in VRAM, moving colder ones out only for a column 1.5x hotter (copies outside the table lock, pointer swaps under it; `GPUDB_NO_VRAM_CACHE=1` keeps the static first-come placement). GPU compression: integer segments are frame-of-reference packed to 8/16/32 bits, low-cardinality DOUBLE segments dictionary-coded, and decimal-valued DOUBLEs (prices like 406.1) stored as 16/32-bit integers / 10^s; on automatically once VRAM is 60% full (`--compress` always, `--no-compress` never). Generated kernels decode through out-of-line loads, so compile time stays flat |
+| Storage | Tables larger than VRAM: segments beyond `--vram-limit` (or when VRAM is full) stay in pinned host RAM and are read over PCIe. `SNAPSHOT` checkpoints and `BACKUP DATABASE .. TO` / `RESTORE` files are columnar (dictionaries + physical column bytes per partition) and zstd-compressed: ClickBench 10M rows snapshot in 10 s to 0.99 GB and restart in 25 s (the earlier row format: 62 s, 1.9 GB, 99 s restart). Older row-format snapshots still load. After loads and restarts, large string dictionaries are sorted in the background (MIN/MAX/ORDER BY on strings), and dictionary-derived caches (sort order, LIKE bitmaps, string-function maps) are extended incrementally when inserts add strings instead of being rebuilt. VRAM cache: when columns spill to the host tier, scans count reads per segment column and a background thread (every 250 ms) keeps the hottest columns in VRAM, moving colder ones out only for a column 1.5x hotter (copies outside the table lock, pointer swaps under it; `WARPSTORE_NO_VRAM_CACHE=1` keeps the static first-come placement). GPU compression: integer segments are frame-of-reference packed to 8/16/32 bits, low-cardinality DOUBLE segments dictionary-coded, and decimal-valued DOUBLEs (prices like 406.1) stored as 16/32-bit integers / 10^s; on automatically once VRAM is 60% full (`--compress` always, `--no-compress` never). Generated kernels decode through out-of-line loads, so compile time stays flat |
 
 String functions run "encoded": an expression over one string column is evaluated once per
 dictionary entry, and the GPU applies the resulting code map. Expressions the GPU can't evaluate
@@ -406,7 +406,7 @@ and nested JSON_ARRAYAGG, JSON result columns (MYSQL_TYPE_JSON), string comparis
 COALESCE over aggregates in correlated subqueries, result column names, `SET @@session.x`, BINARY,
 prepared-statement result metadata at PREPARE.
 
-### MySQL change data capture (gpu-db as a live copy of MySQL)
+### MySQL change data capture (warpstore as a live copy of MySQL)
 
 ```sql
 CREATE PIPELINE shop_cdc AS LOAD DATA MYSQL 'mysql://cdc:secret@mysql-host:3306/shop' INTO DATABASE shop;
@@ -415,11 +415,11 @@ SHOW PIPELINES;               -- Streaming, transactions / rows applied, last er
 LOAD DATA MYSQL 'mysql://cdc:secret@mysql-host:3306/shop' INTO DATABASE shop_copy;  -- one-off copy
 ```
 
-Point dashboards, analytics and vector / full-text search at gpu-db while MySQL stays the system of
+Point dashboards, analytics and vector / full-text search at warpstore while MySQL stays the system of
 record. The pipeline copies a consistent snapshot of the source's tables (types mapped: integers,
 DECIMAL, dates and times, strings, ENUM / SET, JSON, BIT, ...), then follows the binary log
-(row format: MySQL 8's default) and applies each source transaction as one gpu-db transaction,
-together with the binlog position it reached (`_gpudb_cdc_position`), so a crash resumes exactly
+(row format: MySQL 8's default) and applies each source transaction as one warpstore transaction,
+together with the binlog position it reached (`_warpstore_cdc_position`), so a crash resumes exactly
 once. DDL on the source (CREATE / ALTER / DROP / TRUNCATE / RENAME TABLE) re-copies, drops or empties
 the table. Speed on this machine: 200K-row snapshot 0.7 s; inserts follow in real time; a 100K-row
 UPDATE arrives 1.2 s after it starts. The user needs `SELECT, REPLICATION SLAVE, REPLICATION CLIENT`;
@@ -520,4 +520,4 @@ scripts/           install-deps.sh, test-containers.sh, install-cuvs.sh, fetch-e
 
 GNU Affero General Public License v3.0 (see [LICENSE](LICENSE)), with an additional permission for
 linking the NVIDIA CUDA and cuVS libraries (see [NOTICE](NOTICE), which also lists third-party
-components). Running a modified gpu-db as a network service means offering its source to its users.
+components). Running a modified warpstore as a network service means offering its source to its users.

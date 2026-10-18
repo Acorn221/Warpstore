@@ -1,5 +1,5 @@
 # Backup / restore: full restore, restore under another name, point-in-time restore over a WAL
-# rotation (--wal-archive), S3 (when the gpudb-s3 container is running), and LOAD DATA files that are
+# rotation (--wal-archive), S3 (when the warpstore-s3 container is running), and LOAD DATA files that are
 # deleted before a crash.
 import os, subprocess, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -75,9 +75,9 @@ c.eq("restored databases survive a crash", state("shop_t1"), s1)
 c.eq("LOAD DATA survives deleting its file + crash", q("SELECT COUNT(*), SUM(b) FROM shop.loaded"), [(30000, 900030000)])
 
 # S3 (SeaweedFS container from the ingest tests)
-up = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", "gpudb-s3"], capture_output=True, text=True).stdout.strip() == "true"
+up = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", "warpstore-s3"], capture_output=True, text=True).stdout.strip() == "true"
 if up:
-    cfg = "CONFIG '{\"region\":\"us-east-1\",\"endpoint_url\":\"http://127.0.0.1:18333\"}' CREDENTIALS '{\"aws_access_key_id\":\"gpudbkey\",\"aws_secret_access_key\":\"gpudbsecret\"}'"
+    cfg = "CONFIG '{\"region\":\"us-east-1\",\"endpoint_url\":\"http://127.0.0.1:18333\"}' CREDENTIALS '{\"aws_access_key_id\":\"warpstorekey\",\"aws_secret_access_key\":\"warpstoresecret\"}'"
     try:
         print(q(f"BACKUP DATABASE shop TO S3 'events/backup-test-{os.getpid()}' {cfg}"))
         q(f"RESTORE DATABASE shop AS shop_s3 FROM S3 'events/backup-test-{os.getpid()}' {cfg}")
@@ -85,6 +85,6 @@ if up:
     except Exception as e:
         c.check("S3 backup + restore", False, str(e))
 else:
-    print("(S3 part skipped: gpudb-s3 container not running)")
+    print("(S3 part skipped: warpstore-s3 container not running)")
 srv.stop()
 c.done()

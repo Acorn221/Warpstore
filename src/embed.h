@@ -6,7 +6,7 @@
 
 namespace gdb {
 
-// Loads the model once ($GPUDB_EMBED_MODEL, else ~/.cache/gpudb/models/all-MiniLM-L6-v2: config.json,
+// Loads the model once ($WARPSTORE_EMBED_MODEL, else ~/.cache/warpstore/models/all-MiniLM-L6-v2: config.json,
 // vocab.txt, model.safetensors). False if it can't; embedStatus() says why.
 bool embedAvailable();
 std::string embedStatus();

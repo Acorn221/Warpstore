@@ -1,4 +1,4 @@
-"""Time a query against gpu-db and show where the time goes (PROFILE / SHOW PROFILE).
+"""Time a query against warpstore and show where the time goes (PROFILE / SHOW PROFILE).
 
 usage:
   python bench/qtime.py "SELECT ..."                 # timings + stage breakdown
@@ -8,7 +8,7 @@ usage:
 
 Every option is also plain SQL you can type in the mysql client:
   PROFILE SELECT ...;  SHOW PROFILE;  EXPLAIN SELECT ...;  SHOW PLANCACHE;  SHOW PLAN <id>;
-  SET gpudb_codegen = ON|SYNC|OFF;  SET gpudb_dense_groupby = ON|OFF;  SET gpudb_join_filters = ON|OFF;
+  SET warpstore_codegen = ON|SYNC|OFF;  SET warpstore_dense_groupby = ON|OFF;  SET warpstore_join_filters = ON|OFF;
 """
 import argparse
 import statistics
@@ -19,11 +19,11 @@ import pymysql
 
 VARIANTS = [
     ("all optimizations", []),
-    ("codegen off (interpreter)", ["SET gpudb_codegen = OFF"]),
-    ("dense GROUP BY off", ["SET gpudb_dense_groupby = OFF"]),
-    ("join filters off", ["SET gpudb_join_filters = OFF"]),
+    ("codegen off (interpreter)", ["SET warpstore_codegen = OFF"]),
+    ("dense GROUP BY off", ["SET warpstore_dense_groupby = OFF"]),
+    ("join filters off", ["SET warpstore_join_filters = OFF"]),
 ]
-RESET = ["SET gpudb_codegen = SYNC", "SET gpudb_dense_groupby = ON", "SET gpudb_join_filters = ON"]
+RESET = ["SET warpstore_codegen = SYNC", "SET warpstore_dense_groupby = ON", "SET warpstore_join_filters = ON"]
 
 
 def timed(cur, sql, runs):

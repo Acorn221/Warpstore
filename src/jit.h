@@ -29,7 +29,7 @@ struct JitProgram {
   double totalMs = 0, lastMs = 0;
 };
 
-// Per session (connection thread): SET gpudb_codegen = ON | SYNC | OFF.
+// Per session (connection thread): SET warpstore_codegen = ON | SYNC | OFF.
 //   ON   (default) interpret first: a new query shape runs interpreted while its kernel compiles in
 //        the background; later executions use the compiled plan (SingleStore's interpret_first).
 //   SYNC compile before the first execution (benchmarks).   OFF  always interpret.

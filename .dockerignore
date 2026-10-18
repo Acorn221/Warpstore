@@ -1,6 +1,6 @@
 build
 data
 .venv
-gpudb-data
+warpstore-data
 tests/orm/*/node_modules
 **/__pycache__
