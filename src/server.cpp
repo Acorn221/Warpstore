@@ -1395,6 +1395,8 @@ int main(int argc, char** argv) {
   bool planCacheDirSet = false;
   std::string bindAddr = "127.0.0.1", rootPw, tlsCert, tlsKey;
   bool insecure = false, noTls = false;
+  double memLimitGb = -1;  // host memory for table data (segment columns); default half the RAM, 0: no limit
+  if (const char* v = envSetting("MEMORY_LIMIT")) memLimitGb = atof(v);
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     if (a == "--port" && i + 1 < argc) port = atoi(argv[++i]);
@@ -1413,6 +1415,7 @@ int main(int argc, char** argv) {
     else if (a == "--partitions" && i + 1 < argc) partitions = atoi(argv[++i]);
     else if (a == "--plancache-dir" && i + 1 < argc) planCacheDir = argv[++i], planCacheDirSet = true;
     else if (a == "--vram-limit" && i + 1 < argc) gpuSetVramLimit((int64_t)(atof(argv[++i]) * (1ll << 30)));
+    else if (a == "--memory-limit" && i + 1 < argc) memLimitGb = atof(argv[++i]);
     else if (a == "--http-port" && i + 1 < argc) httpPort = atoi(argv[++i]);
     else if (a == "--data-port" && i + 1 < argc) gDataPort = atoi(argv[++i]);
     else if (a == "--replica-of" && i + 1 < argc) replicaOf = argv[++i];
@@ -1440,7 +1443,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-connections" && i + 1 < argc) g_maxConns = atoi(argv[++i]);
     else if (a == "--insecure-no-root-password") insecure = true;
     else {
-      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [--insecure-no-root-password] [--sync-replica-timeout-ms N] [-v]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--memory-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [--insecure-no-root-password] [--sync-replica-timeout-ms N] [-v]\n", argv[0]);
       return 2;
     }
   }
@@ -1464,6 +1467,14 @@ int main(int argc, char** argv) {
   // Slow query log: <data dir>/slow.log, statements over 1 s (--slow-query-ms, SET GLOBAL long_query_time).
   if (monitor::slowPath.empty() && !dataDir.empty()) monitor::slowPath = dataDir + "/slow.log";
   monitor::slowMs = monitor::slowPath.empty() ? -1 : slowMsArg;
+  {
+    int64_t lim = -1;  // (no limit without a data dir: nothing to evict to)
+    if (memLimitGb > 0) lim = (int64_t)(memLimitGb * (1ll << 30));
+    else if (memLimitGb < 0) lim = (int64_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 2;
+    tierInit(dataDir, lim);
+    if (!dataDir.empty() && lim > 0)
+      fprintf(stderr, "[warpstore] table data in host memory up to %.1f GB, the rest in %s/segments (--memory-limit)\n", lim / 1073741824.0, dataDir.c_str());
+  }
   Engine engine(dataDir, sync, partitions);
   fprintf(stderr, "[warpstore] %d partitions per sharded table\n", partitions);
   engine.recover();

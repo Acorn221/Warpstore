@@ -247,6 +247,28 @@ ClickBench (10M rows, 2.3 GB compressed) with a 0.5 GB budget: hot total 0.83 s 
 the cache, the same as with everything in VRAM (the hot columns fit). TPC-H SF1 still matches DuckDB
 22/22 under `--vram-limit 0.5 --compress`.
 
+### When the data doesn't fit in RAM
+
+ClickBench 10M rows with `--memory-limit` below the table's size (3.8 GB of segment files): the
+column data that doesn't fit is evicted to the segment files, read back when scanned and pushed through
+the GPU in windows (`bench/clickbench/tier.py`, results in
+[bench/comparisons](../bench/comparisons/clickbench_warpstore_tier_0.25gb.jsonl)). "Read from the SSD"
+drops the files from the OS page cache before every query (`posix_fadvise(DONTNEED)`), so the reads
+come from the NVMe drive. DuckDB and ClickHouse are compared with their hot, in-memory times.
+
+| Warpstore setup | All 43 queries | Geomean | vs DuckDB hot (geomean) | vs ClickHouse hot (geomean) |
+|---|---:|---:|---:|---:|
+| everything in memory | 0.27 s | 2.5 ms | 13.4x faster | 23.8x faster |
+| `--memory-limit 2`, files in the OS page cache | 0.98 s | 2.9 ms | 11.7x faster | 20.8x faster |
+| `--memory-limit 2`, read from the SSD | 2.47 s | 3.0 ms | 11.4x faster | 20.3x faster |
+| `--memory-limit 0.25`, files in the OS page cache | 1.45 s | 10.2 ms | 3.3x faster | 5.9x faster |
+| `--memory-limit 0.25`, read from the SSD | 5.20 s | 23.6 ms | 1.4x faster | 2.6x faster |
+
+With 2 GB, the columns ClickBench queries fit and only Q24 (`SELECT *`, every column) reads from
+disk: 0.7 s from the page cache, 2.2 s from the SSD. With 0.25 GB nothing stays: every query reads its
+columns from disk, and the time goes to reading (phase B: reads overlapped with the GPU work, and
+GPUDirect Storage, are not done yet; the reads are synchronous).
+
 ### SingleStore's use cases, head to head (`bench/usecases.py`)
 
 SingleStore markets itself for real-time dashboards, operational (OLTP) lookups, streaming ingest,

@@ -25,7 +25,7 @@ queries and `LOAD DATA LOCAL INFILE` are supported on the wire):
 | Backups | `BACKUP DATABASE d TO '/dir'` or `TO S3 'bucket/prefix' CONFIG .. CREDENTIALS ..` (streamed, multipart above 64 MB): a consistent snapshot plus a manifest with its WAL position. `RESTORE DATABASE d [AS other] FROM '/dir' \| S3 .. [UNTIL TIMESTAMP '2026-10-17 12:00:00']`: with `--wal-archive DIR` rotated WALs are kept (they carry a time marker every second), so a restore can replay up to any point in time. Server-side `LOAD DATA INFILE` loads a copy kept in the data dir, so deleting the source file doesn't lose data on a crash |
 | Observability | `GET /metrics` on the HTTP port (Prometheus: statements by kind, latency histogram, errors, connections, rows, tables / segments / write buffers, VRAM, WAL size / fsyncs / fsync time, replication role / lag / replicas, plan cache, RSS). `SHOW [FULL] PROCESSLIST` / `information_schema.PROCESSLIST` (real sessions), `KILL [QUERY \| CONNECTION] id` (queries stop between execution stages and during loads), `information_schema.QUERY_STATS` (count / errors / total / avg / max ms / rows per statement shape, literals replaced; `FLUSH QUERY_STATS`), slow query log in MySQL's format (`<data dir>/slow.log`, over 1 s by default; `--slow-query-ms`, `SET GLOBAL long_query_time / slow_query_log`), `SELECT SLEEP(n)` |
 | Metadata | information_schema with MySQL 8's column layouts (TABLES, COLUMNS, STATISTICS, KEY_COLUMN_USAGE, TABLE_CONSTRAINTS, REFERENTIAL_CONSTRAINTS, ROUTINES, ...; upper-case column labels like MySQL), system variables with MySQL defaults (`@@sql_mode`, `@@lower_case_table_names`, ..), `mysql` / `sys` / `performance_schema` schemas, SHOW CREATE TABLE / INDEX / FULL TABLES / VARIABLES / TABLE STATUS / PIPELINES, DESCRIBE |
-| Storage | Tables larger than VRAM: segments beyond `--vram-limit` (or when VRAM is full) stay in pinned host RAM and are read over PCIe. `SNAPSHOT` checkpoints and `BACKUP DATABASE .. TO` / `RESTORE` files are columnar (dictionaries + physical column bytes per partition) and zstd-compressed: ClickBench 10M rows snapshot in 10 s to 0.99 GB and restart in 25 s (the earlier row format: 62 s, 1.9 GB, 99 s restart). Older row-format snapshots still load. After loads and restarts, large string dictionaries are sorted in the background (MIN/MAX/ORDER BY on strings), and dictionary-derived caches (sort order, LIKE bitmaps, string-function maps) are extended incrementally when inserts add strings instead of being rebuilt. VRAM cache: when columns spill to the host tier, scans count reads per segment column and a background thread (every 250 ms) keeps the hottest columns in VRAM, moving colder ones out only for a column 1.5x hotter (copies outside the table lock, pointer swaps under it; `WARPSTORE_NO_VRAM_CACHE=1` keeps the static first-come placement). GPU compression: integer segments are frame-of-reference packed to 8/16/32 bits, low-cardinality DOUBLE segments dictionary-coded, and decimal-valued DOUBLEs (prices like 406.1) stored as 16/32-bit integers / 10^s; on automatically once VRAM is 60% full (`--compress` always, `--no-compress` never). Generated kernels decode through out-of-line loads, so compile time stays flat |
+| Storage | Tables larger than RAM: see [Disk tier](#disk-tier-tables-larger-than-ram). Tables larger than VRAM: segments beyond `--vram-limit` (or when VRAM is full) stay in pinned host RAM and are read over PCIe. `SNAPSHOT` checkpoints and `BACKUP DATABASE .. TO` / `RESTORE` files are columnar (dictionaries + physical column bytes per partition) and zstd-compressed: ClickBench 10M rows snapshot in 10 s to 0.99 GB and restart in 25 s (the earlier row format: 62 s, 1.9 GB, 99 s restart). Older row-format snapshots still load. After loads and restarts, large string dictionaries are sorted in the background (MIN/MAX/ORDER BY on strings), and dictionary-derived caches (sort order, LIKE bitmaps, string-function maps) are extended incrementally when inserts add strings instead of being rebuilt. VRAM cache: when columns spill to the host tier, scans count reads per segment column and a background thread (every 250 ms) keeps the hottest columns in VRAM, moving colder ones out only for a column 1.5x hotter (copies outside the table lock, pointer swaps under it; `WARPSTORE_NO_VRAM_CACHE=1` keeps the static first-come placement). GPU compression: integer segments are frame-of-reference packed to 8/16/32 bits, low-cardinality DOUBLE segments dictionary-coded, and decimal-valued DOUBLEs (prices like 406.1) stored as 16/32-bit integers / 10^s; on automatically once VRAM is 60% full (`--compress` always, `--no-compress` never). Generated kernels decode through out-of-line loads, so compile time stays flat |
 
 String functions run "encoded": an expression over one string column is evaluated once per
 dictionary entry, and the GPU applies the resulting code map. Expressions the GPU can't evaluate
@@ -119,6 +119,28 @@ sort (connection close / COMMIT took every table's lock).
 PIN`, `ALTER TABLE t ALTER COLUMN c SET VRAM = NEVER`. PIN columns go to VRAM first, NEVER columns stay
 in host RAM (read over PCIe), AUTO ones are placed by the VRAM cache by heat. `SHOW VRAM` lists every
 column's VRAM / host MB, hint and heat. Hints are part of SHOW CREATE TABLE, so they persist.
+
+### Disk tier (tables larger than RAM)
+
+Column segments (1M rows each, immutable) get a file in `<data dir>/segments`. Under
+`--memory-limit GB` (default: half the machine's RAM; `0`: no limit; `WARPSTORE_MEMORY_LIMIT`), a
+background thread evicts the least-used column data from host memory once 90% of the limit is used,
+down to 80% (writing the segment file first if it has none), and reads columns back, hottest first,
+while under 75%. A query that touches a column that is on disk reads it into the cache if there is
+room, otherwise for the scan only: aggregations and filters run over windows of batches (1/8 of VRAM
+by default, `WARPSTORE_SCAN_WINDOW_MB`) and free each window before reading the next, so one query's
+memory stays bounded however large the table is. `SHOW SEGMENTS FROM t` shows `disk-columnstore` for
+segments with columns on disk; `/metrics` has `warpstore_table_memory_bytes`.
+
+`SNAPSHOT` refers to the segment files instead of copying the data (segments with more than half of
+their rows deleted are still rewritten, which compacts them), so it only writes what changed, and a
+restart takes seconds: tables come back on disk and the cache fills up in the background. Files no
+snapshot or segment uses any more are deleted. `BACKUP` files stay self-contained.
+
+Still in memory, whatever the limit: write buffers (up to 1M rows per partition), primary-key and
+secondary indexes, string dictionaries, deleted-row bitmaps. `ALTER TABLE` rebuilds, `BACKUP` and
+CPU-side DML on many rows read whole columns into memory. Reads from disk are synchronous for now
+(not overlapped with GPU work, no GPUDirect Storage).
 
 ## Usage
 

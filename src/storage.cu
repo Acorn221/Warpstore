@@ -82,14 +82,6 @@ std::shared_ptr<Table> Catalog::get(const std::string& name) {
   return t;
 }
 
-SegData::~SegData() {
-  for (size_t c = 0; c < dev.size(); ++c) {
-    const bool e = c < enc.size() && enc[c];
-    const std::vector<uint8_t>* src = e ? &encHost[c] : c < host.size() ? &host[c] : nullptr;
-    releaseColumn(dev[c], src ? (void*)src->data() : nullptr, src ? src->size() : 0, c < mapped.size() && mapped[c]);
-  }
-}
-
 // (Mirrors and bitmaps come and go with snapshots: from the stream-ordered pool, as cudaMalloc /
 // cudaFree synchronize the whole device.)
 DevMirror::~DevMirror() {
@@ -878,6 +870,11 @@ uint8_t Table::encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std
   return 0;
 }
 
+uint64_t nextSegmentId() {
+  static std::atomic<uint64_t> ids{0};
+  return ++ids;
+}
+
 void Table::flushPart(int part) {
   const std::shared_ptr<WriteBuffer> hold = bufs[part];  // (replaced at the end; snapshots keep it)
   WriteBuffer& buf = *hold;
@@ -901,9 +898,8 @@ void Table::flushPart(int part) {
   }
   for (size_t start = 0; start < live.size(); start += kSegRows) {
     size_t n = std::min<size_t>(kSegRows, live.size() - start);
-    static std::atomic<uint64_t> segIds{0};
     auto seg = std::make_unique<Segment>();
-    seg->id = ++segIds;
+    seg->id = nextSegmentId();
     seg->part = part;
     seg->n = (int64_t)n;
     seg->host.resize(cols.size());
@@ -940,6 +936,7 @@ void Table::flushPart(int part) {
       seg->devBytes += (int64_t)placed.size();
     }
     seg->del->host.assign((n + 31) / 32, 0);
+    segAccount(*seg->d);
     int32_t segId = (int32_t)segs.size();
     if (pk >= 0)
       for (size_t i = 0; i < n; ++i) pkIndex[readInt(seg->host[pk], cols[pk].pt, (int64_t)i)] = Loc{segId, (int32_t)i};

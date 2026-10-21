@@ -119,6 +119,7 @@ class Engine {
   Catalog cat_;
   // VRAM cache: a background thread moves segment columns between VRAM and the host tier by heat.
   void vramBalance();
+  void tierBalance();  // host memory vs the segment files (--memory-limit)
   std::atomic<bool> vramStop_{false};
   std::thread vramTh_;
   std::string dir_;

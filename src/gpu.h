@@ -72,7 +72,11 @@ class GpuAggregator {
   ~GpuAggregator();
   void addBatch(const ExprEnv& env, int ncols, int64_t n, const uint32_t* del);
   void run(const ExprEnv& env, const JitProgram* jit);
-  int batches() const { return (int)bn_.size(); }
+  // Aggregates the batches added so far into the running result and drops them (a scan window: the
+  // batches' column data can go); run() then does the rest.
+  void runWindow(const ExprEnv& env, const JitProgram* jit);
+  int batches() const { return batchesDone_ + (int)bn_.size(); }
+  int windows() const { return windows_; }
   int64_t rowsIn() const;
   bool dense() const { return dense_.G > 0; }
   bool overflowed();
@@ -103,6 +107,8 @@ class GpuAggregator {
   std::vector<int64_t> bn_;
   std::vector<const uint32_t*> bdel_;
   std::vector<ColView> bcols_;
+  int64_t rowsDone_ = 0;
+  int batchesDone_ = 0, windows_ = 0;
 };
 
 // Row selection: indices (int32) of rows passing `where` and not deleted. Returns count.

@@ -3277,6 +3277,11 @@ inline void bindView(ColView& v, const BatchRef& b, int c) {
   v.p = (*b.dev)[c];
   v.enc = b.enc ? (*b.enc)[c] : 0;
   v.off = v.enc ? b.off : 0;
+  if (!v.p && b.seg && (size_t)c < b.seg->d->cold.size()) {  // a cold column (disk tier): load it
+    void* p = segScanColumn(*b.seg->d, c);
+    if (p && b.off && !v.enc) p = (char*)p + (int64_t)b.off * b.seg->d->file->cols[c].width;
+    v.p = p;
+  }
 }
 
 // Visits, partition by partition (ascending), every segment that survives min/max elimination and
@@ -3327,10 +3332,9 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
     for (auto& sp : t.segs) {
       if (sp->part != p || !segMayMatch(*sp, preds, !adjust.count((int32_t)(&sp - t.segs.data())))) continue;
       int64_t lo = 0, hi = sp->n;
-      if (!sortPreds.empty() && (int)sp->host.size() > t.sortKey && !sp->host[t.sortKey].empty()) {
+      if (!sortPreds.empty() && (int)sp->host.size() > t.sortKey && (segCold(*sp->d, t.sortKey) || !sp->host[t.sortKey].empty())) {
         const bool i64 = t.cols[t.sortKey].pt == PType::I64;
-        const void* col = sp->host[t.sortKey].data();
-        auto at = [&](int64_t r) { return i64 ? (double)((const int64_t*)col)[r] : (double)((const int32_t*)col)[r]; };
+        auto at = [&](int64_t r) { return (double)segRawInt(*sp->d, t.sortKey, r, i64); };
         auto lowerB = [&](double v) {  // first row >= v
           int64_t a = 0, b = sp->n;
           while (a < b) { int64_t m = (a + b) / 2; if (at(m) < v) a = m + 1; else b = m; }
@@ -3518,7 +3522,9 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
     jit = jitGet(comp.env, (int)comp.slotCols.size(), fp, JF_FLAGM, "filter");
   }
   // All batches (segments + write buffers) are filtered in one launch with one synchronization;
-  // the selected rows (in batch order) are then gathered column by column across batches.
+  // the selected rows (in batch order) are then gathered column by column across batches. Columns
+  // read from the disk tier for this scan are bounded: once a window of them is collected, it is
+  // filtered and gathered, and the next window starts (the pieces are concatenated at the end).
   int64_t total = 0;
   ScanStats st;
   std::vector<int> need(needCols.begin(), needCols.end());
@@ -3528,6 +3534,37 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
   std::vector<ColView> bcols, srcCols;  // [batch][slot], [batch][need]
   std::vector<int> bpart;
   const int nslots = (int)comp.slotCols.size();
+  std::vector<std::vector<DevVec<uint8_t>>> pieces(need.size());
+  std::vector<int64_t> pieceRows;
+  int windows = 0;
+  auto window = [&] {
+    if (bn.empty()) return;
+    ++windows;
+    DevVec<int32_t> sel;
+    std::vector<int64_t> perBatch;
+    int64_t m = gpuSelectMulti(comp.env, hasFilter, wp, bn, bdel, bcols, nslots, sel, perBatch, jit);
+    if (maxRows >= 0 && total + m > maxRows) m = maxRows - total;
+    int64_t left = m;
+    for (size_t b = 0; b < bn.size(); ++b) {
+      const int64_t k = std::min(left, perBatch[b]);
+      perPart[bpart[b]] += k;
+      left -= k;
+    }
+    std::vector<int64_t> boff(bn.size(), 0);
+    for (size_t b = 1; b < bn.size(); ++b) boff[b] = boff[b - 1] + bn[b - 1];
+    for (size_t ci = 0; ci < need.size(); ++ci) {
+      const int c = need[ci];
+      DevVec<uint8_t> out(std::max<int64_t>(m, 1) * t.colBytes(c));
+      std::vector<ColView> src(bn.size());
+      for (size_t b = 0; b < bn.size(); ++b) src[b] = srcCols[b * need.size() + ci];
+      if (m > 0) gpuGatherMulti(src, boff, t.cols[c].pt, t.colBytes(c), sel.p, m, out.p);
+      pieces[ci].push_back(std::move(out));
+    }
+    pieceRows.push_back(m);
+    total += m;
+    bn.clear(), bdel.clear(), bcols.clear(), srcCols.clear(), bpart.clear();
+    releaseScanTemps();
+  };
   scanTable(t, partsToScan(t, bt, preds), preds, st, [&](const BatchRef& b) {
     bn.push_back(b.n);
     bdel.push_back(b.del);
@@ -3542,22 +3579,10 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
       bindView(v, b, c);
       srcCols.push_back(v);
     }
-    return true;
+    if (scanWindowFull()) window();
+    return !(maxRows >= 0 && total >= maxRows);
   });
-  DevVec<int32_t> sel;
-  std::vector<int64_t> perBatch;
-  total = gpuSelectMulti(comp.env, hasFilter, wp, bn, bdel, bcols, nslots, sel, perBatch, jit);
-  if (maxRows >= 0 && total > maxRows) total = maxRows;
-  {
-    int64_t left = total;
-    for (size_t b = 0; b < bn.size(); ++b) {
-      const int64_t k = std::min(left, perBatch[b]);
-      perPart[bpart[b]] += k;
-      left -= k;
-    }
-  }
-  std::vector<int64_t> boff(bn.size(), 0);
-  for (size_t b = 1; b < bn.size(); ++b) boff[b] = boff[b - 1] + bn[b - 1];
+  window();
   Rel r;
   r.n = total;
   r.tabs.insert(bt);
@@ -3567,11 +3592,19 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
     r.partCols.insert({bt, t.shardKey[0]});
   }
   for (size_t ci = 0; ci < need.size(); ++ci) {
-    int c = need[ci];
-    RelCol rc{bt, c, t.cols[c].pt, DevVec<uint8_t>(std::max<int64_t>(total, 1) * t.colBytes(c)), t.colBytes(c)};
-    std::vector<ColView> src(bn.size());
-    for (size_t b = 0; b < bn.size(); ++b) src[b] = srcCols[b * need.size() + ci];
-    gpuGatherMulti(src, boff, rc.pt, rc.esize, sel.p, total, rc.data.p);
+    const int c = need[ci];
+    RelCol rc{bt, c, t.cols[c].pt, DevVec<uint8_t>(), t.colBytes(c)};
+    if (pieces[ci].size() == 1) {
+      rc.data = std::move(pieces[ci][0]);
+    } else {
+      rc.data = DevVec<uint8_t>(std::max<int64_t>(total, 1) * rc.esize);
+      int64_t off = 0;
+      for (size_t w = 0; w < pieces[ci].size(); ++w) {
+        d2d(rc.data.p + off * rc.esize, pieces[ci][w].p, (size_t)pieceRows[w] * rc.esize);
+        off += pieceRows[w];
+      }
+      pieces[ci].clear();
+    }
     r.cols.push_back(std::move(rc));
   }
   std::string jdesc;
@@ -3580,6 +3613,7 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
                   std::to_string(total) + " rows");
   prof.done(total, std::to_string(st.segsScanned) + "/" + std::to_string(st.segsTotal) + " segments, " +
                        std::to_string(st.rowsScanned + st.bufferRows) + " rows scanned" + jdesc +
+                       (windows > 1 ? ", " + std::to_string(windows) + " disk-tier windows" : "") +
                        (hasFilter ? jit ? ", filter compiled (plan #" + std::to_string(jit->id) + ")" : ", filter interpreted" : ""));
   return r;
 }
@@ -3904,6 +3938,8 @@ std::string Engine::metrics() {
     std::lock_guard<std::mutex> g(pipesMu_);
     metric("warpstore_pipelines", "gauge", "Pipelines defined.", (double)pipes_.size());
   }
+  metric("warpstore_table_memory_bytes", "gauge", "Segment column data in host memory.", (double)tierHostBytes());
+  if (tierEnabled() && tierMemLimit() != INT64_MAX) metric("warpstore_table_memory_limit_bytes", "gauge", "--memory-limit.", (double)tierMemLimit());
   if (FILE* f = fopen("/proc/self/statm", "r")) {
     long pages = 0, res = 0;
     if (fscanf(f, "%ld %ld", &pages, &res) == 2) metric("warpstore_resident_memory_bytes", "gauge", "Resident host memory.", (double)res * sysconf(_SC_PAGESIZE));
@@ -3917,6 +3953,7 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
   vramTh_ = std::thread([this] {
     while (!vramStop_) {
       std::this_thread::sleep_for(std::chrono::milliseconds(250));
+      try { tierBalance(); } catch (std::exception& e) { fprintf(stderr, "[warpstore] memory tier: %s\n", e.what()); }
       try { vramBalance(); } catch (...) {}
     }
   });
@@ -3933,6 +3970,91 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
       if (behind) walSyncNow();
     }
   });
+}
+
+// Host memory under --memory-limit (see SegFile): over 90% of the limit, the coldest column data is
+// evicted to the segment files (written first if needed) until 80% is used; under 75%, cold columns
+// are read back, hottest first (after a restart everything is cold: the cache fills up again).
+void Engine::tierBalance() {
+  if (!tierEnabled()) return;
+  const int64_t limit = tierMemLimit();
+  const int64_t used = tierHostBytes() - tierPendingBytes();
+  struct Ent {
+    std::shared_ptr<Table> t;
+    std::shared_ptr<Segment> seg;
+    int c;
+    float heat;
+    int64_t bytes;
+  };
+  const bool evict = limit != INT64_MAX && used > limit / 10 * 9;
+  const bool warm = limit == INT64_MAX || used < limit / 4 * 3;
+  if (!evict && !warm) return;
+  std::vector<std::shared_ptr<Table>> tabs;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (t->db != "__tmp") tabs.push_back(t);
+  }
+  std::vector<Ent> ents;
+  for (auto& t : tabs) {
+    std::shared_lock<FairSharedMutex> lk(t->mu);
+    std::vector<uint8_t> pinned(t->cols.size(), 0);
+    for (size_t c = 0; c < t->cols.size(); ++c) pinned[c] = t->vramHint((int)c) == 1;
+    for (auto& ix : t->indexes)
+      if (ix.vec && ix.algo == 1) pinned[ix.cols[0]] = 1;  // CAGRA graphs refer to the column's VRAM
+    for (auto& sp : t->segs) {
+      Segment& sg = *sp;
+      if (sg.uses.size() != sg.dev.size() || sg.n == 0 || sg.d->cold.size() != sg.dev.size()) continue;
+      for (size_t c = 0; c < sg.dev.size(); ++c) {
+        const bool cold = segCold(*sg.d, (int)c);
+        if (cold) {  // (present columns' heat is kept by vramBalance)
+          const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
+          sg.heat[c] = sg.heat[c] * 0.9f + (float)u;
+        }
+        if (evict == cold || (evict && pinned[c])) continue;
+        const auto& fc = cold ? sg.d->file->cols[c] : SegFile::Col{};
+        const int64_t b = cold ? (int64_t)fc.len + (fc.enc ? sg.n * (int64_t)fc.width : 0)
+                               : (int64_t)sg.host[c].size() + (sg.enc[c] ? (int64_t)sg.encHost[c].size() : 0);
+        ents.push_back({t, sp, (int)c, sg.heat[c], b});
+      }
+    }
+  }
+  if (evict) {
+    std::stable_sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.heat < b.heat; });  // coldest first
+    int64_t need = used - limit / 10 * 8, got = 0;
+    size_t k = 0;
+    while (k < ents.size() && got < need) got += ents[k++].bytes;
+    ents.resize(k);
+    for (auto& e : ents) segFileEnsure(*e.seg->d, e.seg->n);  // (outside the table lock: the data is immutable)
+    std::map<Table*, std::vector<const Ent*>> byTable;
+    for (auto& e : ents) byTable[e.t.get()].push_back(&e);
+    for (auto& [tp, list] : byTable) {
+      std::vector<std::tuple<std::shared_ptr<SegData>, int, uint32_t>> done;
+      {
+        std::unique_lock<FairSharedMutex> lk(tp->mu);  // no reader of the live table uses the columns now
+        std::set<const Segment*> alive;
+        for (auto& sp : tp->segs) alive.insert(sp.get());
+        for (auto* e : list) {
+          if (!alive.count(e->seg.get())) continue;
+          uint32_t gen = 0;
+          if (segEvictBegin(*e->seg->d, e->c, gen)) done.push_back({e->seg->d, e->c, gen});
+        }
+      }
+      // Queries on snapshots may still read the data: freed once those that started earlier finish.
+      if (!done.empty())
+        rcuDefer([done] {
+          for (auto& [d, c, gen] : done) segEvictFinish(*d, c, gen);
+        });
+    }
+    return;
+  }
+  std::stable_sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.heat > b.heat; });  // hottest first
+  int64_t room = limit == INT64_MAX ? INT64_MAX : limit / 4 * 3 - used, loaded = 0;
+  for (auto& e : ents) {
+    if (loaded >= (256ll << 20) || e.bytes > room - loaded) break;
+    segLoad(*e.seg->d, e.c);
+    loaded += e.bytes;
+  }
 }
 
 // When columns live on the host tier (over --vram-limit, or VRAM was full), keep the columns queries
@@ -3966,6 +4088,7 @@ void Engine::vramBalance() {
       Segment& sg = *sp;
       if (sg.uses.size() != sg.dev.size()) continue;  // GPU-built temp segments: not cacheable
       for (size_t c = 0; c < sg.dev.size(); ++c) {
+        if (segCold(*sg.d, (int)c)) continue;  // (disk tier: tierBalance)
         const std::vector<uint8_t>& h = sg.enc[c] ? sg.encHost[c] : sg.host[c];
         if (!sg.dev[c] || h.empty()) continue;
         const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
@@ -4372,6 +4495,7 @@ void Engine::recover() {
     for (auto& t : all) warmDicts(t);
   }
   walOpen(false);
+  segFilesCleanup();  // segment files of an interrupted snapshot or of segments dropped since
   // CAGRA vector indexes: compile cuVS's kernels and build the segment graphs in the background, so
   // the first vector query doesn't pay for either.
   {
@@ -4392,6 +4516,7 @@ void Engine::recover() {
             const int vc = ix.cols[0];
             for (auto& sp : t->segs) {
               Segment& sg = *sp;
+              if (segCold(*sg.d, vc)) segLoad(*sg.d, vc);  // (graph columns stay in memory)
               if (sg.n < 2048 || !sg.dev[vc] || sg.mapped[vc]) continue;
               std::lock_guard<std::mutex> g(ix.cagra->mu);
               if (ix.cagra->graphs.count(sg.id) || ix.cagra->failed.count(sg.id)) continue;
@@ -4835,7 +4960,11 @@ ResultSet Engine::execute(const std::string& sql) {
 ResultSet Engine::executeStmt(const std::string& sql) {
   if (tExecDepth == 0) tTxnViews.clear();  // visibility bitmaps of the previous statement
   ++tExecDepth;
-  struct Depth { ~Depth() { --tExecDepth; } } depthGuard;
+  struct Depth {
+    ~Depth() {
+      if (--tExecDepth == 0) releaseScanTemps();  // columns read from the disk tier for this statement
+    }
+  } depthGuard;
   {
     ResultSet rr;
     if (routineStatement(sql, rr)) return rr;
@@ -6074,7 +6203,7 @@ ResultSet Engine::doShowMisc(Stmt& s) {
       for (size_t c = 0; c < t->cols.size(); ++c) {
         double vram = 0, host = 0, heat = 0;
         for (auto& sp : t->segs) {
-          if (c >= sp->dev.size() || !sp->dev[c]) continue;
+          if (c >= sp->dev.size() || !sp->dev[c] || segCold(*sp->d, (int)c)) continue;
           const double mb = (double)(sp->enc[c] ? sp->encHost[c].size() : sp->host[c].size()) / 1048576.0;
           (sp->mapped[c] ? host : vram) += mb;
           if (c < sp->heat.size()) heat += sp->heat[c];
@@ -6363,7 +6492,8 @@ ResultSet Engine::doShowSegments(Stmt& s) {
       auto& sg = *t->segs[i];
       if (sg.part != p) continue;
       bool host = std::any_of(sg.mapped.begin(), sg.mapped.end(), [](uint8_t m) { return m != 0; });
-      r.rows.push_back({std::to_string(p), std::to_string(i), host ? "host-columnstore (PCIe)" : "gpu-columnstore",
+      bool disk = std::any_of(sg.d->cold.begin(), sg.d->cold.end(), [](uint8_t m) { return m != 0; });
+      r.rows.push_back({std::to_string(p), std::to_string(i), disk ? "disk-columnstore" : host ? "host-columnstore (PCIe)" : "gpu-columnstore",
                         std::to_string(sg.n), std::to_string(sg.ndel()),
                         std::to_string(sg.n * rowBytes + (sg.n + 31) / 32 * 4),
                         t->sortKey >= 0 ? fmtKey(sg.mn[t->sortKey]) : kNullCell,
@@ -6547,7 +6677,8 @@ ResultSet Engine::doModify(Stmt& s) {
       Segment& sg = *t->segs[si];
       if (!inParts[sg.part] || !segMayMatch(sg, conj)) continue;
       const uint32_t* sdel = sg.delDev();
-      const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0};
+      const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
+      struct Temps { ~Temps() { releaseScanTemps(); } } temps;
       for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
       DevVec<int32_t> idx(sg.n);
       int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
@@ -7046,6 +7177,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         Segment& sg = *t.segs[si];
         if (sg.n == 0 || sg.ndel() == sg.n) continue;
         std::shared_ptr<CagraGraph> g;
+        if (segCold(*sg.d, vc)) segLoad(*sg.d, vc);  // (graph columns stay in memory)
         if (sg.n >= 2048 && sg.dev[vc] && !sg.mapped[vc]) {
           std::lock_guard<std::mutex> lk(vix->cagra->mu);
           auto it = vix->cagra->graphs.find(sg.id);
@@ -7066,7 +7198,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         }
         if (gpuWhere) {  // rows passing WHERE (and not deleted) -> keep-bitset
           const uint32_t* sdel = sg.delDev();
-          const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0};
+          const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
+          struct Temps { ~Temps() { releaseScanTemps(); } } temps;
           for (size_t kk = 0; kk < wcomp.slotCols.size(); ++kk) bindView(wcomp.env.cols[kk], br, wcomp.slotCols[kk].second);
           DevVec<int32_t> idx(sg.n);
           const int64_t m = gpuSelect(wcomp.env, true, wprog, sg.n, sdel, idx.p);
@@ -7991,6 +8124,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         st = ScanStats();
         forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
           a1.addBatch(env, ncols, n, del);
+          if (scanWindowFull()) a1.runWindow(comp.env, jit1), releaseScanTemps();  // (disk tier)
           return true;
         });
         a1.run(comp.env, jit1);
@@ -8069,6 +8203,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         } else {
           forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
             agg.addBatch(env, ncols, n, del);
+            if (scanWindowFull()) agg.runWindow(comp.env, jit), releaseScanTemps();  // (disk tier)
             return true;
           });
         }
@@ -8079,7 +8214,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       if (explain) break;
       agg.run(comp.env, jit);
       const bool overflow = agg.overflowed();
-      pscan.done(agg.rowsIn(), std::to_string(agg.batches()) + " batches in 1 launch, " + method + ", " + codegen +
+      pscan.done(agg.rowsIn(), std::to_string(agg.batches()) + " batches in " + std::to_string(agg.windows() + 1) + (agg.windows() ? " launches (disk tier windows), " : " launch, ") + method + ", " + codegen +
                                    (overflow ? ", hash table overflowed: retrying bigger" : ""));
       if (overflow) {
         int64_t want = std::max<int64_t>(cap * 4, agg.groupCount() * 4);
@@ -11196,7 +11331,23 @@ ResultSet Engine::doSnapshot() {
 
 // Columnar table image: dictionaries, NULL flags, then per partition the live rows' physical column
 // bytes (string columns as dictionary codes). Restoring it skips parsing and per-row inserts.
-void writeColumnar(FILE* f, const Table& t) {
+void putDbl(FILE* f, double v) {
+  uint64_t u;
+  memcpy(&u, &v, 8);
+  putU64(f, u);
+}
+double getDbl(FILE* f) {
+  uint64_t u = 0;
+  getU64(f, u);
+  double v;
+  memcpy(&v, &u, 8);
+  return v;
+}
+
+// refs (snapshot.bin with a data dir): segments that are mostly live are not copied but referred to
+// by their segment file (written now if they have none), with their deleted-row bitmap; their file
+// ids are added to refs. Everything else is written row by row as before (and compacted).
+void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullptr) {
   const size_t nc = t.cols.size();
   putU64(f, (uint64_t)t.nparts);
   for (size_t c = 0; c < nc; ++c) {
@@ -11219,17 +11370,45 @@ void writeColumnar(FILE* f, const Table& t) {
     if (ghosts.count({seg, (int32_t)r})) return true;
     return !deleted && !hidden.count({seg, (int32_t)r});
   };
+  std::vector<std::vector<int32_t>> live(t.segs.size());
+  std::vector<bool> byRef(t.segs.size(), false);
+  for (size_t si = 0; si < t.segs.size(); ++si) {
+    const auto& sg = t.segs[si];
+    for (int64_t r = 0; r < sg->n; ++r)
+      if (keep((int32_t)si, r, sg->del->test(r))) live[si].push_back((int32_t)r);
+    byRef[si] = refs && tierEnabled() && sg->uses.size() == sg->dev.size() && sg->n > 0 && (int64_t)live[si].size() * 2 >= sg->n;
+  }
+  if (refs) {
+    std::vector<size_t> rs;
+    for (size_t si = 0; si < t.segs.size(); ++si)
+      if (byRef[si]) rs.push_back(si);
+    putU64(f, rs.size());
+    for (size_t si : rs) {
+      Segment& sg = *t.segs[si];
+      auto file = segFileEnsure(*sg.d, sg.n);
+      segFileSync(*file);
+      refs->push_back(file->id);
+      putU64(f, (uint64_t)sg.part);
+      putU64(f, (uint64_t)sg.n);
+      putU64(f, file->id);
+      for (size_t c = 0; c < nc; ++c) {
+        putDbl(f, sg.mn[c]);
+        putDbl(f, sg.mx[c]);
+      }
+      std::vector<uint32_t> bits((size_t)(sg.n + 31) / 32, ~0u);  // deleted unless live
+      for (int32_t r : live[si]) bits[r >> 5] &= ~(1u << (r & 31));
+      if (sg.n % 32) bits.back() &= (1u << (sg.n % 32)) - 1;
+      fwrite(bits.data(), 4, bits.size(), f);
+    }
+  }
+  std::vector<uint8_t> tmp;
   for (int p = 0; p < t.nparts; ++p) {
-    std::vector<std::pair<const Segment*, std::vector<int32_t>>> parts;  // live rows per segment
+    std::vector<std::pair<const Segment*, const std::vector<int32_t>*>> parts;  // live rows per segment
     int64_t n = 0;
     for (size_t si = 0; si < t.segs.size(); ++si) {
-      const auto& sg = t.segs[si];
-      if (sg->part != p) continue;
-      std::vector<int32_t> live;
-      for (int64_t r = 0; r < sg->n; ++r)
-        if (keep((int32_t)si, r, sg->del->test(r))) live.push_back((int32_t)r);
-      n += (int64_t)live.size();
-      parts.push_back({sg.get(), std::move(live)});
+      if (t.segs[si]->part != p || byRef[si]) continue;
+      n += (int64_t)live[si].size();
+      parts.push_back({t.segs[si].get(), &live[si]});
     }
     const WriteBuffer& b = *t.bufs[p];
     std::vector<int32_t> blive;
@@ -11250,14 +11429,14 @@ void writeColumnar(FILE* f, const Table& t) {
         }
         for (int32_t r : rows) memcpy(out.data() + o, src + (size_t)r * sz, sz), o += sz;
       };
-      for (auto& [sg, live] : parts) copy(sg->host[c].data(), live, sg->n);
+      for (auto& [sg, lv] : parts) copy(segRawColumn(*sg->d, (int)c, tmp), *lv, sg->n);
       copy(b.cols[c].data(), blive, b.n);
       fwrite(out.data(), 1, out.size(), f);
     }
   }
 }
 
-void readColumnar(FILE* f, Table& t) {
+void readColumnar(FILE* f, Table& t, bool refs = false) {
   const size_t nc = t.cols.size();
   uint64_t np, v;
   getU64(f, np);
@@ -11271,6 +11450,110 @@ void readColumnar(FILE* f, Table& t) {
     getU64(f, v);
     t.hasNull[c] = (uint8_t)v;
   }
+  const bool samePlacement = (int)np == t.nparts || t.nparts == 1;
+  auto place = [&](const std::vector<std::vector<uint8_t>>& colsIn, int dst, const std::vector<int64_t>* rows, size_t cnt) {
+    WriteBuffer& b = *t.bufs[dst];
+    for (size_t c = 0; c < nc; ++c) {
+      const int sz = t.colBytes((int)c);
+      auto& bc = b.cols[c];
+      if (!rows) bc.insert(bc.end(), colsIn[c].begin(), colsIn[c].begin() + cnt * sz);
+      else
+        for (int64_t r : *rows) bc.insert(bc.end(), colsIn[c].begin() + r * sz, colsIn[c].begin() + (r + 1) * sz);
+    }
+    b.n += (int64_t)(rows ? rows->size() : cnt);
+    b.del->host.resize((b.n + 31) / 32, 0);
+    ++b.version;
+  };
+  // Rows of partition p of the snapshot (or of any, when keep is given: only those rows) -> write buffers.
+  auto ingest = [&](const std::vector<std::vector<uint8_t>>& colsIn, uint64_t p, uint64_t n, const std::vector<int64_t>* keepRows) {
+    if (samePlacement) {
+      place(colsIn, t.nparts == 1 ? 0 : (int)p, keepRows, n);
+      return;
+    }
+    // a different partition count: re-hash each row by its shard key
+    std::vector<std::vector<int64_t>> to(t.nparts);
+    std::vector<int64_t> ints(nc);
+    std::vector<double> dbls(nc);
+    auto route = [&](int64_t r) {
+      for (int c : t.shardKey) {
+        const uint8_t* x = colsIn[c].data() + r * t.colBytes(c);
+        if (t.cols[c].pt == PType::F64) memcpy(&dbls[c], x, 8);
+        else if (t.cols[c].pt == PType::I64) memcpy(&ints[c], x, 8);
+        else { int32_t i32; memcpy(&i32, x, 4); ints[c] = i32; }
+      }
+      to[t.partOf(ints, dbls)].push_back(r);
+    };
+    if (keepRows)
+      for (int64_t r : *keepRows) route(r);
+    else
+      for (uint64_t r = 0; r < n; ++r) route((int64_t)r);
+    for (int q = 0; q < t.nparts; ++q) place(colsIn, q, &to[q], 0);
+  };
+  if (refs) {  // segments kept in their files: back as cold segments (columns read when used)
+    uint64_t nref = 0;
+    getU64(f, nref);
+    for (uint64_t i = 0; i < nref; ++i) {
+      uint64_t part, n, id;
+      getU64(f, part);
+      getU64(f, n);
+      getU64(f, id);
+      auto seg = std::make_unique<Segment>();
+      seg->id = nextSegmentId();
+      seg->part = t.nparts == 1 ? 0 : (int)part;
+      seg->n = (int64_t)n;
+      seg->host.resize(nc);
+      seg->dev.assign(nc, nullptr);
+      seg->mapped.assign(nc, 0);
+      seg->uses.assign(nc, 0);
+      seg->heat.assign(nc, 0.f);
+      seg->mn.resize(nc);
+      seg->mx.resize(nc);
+      seg->encHost.resize(nc);
+      for (size_t c = 0; c < nc; ++c) {
+        seg->mn[c] = getDbl(f);
+        seg->mx[c] = getDbl(f);
+      }
+      std::vector<uint32_t> bits((size_t)(n + 31) / 32);
+      if (fread(bits.data(), 4, bits.size(), f) != bits.size()) throw SqlError("truncated snapshot", 1105);
+      seg->d->file = segFileOpen(id, nc, (int64_t)n);
+      seg->enc.resize(nc);
+      for (size_t c = 0; c < nc; ++c) {
+        seg->enc[c] = seg->d->file->cols[c].enc;
+        if (seg->d->file->cols[c].width != (uint32_t)t.colBytes((int)c)) throw SqlError("segment file does not match the table", 1105);
+      }
+      segAccount(*seg->d);
+      seg->d->cold.assign(nc, 1);
+      int64_t ndel = 0;
+      for (uint32_t w : bits) ndel += __builtin_popcount(w);
+      if (!samePlacement) {  // rows go to their new partitions through the write buffers
+        std::vector<std::vector<uint8_t>> colsIn(nc);
+        std::vector<uint8_t> tmp;
+        for (size_t c = 0; c < nc; ++c) {
+          const uint8_t* raw = segRawColumn(*seg->d, (int)c, tmp);
+          colsIn[c].assign(raw, raw + n * t.colBytes((int)c));
+        }
+        std::vector<int64_t> keepRows;
+        for (uint64_t r = 0; r < n; ++r)
+          if (!((bits[r >> 5] >> (r & 31)) & 1u)) keepRows.push_back((int64_t)r);
+        ingest(colsIn, part, n, &keepRows);
+        continue;
+      }
+      seg->del->host = std::move(bits);
+      seg->del->ndel = ndel;
+      const int32_t segId = (int32_t)t.segs.size();
+      if (t.pk >= 0) {
+        std::vector<uint8_t> tmp;
+        const uint8_t* raw = segRawColumn(*seg->d, t.pk, tmp);
+        const PType pt = t.cols[t.pk].pt;
+        for (int64_t r = 0; r < (int64_t)n; ++r) {
+          if (seg->del->test(r)) continue;
+          const int64_t k = pt == PType::I32 ? ((const int32_t*)raw)[r] : pt == PType::I64 ? ((const int64_t*)raw)[r] : (int64_t)((const double*)raw)[r];
+          t.pkIndex[k] = Loc{segId, (int32_t)r};
+        }
+      }
+      t.segs.push_back(std::move(seg));
+    }
+  }
   for (uint64_t p = 0; p < np; ++p) {
     uint64_t n;
     getU64(f, n);
@@ -11279,36 +11562,7 @@ void readColumnar(FILE* f, Table& t) {
       colsIn[c].resize(n * t.colBytes((int)c));
       if (fread(colsIn[c].data(), 1, colsIn[c].size(), f) != colsIn[c].size()) throw SqlError("truncated snapshot", 1105);
     }
-    auto place = [&](int dst, size_t from, size_t cnt, const std::vector<int64_t>* rows) {
-      WriteBuffer& b = *t.bufs[dst];
-      for (size_t c = 0; c < nc; ++c) {
-        const int sz = t.colBytes((int)c);
-        auto& bc = b.cols[c];
-        if (!rows) bc.insert(bc.end(), colsIn[c].begin() + from * sz, colsIn[c].begin() + (from + cnt) * sz);
-        else
-          for (int64_t r : *rows) bc.insert(bc.end(), colsIn[c].begin() + r * sz, colsIn[c].begin() + (r + 1) * sz);
-      }
-      b.n += (int64_t)(rows ? rows->size() : cnt);
-      b.del->host.resize((b.n + 31) / 32, 0);
-      ++b.version;
-    };
-    if ((int)np == t.nparts || t.nparts == 1) {
-      place(t.nparts == 1 ? 0 : (int)p, 0, n, nullptr);
-    } else {  // a different partition count: re-hash each row by its shard key
-      std::vector<std::vector<int64_t>> to(t.nparts);
-      std::vector<int64_t> ints(nc);
-      std::vector<double> dbls(nc);
-      for (uint64_t r = 0; r < n; ++r) {
-        for (int c : t.shardKey) {
-          const uint8_t* x = colsIn[c].data() + r * t.colBytes(c);
-          if (t.cols[c].pt == PType::F64) memcpy(&dbls[c], x, 8);
-          else if (t.cols[c].pt == PType::I64) memcpy(&ints[c], x, 8);
-          else { int32_t i32; memcpy(&i32, x, 4); ints[c] = i32; }
-        }
-        to[t.partOf(ints, dbls)].push_back((int64_t)r);
-      }
-      for (int q = 0; q < t.nparts; ++q) place(q, 0, 0, &to[q]);
-    }
+    ingest(colsIn, p, n, nullptr);
     t.flush(true);  // segments (sorted by the SORT KEY, compressed, primary-key index) right away
   }
   for (auto& ix : t.indexes) t.buildIndex(ix);
@@ -11405,6 +11659,18 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     for (auto& [k, v] : cat_.views)
       if (onlyDb.empty() || k.rfind(lower(onlyDb) + ".", 0) == 0) views[k] = v;
   }
+  const bool v4 = outPath.empty() && tierEnabled();  // snapshot.bin: segments by reference (their files)
+  if (v4)  // write the files first, without quiescing anything (segment data is immutable)
+    for (auto& t : tabs) {
+      std::vector<std::shared_ptr<Segment>> segs;
+      {
+        std::shared_lock<FairSharedMutex> lk(t->mu);
+        for (auto& sp : t->segs)
+          if (sp->uses.size() == sp->dev.size() && sp->n > 0 && sp->ndel() * 2 <= sp->n) segs.push_back(sp);
+      }
+      for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n));
+    }
+  std::vector<uint64_t> refs;
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
   std::sort(tabs.begin(), tabs.end());
   for (auto& t : tabs) locks.emplace_back(t->mu);
@@ -11414,7 +11680,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   const std::string fin = outPath.empty() ? dir_ + "/snapshot.bin" : outPath, tmp = fin + ".tmp";
   FILE* f = fopen(tmp.c_str(), "wb");
   if (!f) throw SqlError("cannot write " + tmp, 1105);
-  fwrite("GDBSNAP3", 1, 8, f);  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables
+  fwrite(v4 ? "GDBSNAP4" : "GDBSNAP3", 1, 8, f);  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables; 4: + segment files
   f = zstdWriter(f);
   putU64(f, dbs.size());
   for (auto& d : dbs) putStr(f, cat_.syncDbs.count(d) ? d + "\x1fSYNC" : d);  // (cat_.mu not needed: dbs only grow under writes, quiesced here)
@@ -11427,7 +11693,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     putStr(f, showCreate(*t));
     putU64(f, (uint64_t)t->autoNext);
     putU64(f, (uint64_t)t->liveRows());
-    writeColumnar(f, *t);
+    writeColumnar(f, *t, v4 ? &refs : nullptr);
     rows += t->liveRows();
   }
   std::vector<std::shared_ptr<Pipeline>> ps;
@@ -11485,9 +11751,11 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     walOpen(true);
     if (wal_) fdatasync(fileno(wal_));
     syncDir(fin);
+    segDirSync();
   }
   if (rename(tmp.c_str(), fin.c_str()) != 0) throw SqlError("cannot install snapshot " + fin, 1105);
   syncDir(fin);
+  if (v4) segFilesInstalled(refs);  // files only the previous snapshot used can go
   if (outPath.empty()) {
     archiveWal(dir_ + "/wal.old");
     archiveLoads(walGen_);
@@ -12034,7 +12302,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
   auto t0 = Clock::now();
   const std::string savedDb = currentDb();
   char magic[8];
-  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '3') {
+  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '4') {
     fclose(f);
     throw SqlError("bad snapshot file " + path, 1105);
   }
@@ -12077,7 +12345,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     auto t = cat_.get(db + "." + cs.table);
     std::unique_lock<FairSharedMutex> lk(t->mu);
     std::vector<Value> row(t->cols.size());
-    if (columnar) readColumnar(f, *t), rows = 0;  // (rows: counted below from the table)
+    if (columnar) readColumnar(f, *t, magic[7] >= '4'), rows = 0;  // (rows: counted below from the table)
     for (uint64_t r = 0; r < rows; ++r) {
       for (auto& v : row) getVal(f, v);
       t->appendRow(row);

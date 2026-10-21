@@ -278,9 +278,20 @@ void GpuAggregator::addBatch(const ExprEnv& env, int ncols, int64_t n, const uin
 }
 
 int64_t GpuAggregator::rowsIn() const {
-  int64_t r = 0;
+  int64_t r = rowsDone_;
   for (int64_t n : bn_) r += n;
   return r;
+}
+
+void GpuAggregator::runWindow(const ExprEnv& env, const JitProgram* jit) {
+  if (bn_.empty()) return;
+  run(env, jit);
+  ++windows_;
+  for (int64_t n : bn_) rowsDone_ += n;
+  batchesDone_ += (int)bn_.size();
+  bn_.clear();
+  bdel_.clear();
+  bcols_.clear();
 }
 
 std::vector<uint8_t> GpuAggregator::sumBitsSlots() const {
@@ -297,10 +308,10 @@ void GpuAggregator::run(const ExprEnv& env, const JitProgram* jit) {
   if (!jit && (plan_.naggs > kInterpAggs || plan_.nkeys > kInterpKeys))
     throw SqlError("this aggregation needs a compiled plan (more than 16 aggregates or 4 GROUP BY keys); codegen failed or is off", 1235);
   const size_t nb = bn_.size();
-  if (nb == 0 && plan_.nkeys) return;
+  if (nb == 0 && (plan_.nkeys || block_)) return;
   // One descriptor for all batches: [n x nb][del x nb][cols x nb*ncols], uploaded asynchronously from
-  // pinned memory. Without GROUP BY the accumulators (initialized here) share the allocation.
-  const size_t accBytes = plan_.nkeys == 0 ? sizeof(double) * kMaxAggs * 2 : 0;  // (+ high words of exact sums)
+  // pinned memory. Without GROUP BY the accumulators (initialized by the first run) share the allocation.
+  const size_t accBytes = plan_.nkeys == 0 && !block_ ? sizeof(double) * kMaxAggs * 2 : 0;  // (+ high words of exact sums)
   const size_t colBytes = 16 * nb + bcols_.size() * sizeof(ColView);
   const size_t envOff = (colBytes + 15) & ~(size_t)15;  // interpreted: the ExprEnv follows (see AggPlan::genv)
   const size_t blobBytes = jit ? colBytes : envOff + sizeof(ExprEnv);

@@ -72,3 +72,15 @@ print("\n| System | Hardware | Rows | All 43 queries, hot | All 43, first run | 
 print("|---|---|---:|---:|---:|---:|")
 print(f"| Sirius ({d['date']}) | NVIDIA H100 (AWS {d['machine']}) | 100M | {sum(S.values()):.2f} s | {sf:.2f} s | {gm([S[q] / (10 * W[q]) for q in Q]):.2f}x Warpstore's time |")
 print(f"| Warpstore | RTX 3080 10 GB | 10M | {sum(W.values()):.2f} s | {sum(WF.values()):.2f} s | — (x10 rows: {10 * sum(W.values()):.1f} s hot) |")
+
+# Disk tier: the table (3.8 GB of segment files) larger than --memory-limit
+print()
+print("| Warpstore setup | All 43 queries | Geomean | vs DuckDB hot (geomean) | vs ClickHouse hot (geomean) |")
+print("|---|---:|---:|---:|---:|")
+for label, f, k in [("everything in memory", "clickbench_warpstore_tier_2gb.jsonl", "memory"),
+                    ("`--memory-limit 2`, files in the OS page cache", "clickbench_warpstore_tier_2gb.jsonl", "limited_pagecache"),
+                    ("`--memory-limit 2`, read from the SSD", "clickbench_warpstore_tier_2gb.jsonl", "limited_ssd"),
+                    ("`--memory-limit 0.25`, files in the OS page cache", "clickbench_warpstore_tier_0.25gb.jsonl", "limited_pagecache"),
+                    ("`--memory-limit 0.25`, read from the SSD", "clickbench_warpstore_tier_0.25gb.jsonl", "limited_ssd")]:
+    T = {r["q"]: cl(r[k]) for r in jl(f)}
+    print(f"| {label} | {sum(T.values()):.2f} s | {gm(list(T.values())) * 1000:.1f} ms | {gm([D[q] / T[q] for q in Q]):.1f}x faster | {gm([CH[q] / T[q] for q in Q]):.1f}x faster |")

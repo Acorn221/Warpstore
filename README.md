@@ -30,13 +30,19 @@ caveats: [docs/benchmarks.md](docs/benchmarks.md).</sub>
 
 ## Trade-offs: should you use it?
 
-Warpstore is fast because it keeps data in memory (hot columns in GPU memory, the rest in host RAM)
-and runs every analytic query as compiled GPU kernels. That shapes what it is good and bad at.
+Warpstore is fast because it keeps the data queries use in memory (hottest columns in GPU memory,
+then host RAM, the rest on disk) and runs every analytic query as compiled GPU kernels. That shapes
+what it is good and bad at.
 
 **The hard limits**
 
-- **Data has to fit in RAM.** Disk holds snapshots and the write-ahead log, not a working set: a table
-  lives in host memory (and as much of it as fits, in VRAM). Plan for host RAM larger than your data.
+- **It is fastest when the columns your queries touch fit in RAM.** Tables can be larger than RAM:
+  column data beyond `--memory-limit` (default: half the RAM) lives in segment files and streams
+  through the GPU in windows when scanned. With ClickBench's working set in memory nothing changes;
+  with only 0.25 GB of RAM for a 3.8 GB table, reading from the SSD, the 43 queries take 5.2 s instead
+  of 0.27 s (still 1.4x DuckDB with its data in memory, see [benchmarks](docs/benchmarks.md#when-the-data-doesnt-fit-in-ram)).
+  Write buffers, primary-key and secondary indexes and string dictionaries still live in RAM, so
+  billions of rows need a lot of it.
 - **An NVIDIA GPU is required** (Turing or newer, CUDA 12). No AMD, Apple or CPU-only mode.
 - **It is young.** One main developer, no production users yet, alpha quality. Clustering exists but
   is experimental; single-node is the tested setup.
@@ -48,8 +54,8 @@ and runs every analytic query as compiled GPU kernels. That shapes what it is go
 
 | | Pick Warpstore when | Pick the other when |
 |---|---|---|
-| **MySQL / MariaDB** | You need dashboards, reports or search over your data in milliseconds instead of seconds (46x to 2,000x faster here), or vectors / embeddings / full-text in SQL. Run it as a live copy of MySQL (change data capture) and keep MySQL as the system of record. | Data larger than RAM, decades of tooling and operational knowledge, strict durability by default, full MySQL compatibility, no GPU in the budget. Point lookups by key are fast in both. |
-| **PostgreSQL** | The same analytics and search speed-ups, through the MySQL protocol and ORMs. | You rely on PostgreSQL's dialect or extensions (PostGIS, pgvector ecosystem, PL/pgSQL), SERIALIZABLE isolation, foreign keys, triggers, or data larger than RAM. |
+| **MySQL / MariaDB** | You need dashboards, reports or search over your data in milliseconds instead of seconds (46x to 2,000x faster here), or vectors / embeddings / full-text in SQL. Run it as a live copy of MySQL (change data capture) and keep MySQL as the system of record. | Data much larger than RAM with random access to it, decades of tooling and operational knowledge, strict durability by default, full MySQL compatibility, no GPU in the budget. Point lookups by key are fast in both. |
+| **PostgreSQL** | The same analytics and search speed-ups, through the MySQL protocol and ORMs. | You rely on PostgreSQL's dialect or extensions (PostGIS, pgvector ecosystem, PL/pgSQL), SERIALIZABLE isolation, foreign keys, triggers. |
 | **SingleStore** | Same model (row-store write buffer, columnar segments, MySQL protocol, SHARD / SORT keys, pipelines) but open source (AGPL), no licence fees, and 87x faster on one machine here. | You need a mature distributed system: high availability across nodes, managed cloud, bottomless storage on object stores for data larger than memory, enterprise support. |
 | **ClickHouse** | You also need transactions, UPDATE / DELETE as ordinary statements, the MySQL protocol for applications and ORMs, and lower latency (24x faster here at 10M rows). | Very large data (billions of rows on disk), append-mostly logs and events, mature clustering, CPU-only servers. |
 | **DuckDB** | A server that many clients and applications share, with transactions, replication and ingest pipelines (13x faster here). | An embedded, in-process engine for notebooks and data science, files (Parquet, CSV) larger than memory, no server and no GPU. |
@@ -64,7 +70,7 @@ SingleStore; a power cut can lose the last ~10 ms, a crash of the process loses 
   (READ COMMITTED and snapshot isolation, MVCC: reads never block writes), information_schema;
   Drizzle, Prisma, SQLAlchemy and the usual drivers work.
 - **Analytics on the GPU**: joins, GROUP BY, window functions, CTEs, subqueries, compiled per query
-  (NVRTC) and cached; all 22 TPC-H queries; columnar compression; data larger than VRAM spills to host RAM.
+  (NVRTC) and cached; all 22 TPC-H queries; columnar compression; tables larger than VRAM spill to host RAM, larger than RAM to disk.
 - **Search and AI in SQL**: vector search with a GPU graph index (cuVS CAGRA), `EMBED()` sentence
   embeddings computed on the GPU, BM25 full-text search, hybrid queries.
 - **Getting data in**: `LOAD DATA` (CSV, JSON, Parquet, ORC, Avro), continuous pipelines from S3 and

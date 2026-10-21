@@ -255,6 +255,53 @@ using DelP = std::shared_ptr<DelBits>;
 DelBits& delForWrite(DelP& d);
 void delSet(DelBits& d, int64_t r);  // marks row r deleted (and patches a current device copy)
 
+// ---- Disk tier: tables larger than host memory. A flushed segment gets a file in <data dir>/segments
+// (written lazily: before its columns are evicted, or by the SNAPSHOT whose manifest refers to it).
+// Under --memory-limit the cache balancer (Engine::vramBalance) evicts the coldest column data from
+// host memory; an evicted ("cold") column is read back from the file when it is used: into the cache
+// while it has room, otherwise for one scan batch only, so scans larger than the budget stream through.
+struct SegFile {
+  uint64_t id = 0;
+  int fd = -1;
+  int64_t rows = 0;
+  bool synced = false;  // fdatasync'd (a snapshot refers only to synced files)
+  struct Col {
+    uint8_t enc;     // ColView::enc of the bytes (0: raw)
+    uint32_t width;  // bytes per row of the raw column
+    uint64_t off, len;
+  };
+  std::vector<Col> cols;
+  ~SegFile();  // closes the file; deletes it unless the installed snapshot refers to it
+};
+struct SegData;
+void tierInit(const std::string& dataDir, int64_t memLimit);  // memLimit < 0: no limit
+bool tierEnabled();                                           // segment files can be written (a data dir)
+int64_t tierMemLimit();                                       // INT64_MAX: none
+int64_t tierHostBytes();                                      // segment column bytes in host memory
+int64_t tierPendingBytes();                                   // evicted, freed once older queries finish
+// The segment's file (written and opened if it has none yet; null without a data dir).
+std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n);
+std::shared_ptr<SegFile> segFileOpen(uint64_t id, size_t ncols, int64_t n);  // throws if missing / bad
+void segFilesInstalled(const std::vector<uint64_t>& ids);  // a snapshot referring to exactly these is installed
+void segFilesCleanup();                                    // startup: deletes files no segment uses
+bool segCold(const SegData& d, int c);
+void segLoad(SegData& d, int c);            // makes a cold column present (host mirror + device copy)
+void* segScanColumn(SegData& d, int c);     // device pointer for one scan batch (see releaseScanTemps)
+void releaseScanTemps();                    // frees this thread's per-batch column copies
+// The column copies read for the current scan window reached the window size: an operator that
+// collects batches for one launch runs on what it has now, then releaseScanTemps().
+bool scanWindowFull();
+const uint8_t* segRawColumn(const SegData& d, int c, std::vector<uint8_t>& tmp);  // raw bytes (cold: into tmp)
+long long segRawInt(SegData& d, int c, int64_t r, bool i64);  // one raw integer (cold: read from the file)
+// Eviction: begin under the table's exclusive lock, finish (frees) once older queries are done.
+// Returns the bytes evicted (0: the column was not evictable).
+int64_t segEvictBegin(SegData& d, int c, uint32_t& gen);
+void segEvictFinish(SegData& d, int c, uint32_t gen);
+void segAccount(SegData& d);  // counts a new segment's host bytes (after it is filled)
+void segFileSync(SegFile& f);  // fdatasync (once)
+void segDirSync();             // fsync of the segments directory (new files' entries)
+uint64_t nextSegmentId();      // Segment::id
+
 // Immutable column data of a segment (shared by the live table's Segment and snapshots of it).
 struct SegData {
   std::vector<std::vector<uint8_t>> host;  // host mirror, per column
@@ -270,6 +317,15 @@ struct SegData {
   std::vector<std::vector<uint8_t>> encHost;
   int64_t devBytes = 0;  // VRAM (or pinned host) bytes of the column copies
   std::vector<double> mn, mx;  // segment elimination metadata
+  // Disk tier (see SegFile). cold[c] (read atomically): the column's bytes are only in the file. A
+  // load or an eviction changes a column's host / device data under loadMu; evicted[c] holds the
+  // device pointer of an eviction whose frees are still deferred (a load before then revives it).
+  std::shared_ptr<SegFile> file;
+  std::mutex loadMu;
+  std::vector<uint8_t> cold;
+  std::vector<uint32_t> gen;
+  std::vector<std::pair<void*, uint8_t>> evicted;
+  int64_t hostBytes = 0;  // host + encHost bytes counted in tierHostBytes
   ~SegData();
 };
 
@@ -544,6 +600,7 @@ struct Table {
   const std::vector<uint8_t>& colData(Loc l, int c) const {
     if (l.seg < 0) return bufs[bufPart(l)]->cols[c];
     Segment& sg = *segs[l.seg];
+    if (segCold(*sg.d, c)) segLoad(*sg.d, c);
     if (sg.host[c].empty() && sg.n > 0 && sg.dev[c] && !sg.enc[c]) fillHostMirror(sg, c);  // GPU-built temp tables
     return sg.host[c];
   }

@@ -98,6 +98,7 @@ TESTS = [
     ("mvcc", "mvcc.py", None, True),
     ("observability", "observability.py", None, True),
     ("crash", "crash.py", None, True),
+    ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),
     ("replication", "replication.py", None, True),
     ("ingest-s3", "ingest_s3.py", lambda: docker_up("warpstore-s3"), True),
