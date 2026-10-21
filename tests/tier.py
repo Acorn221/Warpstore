@@ -53,6 +53,10 @@ def queries(cur, label, deleted=False):
          [("s0", len([i for i in range(lo, N) if i % 50 == 0])), ("s1", len([i for i in range(lo, N) if i % 50 == 1]))])
     c.eq(f"{label}: sort-key range", q(cur, "SELECT COUNT(*), MIN(id), MAX(v) FROM t WHERE id BETWEEN 2500000 AND 2500999"), [(1000, 2500000, 2500999 * 0.5)])
     c.eq(f"{label}: point lookup", q(cur, "SELECT g, v, s FROM t WHERE id = 3333333"), [(333, 3333333 * 0.5, "s33")])
+    top = [i for i in range(N - 1, lo - 1, -1) if i % 1000 == 7][:3]
+    c.eq(f"{label}: top-N, other columns read for the top rows", q(cur, "SELECT * FROM t WHERE g = 7 ORDER BY v DESC LIMIT 3"),
+         [(i, 7, i * 0.5, f"s{i % 50}") for i in top])
+    c.eq(f"{label}: top-N with OFFSET", q(cur, "SELECT s, id FROM t ORDER BY id DESC LIMIT 2 OFFSET 1"), [(f"s{(N - 2) % 50}", N - 2), (f"s{(N - 3) % 50}", N - 3)])
     c.eq(f"{label}: filter", q(cur, "SELECT COUNT(*) FROM t WHERE g = 7 AND v > 1000000"), [(len([i for i in range(2000001, N) if i % 1000 == 7]),)])
 
 

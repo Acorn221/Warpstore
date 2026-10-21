@@ -127,7 +127,8 @@ Column segments (1M rows each, immutable) get a file in `<data dir>/segments`. U
 background thread evicts the least-used column data from host memory once 90% of the limit is used,
 down to 80% (writing the segment file first if it has none), and reads columns back, hottest first,
 while under 75%. A query that touches a column that is on disk reads it into the cache if there is
-room, otherwise for the scan only: aggregations and filters run over windows of batches (1/8 of VRAM
+room, otherwise for the scan only (just the rows of the batch, when the SORT KEY narrows it, read
+ahead on I/O threads for the next segments): aggregations and filters run over windows of batches (1/8 of VRAM
 by default, `WARPSTORE_SCAN_WINDOW_MB`) and free each window before reading the next, so one query's
 memory stays bounded however large the table is. `SHOW SEGMENTS FROM t` shows `disk-columnstore` for
 segments with columns on disk; `/metrics` has `warpstore_table_memory_bytes`.
@@ -139,8 +140,9 @@ snapshot or segment uses any more are deleted. `BACKUP` files stay self-containe
 
 Still in memory, whatever the limit: write buffers (up to 1M rows per partition), primary-key and
 secondary indexes, string dictionaries, deleted-row bitmaps. `ALTER TABLE` rebuilds, `BACKUP` and
-CPU-side DML on many rows read whole columns into memory. Reads from disk are synchronous for now
-(not overlapped with GPU work, no GPUDirect Storage).
+CPU-side DML on many rows read whole columns into memory. `SELECT .. ORDER BY .. LIMIT n` (n up to
+10,000) scans only the filter and ORDER BY columns and reads the others for the n rows it returns. The
+files are not compressed beyond the GPU encodings, and there is no GPUDirect Storage yet.
 
 ## Usage
 

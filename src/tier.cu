@@ -7,6 +7,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <map>
+#include <thread>
+#include <tuple>
 #include <unordered_set>
 #include "devtypes.h"
 #include "gpu.h"
@@ -125,10 +131,13 @@ void loadLocked(SegData& d, int c, int64_t n) {
 }
 
 // This thread's per-batch column copies: device memory (kind 0) or mapped pinned host memory (1).
-thread_local std::vector<std::pair<void*, int>> tTemps;
+struct Temp {
+  void* p;
+  int kind;  // 0 device memory, 2 pinned buffer (back to the pool)
+  size_t cap;
+};
+thread_local std::vector<Temp> tTemps;
 thread_local int64_t tTempBytes = 0;
-thread_local void* tStage = nullptr;
-thread_local size_t tStageCap = 0;
 }  // namespace
 
 void tierInit(const std::string& dataDir, int64_t memLimit) {
@@ -293,57 +302,309 @@ void segLoad(SegData& d, int c) {
   loadLocked(d, c, d.file->rows);
 }
 
-void* segScanColumn(SegData& d, int c) {
+namespace {
+// ---- Reads from the segment files for scans: a small I/O thread pool, pinned host buffers (pooled)
+// and read-ahead of the column a scan is reading for the batches it visits next.
+std::atomic<int64_t> g_readBytes{0};
+
+struct IoPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::function<void()>> q;
+  std::vector<std::thread> th;
+  IoPool() {
+    const int n = std::clamp<int>((int)std::thread::hardware_concurrency(), 4, 16);
+    for (int i = 0; i < n; ++i)
+      th.emplace_back([this] {
+        for (;;) {
+          std::function<void()> f;
+          {
+            std::unique_lock<std::mutex> g(mu);
+            cv.wait(g, [&] { return !q.empty(); });
+            f = std::move(q.front());
+            q.pop_front();
+          }
+          f();
+        }
+      });
+    for (auto& t : th) t.detach();
+  }
+  void submit(std::function<void()> f) {
+    {
+      std::lock_guard<std::mutex> g(mu);
+      q.push_back(std::move(f));
+    }
+    cv.notify_one();
+  }
+};
+IoPool& ioPool() {
+  static IoPool* p = new IoPool();
+  return *p;
+}
+
+// Pinned (and mapped) host buffers by power-of-two size class.
+std::mutex g_pinMu;
+std::map<size_t, std::vector<void*>> g_pinFree;
+int64_t g_pinFreeBytes = 0;
+size_t pinClass(size_t n) {
+  size_t c = 1 << 20;
+  while (c < n) c <<= 1;
+  return c;
+}
+void* pinGet(size_t cap) {
+  {
+    std::lock_guard<std::mutex> g(g_pinMu);
+    auto& v = g_pinFree[cap];
+    if (!v.empty()) {
+      void* p = v.back();
+      v.pop_back();
+      g_pinFreeBytes -= (int64_t)cap;
+      return p;
+    }
+  }
+  void* p = nullptr;
+  CK(cudaHostAlloc(&p, cap, cudaHostAllocMapped | cudaHostAllocPortable));
+  return p;
+}
+void pinPut(void* p, size_t cap);
+// Buffers whose copy to the GPU is queued: back to the pool once their event has completed.
+struct Pending {
+  void* p;
+  size_t cap;
+  cudaEvent_t ev;
+};
+thread_local std::vector<Pending> tPending;
+void pinReap(bool all) {
+  for (size_t i = 0; i < tPending.size();) {
+    auto& x = tPending[i];
+    if (all ? cudaEventSynchronize(x.ev) == cudaSuccess || true : cudaEventQuery(x.ev) == cudaSuccess) {
+      cudaEventDestroy(x.ev);
+      pinPut(x.p, x.cap);
+      x = tPending.back();
+      tPending.pop_back();
+    } else {
+      cudaGetLastError();
+      ++i;
+    }
+  }
+}
+
+void pinPut(void* p, size_t cap) {
+  std::lock_guard<std::mutex> g(g_pinMu);
+  if (g_pinFreeBytes + (int64_t)cap > (1ll << 30)) {  // keep at most 1 GB around
+    cudaFreeHost(p);
+    return;
+  }
+  g_pinFree[cap].push_back(p);
+  g_pinFreeBytes += (int64_t)cap;
+}
+
+// What to read for rows [lo, lo + n) of a column: one piece (raw), or the encoding's header (and
+// dictionary) plus the codes of the rows (encoded; read with ColView::off = 0).
+struct Piece {
+  uint64_t off, len, dst;
+};
+std::vector<Piece> piecesOf(const SegFile::Col& col, int64_t rows, int64_t lo, int64_t n, size_t& total) {
+  if (lo == 0 && n >= rows) {
+    total = col.len;
+    return {{col.off, col.len, 0}};
+  }
+  if (!col.enc) {
+    total = (size_t)n * col.width;
+    return {{col.off + (uint64_t)lo * col.width, total, 0}};
+  }
+  const uint64_t pre = kEncHeader + (col.enc == 4 ? 256 * 8 : 0), w = (uint64_t)encWidth(col.enc);
+  total = pre + n * w + 16;
+  return {{col.off, pre, 0}, {col.off + pre + (uint64_t)lo * w, (uint64_t)n * w, pre}};
+}
+
+void readPieces(const SegFile& f, const std::vector<Piece>& ps, uint8_t* dst) {
+  for (auto& p : ps)
+    if (!preadAll(f.fd, dst + p.dst, p.len, p.off)) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
+  for (auto& p : ps) g_readBytes += (int64_t)p.len;
+}
+
+// Reads pieces with the I/O threads in 8 MB chunks (several requests in flight on the SSD).
+void readParallel(const SegFile& f, const std::vector<Piece>& ps, uint8_t* dst) {
+  constexpr uint64_t kChunk = 8 << 20;
+  std::vector<Piece> chunks;
+  for (auto& p : ps)
+    for (uint64_t o = 0; o < p.len; o += kChunk) chunks.push_back({p.off + o, std::min(kChunk, p.len - o), p.dst + o});
+  if (chunks.size() <= 1) return readPieces(f, chunks, dst);
+  std::mutex m;
+  std::condition_variable cv;
+  size_t left = chunks.size();
+  bool failed = false;
+  for (auto& ch : chunks)
+    ioPool().submit([&, ch] {
+      bool ok = preadAll(f.fd, dst + ch.dst, ch.len, ch.off);
+      std::lock_guard<std::mutex> g(m);
+      failed |= !ok;
+      if (--left == 0) cv.notify_all();
+    });
+  std::unique_lock<std::mutex> g(m);
+  cv.wait(g, [&] { return left == 0; });
+  if (failed) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
+  for (auto& ch : chunks) g_readBytes += (int64_t)ch.len;
+}
+
+// A read-ahead in flight: the column's bytes for one batch, into a pinned buffer.
+struct Fetch {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool done = false, failed = false;
+  void* buf = nullptr;
+  size_t cap = 0, len = 0;
+};
+struct FetchKey {
+  const SegData* d;
+  int c;
+  int64_t lo;
+  bool operator<(const FetchKey& o) const { return std::tie(d, c, lo) < std::tie(o.d, o.c, o.lo); }
+};
+thread_local std::map<FetchKey, std::shared_ptr<Fetch>> tFetches;
+thread_local int64_t tFetchBytes = 0;
+thread_local std::vector<ScanAheadItem> tAhead;
+thread_local size_t tAheadPos = 0;
+int64_t aheadBudget() {
+  static const int64_t b = [] {
+    size_t freeB = 0, total = 0;
+    cudaMemGetInfo(&freeB, &total);
+    return std::clamp<int64_t>((int64_t)total / 16, 64ll << 20, 1ll << 30);
+  }();
+  return b;
+}
+
+void waitFetch(Fetch& f) {
+  std::unique_lock<std::mutex> g(f.mu);
+  f.cv.wait(g, [&] { return f.done; });
+}
+
+// Starts reading column c of the next batches of the scan (the ones that are on disk).
+void readAhead(int c) {
+  int started = 0;
+  for (size_t j = tAheadPos + 1; j < tAhead.size() && started < 8 && tFetchBytes < aheadBudget(); ++j) {
+    const ScanAheadItem& it = tAhead[j];
+    if (!segCold(*it.d, c) || tFetches.count({it.d, c, it.lo})) continue;
+    auto file = it.d->file;
+    const auto& col = file->cols[c];
+    if (it.lo == 0 && it.n >= file->rows && g_hostBytes + (int64_t)col.len + (col.enc ? file->rows * (int64_t)col.width : 0) <= g_memLimit)
+      continue;  // (it goes into the cache when the scan gets to it)
+    size_t total = 0;
+    auto ps = piecesOf(file->cols[c], file->rows, it.lo, it.n, total);
+    auto f = std::make_shared<Fetch>();
+    f->len = total;
+    f->cap = pinClass(std::max<size_t>(total, 1));
+    tFetches[{it.d, c, it.lo}] = f;
+    tFetchBytes += (int64_t)f->cap;
+    ++started;
+    ioPool().submit([f, file, ps] {
+      bool ok = true;
+      try {
+        f->buf = pinGet(f->cap);
+        readPieces(*file, ps, (uint8_t*)f->buf);
+      } catch (...) {
+        ok = false;
+      }
+      std::lock_guard<std::mutex> g(f->mu);
+      f->failed = !ok;
+      f->done = true;
+      f->cv.notify_all();
+    });
+  }
+}
+}  // namespace
+
+void scanAheadExchange(std::vector<ScanAheadItem>& items, size_t& pos) {
+  std::swap(tAhead, items);
+  std::swap(tAheadPos, pos);
+}
+void scanAheadAt(size_t pos) { tAheadPos = pos; }
+int64_t tierReadBytes() { return g_readBytes; }
+
+void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased) {
+  rebased = false;
   if (!segCold(d, c)) return d.dev[c];
+  const bool whole = lo == 0 && n >= d.file->rows;
+  auto it = tFetches.find({&d, c, lo});
   {
     std::lock_guard<std::mutex> g(d.loadMu);
     if (!d.cold[c] || revive(d, c)) return d.dev[c];
     const auto& col = d.file->cols[c];
     const int64_t need = (int64_t)col.len + (col.enc ? (int64_t)d.file->rows * col.width : 0);
-    if (g_hostBytes + need <= g_memLimit) {  // room in the cache
+    if (whole && it == tFetches.end() && g_hostBytes + need <= g_memLimit) {  // room in the cache
       loadLocked(d, c, d.file->rows);
       return d.dev[c];
     }
   }
-  // Over the budget: a copy for this batch only.
-  const auto& col = d.file->cols[c];
-  const size_t len = std::max<size_t>(col.len, 1);
-  tTempBytes += (int64_t)len;
-  void* p = nullptr;
-  if (cudaMallocAsync(&p, len, 0) == cudaSuccess) {
-    if (tStageCap < len) {
-      if (tStage) cudaFreeHost(tStage);
-      tStageCap = std::max(len, tStageCap * 2);
-      CK(cudaMallocHost(&tStage, tStageCap));
+  // Over the budget: the rows of this batch, for this scan only (read ahead if possible).
+  std::shared_ptr<Fetch> f;
+  if (it != tFetches.end()) {
+    f = it->second;
+    tFetches.erase(it);
+    waitFetch(*f);
+    tFetchBytes -= (int64_t)f->cap;
+    if (f->failed) {
+      if (f->buf) pinPut(f->buf, f->cap);
+      throw SqlError("cannot read segment file " + pathOf(d.file->id), 1105);
     }
-    readCol(*d.file, c, tStage);
-    CK(cudaMemcpyAsync(p, tStage, col.len, cudaMemcpyHostToDevice, 0));
-    CK(cudaStreamSynchronize(0));  // (the staging buffer is reused for the next column)
-    tTemps.push_back({p, 0});
+  } else {
+    size_t total = 0;
+    auto ps = piecesOf(d.file->cols[c], d.file->rows, lo, n, total);
+    f = std::make_shared<Fetch>();
+    f->len = total;
+    f->cap = pinClass(std::max<size_t>(total, 1));
+    f->buf = pinGet(f->cap);
+    try {
+      readParallel(*d.file, ps, (uint8_t*)f->buf);
+    } catch (...) {
+      pinPut(f->buf, f->cap);
+      throw;
+    }
+  }
+  pinReap(false);
+  readAhead(c);
+  rebased = !whole;
+  tTempBytes += (int64_t)f->len;
+  void* p = nullptr;
+  if (cudaMallocAsync(&p, std::max<size_t>(f->len, 1), 0) == cudaSuccess) {
+    CK(cudaMemcpyAsync(p, f->buf, f->len, cudaMemcpyHostToDevice, 0));
+    tTemps.push_back({p, 0, 0});
+    cudaEvent_t ev;
+    CK(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming));
+    CK(cudaEventRecord(ev, 0));
+    tPending.push_back({f->buf, f->cap, ev});  // (reused once the copy has run)
     return p;
   }
-  cudaGetLastError();  // VRAM full: pinned host memory the kernels read over PCIe
-  void* h = nullptr;
-  CK(cudaHostAlloc(&h, len, cudaHostAllocMapped | cudaHostAllocPortable));
-  tTemps.push_back({h, 1});
-  readCol(*d.file, c, h);
-  void* dp = nullptr;
-  CK(cudaHostGetDevicePointer(&dp, h, 0));
-  return dp;
+  cudaGetLastError();  // VRAM full: the kernels read the pinned buffer over PCIe
+  tTemps.push_back({f->buf, 2, f->cap});
+  CK(cudaHostGetDevicePointer(&p, f->buf, 0));
+  return p;
 }
 
 void releaseScanTemps() {
   if (tTemps.empty()) return;
   bool synced = false;
-  for (auto [p, kind] : tTemps) {
-    if (kind == 0) cudaFreeAsync(p, 0);
+  for (auto& t : tTemps) {
+    if (t.kind == 0) cudaFreeAsync(t.p, 0);
     else {
-      if (!synced) cudaStreamSynchronize(0), synced = true;
-      cudaFreeHost(p);
+      if (!synced) cudaStreamSynchronize(0), synced = true;  // (copies and kernels reading it are done)
+      pinPut(t.p, t.cap);
     }
   }
   tTemps.clear();
   tTempBytes = 0;
+}
+
+void releaseStatementTemps() {
+  releaseScanTemps();
+  pinReap(true);
+  for (auto& [k, f] : tFetches) {  // read-aheads the scans did not get to
+    waitFetch(*f);
+    if (f->buf) pinPut(f->buf, f->cap);
+  }
+  tFetches.clear();
+  tFetchBytes = 0;
 }
 
 bool scanWindowFull() {
@@ -395,6 +656,19 @@ long long segRawInt(SegData& d, int c, int64_t r, bool i64) {
   v.enc = col.enc;
   v.t = col.width == 4 ? 0 : 1;
   return encInt(v, 0);
+}
+
+void segRawCell(SegData& d, int c, int64_t r, uint8_t* out) {
+  const auto& col = d.file->cols[c];
+  if (!col.enc) {
+    if (!preadAll(d.file->fd, out, col.width, col.off + (uint64_t)r * col.width)) throw SqlError("cannot read segment file", 1105);
+    return;
+  }
+  const uint64_t pre = kEncHeader + (col.enc == 4 ? 256 * 8 : 0), w = (uint64_t)encWidth(col.enc);
+  std::vector<uint8_t> buf(pre + 8, 0);
+  if (!preadAll(d.file->fd, buf.data(), pre, col.off) || !preadAll(d.file->fd, buf.data() + pre, w, col.off + pre + (uint64_t)r * w))
+    throw SqlError("cannot read segment file", 1105);
+  decodeInto(SegFile::Col{col.enc, col.width, 0, 0}, buf.data(), 1, out);
 }
 
 int64_t segEvictBegin(SegData& d, int c, uint32_t& gen) {

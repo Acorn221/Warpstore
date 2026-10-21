@@ -3277,9 +3277,11 @@ inline void bindView(ColView& v, const BatchRef& b, int c) {
   v.p = (*b.dev)[c];
   v.enc = b.enc ? (*b.enc)[c] : 0;
   v.off = v.enc ? b.off : 0;
-  if (!v.p && b.seg && (size_t)c < b.seg->d->cold.size()) {  // a cold column (disk tier): load it
-    void* p = segScanColumn(*b.seg->d, c);
-    if (p && b.off && !v.enc) p = (char*)p + (int64_t)b.off * b.seg->d->file->cols[c].width;
+  if (!v.p && b.seg && (size_t)c < b.seg->d->cold.size()) {  // a cold column (disk tier): read it
+    bool rebased = false;
+    void* p = segScanColumn(*b.seg->d, c, b.off, b.n, rebased);
+    if (rebased) v.off = 0;  // (only the batch's rows were read)
+    else if (p && b.off && !v.enc) p = (char*)p + (int64_t)b.off * b.seg->d->file->cols[c].width;
     v.p = p;
   }
 }
@@ -3327,7 +3329,15 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
     tTxnViews.push_back(d);
     return d->p;
   };
-  std::vector<void*> adj;
+  // The batches to visit, in order: per partition its segments (after elimination, narrowed to
+  // sort-key ranges), then its write buffer (sp null).
+  struct Visit {
+    int p;
+    Segment* sp;
+    int32_t si;
+    int64_t lo, hi;
+  };
+  std::vector<Visit> plan;
   for (int p : parts) {
     for (auto& sp : t.segs) {
       if (sp->part != p || !segMayMatch(*sp, preds, !adjust.count((int32_t)(&sp - t.segs.data())))) continue;
@@ -3354,20 +3364,47 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
         lo &= ~(int64_t)31;  // the deleted-row bitmap is addressed in 32-row words
       }
       if (lo >= hi) continue;
+      plan.push_back({p, sp.get(), (int32_t)(&sp - t.segs.data()), lo, hi});
+    }
+    plan.push_back({p, nullptr, -1, 0, 0});
+  }
+  // Read-ahead of columns on disk follows this order (restored for an enclosing scan).
+  std::vector<ScanAheadItem> ahead;
+  for (auto& v : plan)
+    if (v.sp && v.sp->d->file) ahead.push_back({v.sp->d.get(), v.lo, v.hi - v.lo});
+  size_t aheadPos = 0;
+  if (!dryRun) scanAheadExchange(ahead, aheadPos);
+  struct Restore {
+    std::vector<ScanAheadItem>& a;
+    size_t& pos;
+    bool on;
+    ~Restore() {
+      if (on) scanAheadExchange(a, pos);
+    }
+  } restore{ahead, aheadPos, !dryRun};
+  size_t aheadAt = 0;
+  std::vector<void*> adj;
+  for (auto& vis : plan) {
+    const int p = vis.p;
+    if (vis.sp) {
+      Segment* sp = vis.sp;
+      const int64_t lo = vis.lo, hi = vis.hi;
       ++st.segsScanned;
       st.rowsScanned += hi - lo;
       st.segRows += sp->n;
       if (dryRun) continue;
-      const uint32_t* segDel = viewDel((int32_t)(&sp - t.segs.data()), *sp->del, sp->n);
+      if (sp->d->file) scanAheadAt(aheadAt++);
+      const uint32_t* segDel = viewDel(vis.si, *sp->del, sp->n);
       if (lo == 0 && hi == sp->n) {
-        if (!fn(BatchRef{p, sp->n, &sp->dev, segDel, &sp->enc, 0, sp.get()})) return;
+        if (!fn(BatchRef{p, sp->n, &sp->dev, segDel, &sp->enc, 0, sp})) return;
         continue;
       }
       // Raw columns: shift the pointer; encoded ones (header first): pass the row offset.
       adj.assign(sp->dev.size(), nullptr);
       for (size_t c = 0; c < sp->dev.size(); ++c)
         adj[c] = sp->dev[c] && !sp->enc[c] ? (void*)((char*)sp->dev[c] + lo * t.colBytes((int)c)) : sp->dev[c];
-      if (!fn(BatchRef{p, hi - lo, &adj, segDel ? segDel + lo / 32 : nullptr, &sp->enc, (int32_t)lo, sp.get()})) return;
+      if (!fn(BatchRef{p, hi - lo, &adj, segDel ? segDel + lo / 32 : nullptr, &sp->enc, (int32_t)lo, sp})) return;
+      continue;
     }
     WriteBuffer& b = *t.bufs[p];
     if (b.n > 0) {
@@ -3487,8 +3524,19 @@ struct JoinFilter {
 
 // Filter table bt with pushed-down predicates (and join filters) and gather the needed columns
 // into VRAM.
+// Raw stored bytes of one cell (a column on disk is read from its segment file).
+void cellRaw(const Table& t, Loc l, int c, uint8_t* out) {
+  if (l.seg >= 0 && segCold(*t.segs[l.seg]->d, c)) {
+    segRawCell(*t.segs[l.seg]->d, c, l.row, out);
+    return;
+  }
+  const int w = t.colBytes(c);
+  memcpy(out, t.colData(l, c).data() + (size_t)l.row * w, w);
+}
+
+// locs: also the location of every output row (late materialization of other columns).
 Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std::set<int>& needCols, int64_t maxRows,
-                std::vector<std::string>& notes, const std::vector<JoinFilter>& jfs = {}) {
+                std::vector<std::string>& notes, const std::vector<JoinFilter>& jfs = {}, std::vector<Loc>* locs = nullptr) {
   Table& t = *ctx.tabs[bt];
   ProfStage prof("scan+filter " + t.name);
   Compiler comp(&ctx);
@@ -3533,6 +3581,10 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
   std::vector<const uint32_t*> bdel;
   std::vector<ColView> bcols, srcCols;  // [batch][slot], [batch][need]
   std::vector<int> bpart;
+  std::vector<Loc> bloc;  // locs: each batch's first row
+  std::unordered_map<const Segment*, int32_t> segIndex;
+  if (locs)
+    for (size_t i = 0; i < t.segs.size(); ++i) segIndex[t.segs[i].get()] = (int32_t)i;
   const int nslots = (int)comp.slotCols.size();
   std::vector<std::vector<DevVec<uint8_t>>> pieces(need.size());
   std::vector<int64_t> pieceRows;
@@ -3552,6 +3604,13 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
     }
     std::vector<int64_t> boff(bn.size(), 0);
     for (size_t b = 1; b < bn.size(); ++b) boff[b] = boff[b - 1] + bn[b - 1];
+    if (locs && m > 0) {
+      size_t b = 0;
+      for (int32_t g : sel.download(m)) {
+        while (b + 1 < bn.size() && boff[b + 1] <= g) ++b;
+        locs->push_back(Loc{bloc[b].seg, (int32_t)(bloc[b].row + (g - boff[b]))});
+      }
+    }
     for (size_t ci = 0; ci < need.size(); ++ci) {
       const int c = need[ci];
       DevVec<uint8_t> out(std::max<int64_t>(m, 1) * t.colBytes(c));
@@ -3562,13 +3621,14 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
     }
     pieceRows.push_back(m);
     total += m;
-    bn.clear(), bdel.clear(), bcols.clear(), srcCols.clear(), bpart.clear();
+    bn.clear(), bdel.clear(), bcols.clear(), srcCols.clear(), bpart.clear(), bloc.clear();
     releaseScanTemps();
   };
   scanTable(t, partsToScan(t, bt, preds), preds, st, [&](const BatchRef& b) {
     bn.push_back(b.n);
     bdel.push_back(b.del);
     bpart.push_back(b.part);
+    if (locs) bloc.push_back(b.seg ? Loc{segIndex.at(b.seg), b.off} : bufLoc(b.part, 0));
     for (int k = 0; k < nslots; ++k) {
       ColView v = comp.env.cols[k];
       bindView(v, b, comp.slotCols[k].second);
@@ -3939,6 +3999,7 @@ std::string Engine::metrics() {
     metric("warpstore_pipelines", "gauge", "Pipelines defined.", (double)pipes_.size());
   }
   metric("warpstore_table_memory_bytes", "gauge", "Segment column data in host memory.", (double)tierHostBytes());
+  metric("warpstore_disk_read_bytes_total", "counter", "Column data read from segment files by scans.", (double)tierReadBytes());
   if (tierEnabled() && tierMemLimit() != INT64_MAX) metric("warpstore_table_memory_limit_bytes", "gauge", "--memory-limit.", (double)tierMemLimit());
   if (FILE* f = fopen("/proc/self/statm", "r")) {
     long pages = 0, res = 0;
@@ -4962,7 +5023,7 @@ ResultSet Engine::executeStmt(const std::string& sql) {
   ++tExecDepth;
   struct Depth {
     ~Depth() {
-      if (--tExecDepth == 0) releaseScanTemps();  // columns read from the disk tier for this statement
+      if (--tExecDepth == 0) releaseStatementTemps();  // columns read from the disk tier for this statement
     }
   } depthGuard;
   {
@@ -8569,11 +8630,32 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     }());
   }
   Rel rel;
+  // Top-N over a table with columns on disk: only the filter / ORDER BY columns are scanned (with
+  // each row's location); the other columns are read for the N rows that are left.
+  std::set<int> deferred;
+  std::vector<Loc> lateLocs;
+  if (ctx.tabs.size() == 1 && !hostMode && !orderBy.empty() && s.limit >= 0 && s.offset + s.limit <= 10000 && !tRawNumber) {
+    std::set<std::pair<int, int>> early;
+    for (auto& o : orderBy) colsOf(o.e, early);
+    for (auto& p : pushdown[0]) colsOf(p, early);
+    for (auto& p : residual) colsOf(p, early);
+    const Table& t0 = *ctx.tabs[0];
+    bool cold = false;
+    for (int c : needOf(0)) {
+      if (early.count({0, c})) continue;
+      deferred.insert(c);
+      for (auto& sp : t0.segs) cold = cold || segCold(*sp->d, c);
+    }
+    if (!cold || deferred.size() == needOf(0).size()) deferred.clear();
+  }
   if (ctx.tabs.size() == 1) {
     int64_t maxRows = orderBy.empty() && s.limit >= 0 && hostFilt.empty() ? s.offset + s.limit : -1;
     notes.push_back("GPU filter + gather (late materialization)" + std::string(maxRows >= 0 ? ", early stop at LIMIT" : ""));
     if (explain) return explainResult();
-    rel = materialize(ctx, 0, pushdown[0], needOf(0), maxRows, notes);
+    std::set<int> need = needOf(0);
+    for (int c : deferred) need.erase(c);
+    rel = materialize(ctx, 0, pushdown[0], need, maxRows, notes, {}, deferred.empty() ? nullptr : &lateLocs);
+    for (int c : deferred) rel.cols.push_back(RelCol{0, c, ctx.tabs[0]->cols[c].pt, DevVec<uint8_t>(16), ctx.tabs[0]->colBytes(c)});  // (filled for the top N below)
   } else {
     notes.push_back("GPU join pipeline (EXPLAIN runs the joins to report the actual strategy):");
     rel = buildJoin();
@@ -8698,6 +8780,33 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     }
   }
   psort.done(cnt, std::to_string(m) + " rows in");
+  if (!deferred.empty() && cnt > 0) {  // the top N rows, with the deferred columns read for them
+    ProfStage plate("late materialization");
+    const Table& t0 = *ctx.tabs[0];
+    std::vector<int32_t> fi = finalIdx.download(cnt);
+    Rel top;
+    top.n = cnt;
+    for (auto& rc : rel.cols) {
+      RelCol nc{rc.bt, rc.bc, rc.pt, DevVec<uint8_t>(cnt * rc.esize), rc.esize};
+      if (!deferred.count(rc.bc)) {
+        gpuGatherBytes(rc.data.p, rc.esize, finalIdx.p, cnt, nc.data.p, false);
+      } else {
+        std::vector<uint8_t> h((size_t)cnt * rc.esize);
+        parallelFor((size_t)cnt, [&](size_t b, size_t e) {
+          for (size_t r = b; r < e; ++r) cellRaw(t0, lateLocs[fi[r]], rc.bc, h.data() + r * rc.esize);
+        }, 1);
+        h2d(nc.data.p, h.data(), h.size());
+      }
+      top.cols.push_back(std::move(nc));
+    }
+    rel = std::move(top);
+    bindRelCols(comp, rel);
+    std::vector<int32_t> seq(cnt);
+    for (int64_t i = 0; i < cnt; ++i) seq[i] = (int32_t)i;
+    h2d(finalIdx.p, seq.data(), cnt * 4);
+    notes.push_back("  late materialization: " + std::to_string(deferred.size()) + " columns read for " + std::to_string(cnt) + " rows");
+    plate.done(cnt, std::to_string(deferred.size()) + " columns read for the top rows");
+  }
   ProfStage pproj("project + format");
   // IN (SELECT int_col ..): only the distinct values matter: deduplicated on the GPU through a bitmap
   // over the column's value range, so only those come back.

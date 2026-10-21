@@ -259,15 +259,26 @@ come from the NVMe drive. DuckDB and ClickHouse are compared with their hot, in-
 | Warpstore setup | All 43 queries | Geomean | vs DuckDB hot (geomean) | vs ClickHouse hot (geomean) |
 |---|---:|---:|---:|---:|
 | everything in memory | 0.27 s | 2.5 ms | 13.4x faster | 23.8x faster |
-| `--memory-limit 2`, files in the OS page cache | 0.98 s | 2.9 ms | 11.7x faster | 20.8x faster |
-| `--memory-limit 2`, read from the SSD | 2.47 s | 3.0 ms | 11.4x faster | 20.3x faster |
-| `--memory-limit 0.25`, files in the OS page cache | 1.45 s | 10.2 ms | 3.3x faster | 5.9x faster |
-| `--memory-limit 0.25`, read from the SSD | 5.20 s | 23.6 ms | 1.4x faster | 2.6x faster |
+| `--memory-limit 2`, files in the OS page cache | 0.37 s | 3.0 ms | 11.4x faster | 20.3x faster |
+| `--memory-limit 2`, read from the SSD | 0.36 s | 3.0 ms | 11.3x faster | 20.1x faster |
+| `--memory-limit 0.25`, files in the OS page cache | 0.98 s | 11.5 ms | 2.9x faster | 5.2x faster |
+| `--memory-limit 0.25`, read from the SSD | 1.07 s | 12.2 ms | 2.8x faster | 4.9x faster |
 
-With 2 GB, the columns ClickBench queries fit and only Q24 (`SELECT *`, every column) reads from
-disk: 0.7 s from the page cache, 2.2 s from the SSD. With 0.25 GB nothing stays: every query reads its
-columns from disk, and the time goes to reading (phase B: reads overlapped with the GPU work, and
-GPUDirect Storage, are not done yet; the reads are synchronous).
+How the disk tier keeps this fast:
+
+- **Only the rows a scan needs.** Segments are sorted by the SORT KEY, so `WHERE CounterID = 62`
+  narrows each segment to a small row range; only that range is read from the file (Q37-Q43: about
+  110-200 ms each when whole columns were read, about 20 ms now).
+- **Read-ahead on several threads.** While a scan works on one segment, the column it is reading is
+  already being read for the next segments (I/O threads, several requests in flight on the SSD, into
+  pooled pinned buffers that go back to the pool as soon as their copy to the GPU has run).
+- **Late materialization for top-N.** `SELECT * .. ORDER BY .. LIMIT 10` scans only the filter and
+  ORDER BY columns (with each row's location), sorts, and reads the other columns for the 10 rows left
+  (Q24: 2.9 s reading all 105 columns, 0.12 s now).
+
+Before these three, the 0.25 GB / SSD run took 5.2 s. What is left is mostly reading whole columns for
+full scans (GROUP BY over WatchID / ClientIP): storing the files compressed, and GPUDirect Storage,
+would be next.
 
 ### SingleStore's use cases, head to head (`bench/usecases.py`)
 

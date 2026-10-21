@@ -39,8 +39,8 @@ what it is good and bad at.
 - **It is fastest when the columns your queries touch fit in RAM.** Tables can be larger than RAM:
   column data beyond `--memory-limit` (default: half the RAM) lives in segment files and streams
   through the GPU in windows when scanned. With ClickBench's working set in memory nothing changes;
-  with only 0.25 GB of RAM for a 3.8 GB table, reading from the SSD, the 43 queries take 5.2 s instead
-  of 0.27 s (still 1.4x DuckDB with its data in memory, see [benchmarks](docs/benchmarks.md#when-the-data-doesnt-fit-in-ram)).
+  with only 0.25 GB of RAM for a 3.8 GB table, reading from the SSD, the 43 queries take 1.1 s instead
+  of 0.27 s (still 2.8x DuckDB with its data in memory, see [benchmarks](docs/benchmarks.md#when-the-data-doesnt-fit-in-ram)).
   Write buffers, primary-key and secondary indexes and string dictionaries still live in RAM, so
   billions of rows need a lot of it.
 - **An NVIDIA GPU is required** (Turing or newer, CUDA 12). No AMD, Apple or CPU-only mode.

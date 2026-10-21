@@ -51,15 +51,17 @@ def run(cur, q, before=None):
 
 
 res = [{"q": i + 1} for i in range(len(queries))]
-# 1) everything in memory; SNAPSHOT writes the segment files (and refers to them)
-p, cur = start("0")
-for setup in ("SET collation_connection = utf8mb4_bin", "SET warpstore_codegen = SYNC"):
-    cur.execute(setup)
-cur.execute("SNAPSHOT")
-for i, q in enumerate(queries):
-    run(cur, q)  # compile + warm
-    res[i]["memory"] = min(run(cur, q) for _ in range(3))
-stop(p, cur)
+# 1) everything in memory; SNAPSHOT writes the segment files (and refers to them).
+# WARPSTORE_TIER_LIMITED_ONLY=1: skip this (the data dir already has its segment files).
+if not os.environ.get("WARPSTORE_TIER_LIMITED_ONLY"):
+    p, cur = start("0")
+    for setup in ("SET collation_connection = utf8mb4_bin", "SET warpstore_codegen = SYNC"):
+        cur.execute(setup)
+    cur.execute("SNAPSHOT")
+    for i, q in enumerate(queries):
+        run(cur, q)  # compile + warm
+        res[i]["memory"] = min(run(cur, q) for _ in range(3))
+    stop(p, cur)
 # 2) under the limit: the table starts on disk after the restart
 p, cur = start(limit)
 for setup in ("SET collation_connection = utf8mb4_bin", "SET warpstore_codegen = SYNC"):

@@ -286,13 +286,26 @@ void segFilesInstalled(const std::vector<uint64_t>& ids);  // a snapshot referri
 void segFilesCleanup();                                    // startup: deletes files no segment uses
 bool segCold(const SegData& d, int c);
 void segLoad(SegData& d, int c);            // makes a cold column present (host mirror + device copy)
-void* segScanColumn(SegData& d, int c);     // device pointer for one scan batch (see releaseScanTemps)
-void releaseScanTemps();                    // frees this thread's per-batch column copies
+// Device pointer to column c for a scan batch of rows [lo, lo + n). A cold column is read into the
+// cache (whole batches, while there is room) or for the scan only: then just the batch's rows, and
+// rebased is set (the pointer is to row lo; read encoded columns with ColView::off = 0).
+void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased);
+void releaseScanTemps();       // frees this thread's scan-only column copies (after the kernels using them)
+void releaseStatementTemps();  // ... and read-aheads not used (end of statement)
+// The segment batches the running scan visits, in order, for read-ahead (exchange: save / restore).
+struct ScanAheadItem {
+  SegData* d;
+  int64_t lo, n;
+};
+void scanAheadExchange(std::vector<ScanAheadItem>& items, size_t& pos);
+void scanAheadAt(size_t pos);
+int64_t tierReadBytes();  // bytes read from segment files for scans
 // The column copies read for the current scan window reached the window size: an operator that
 // collects batches for one launch runs on what it has now, then releaseScanTemps().
 bool scanWindowFull();
 const uint8_t* segRawColumn(const SegData& d, int c, std::vector<uint8_t>& tmp);  // raw bytes (cold: into tmp)
-long long segRawInt(SegData& d, int c, int64_t r, bool i64);  // one raw integer (cold: read from the file)
+long long segRawInt(SegData& d, int c, int64_t r, bool i64);
+void segRawCell(SegData& d, int c, int64_t r, uint8_t* out);  // one raw cell of a cold column, from the file  // one raw integer (cold: read from the file)
 // Eviction: begin under the table's exclusive lock, finish (frees) once older queries are done.
 // Returns the bytes evicted (0: the column was not evictable).
 int64_t segEvictBegin(SegData& d, int c, uint32_t& gen);
