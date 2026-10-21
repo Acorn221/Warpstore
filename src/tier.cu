@@ -4,7 +4,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cuda_runtime.h>
+#include <zstd.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <condition_variable>
@@ -37,8 +39,8 @@ std::atomic<uint64_t> g_nextId{1};
 std::mutex g_regMu;
 std::unordered_set<uint64_t> g_live, g_installed;  // files with an open SegFile / in the installed snapshot
 
-constexpr char kMagic[8] = {'W', 'S', 'E', 'G', '0', '0', '0', '1'};
-constexpr uint64_t kAlign = 4096;
+constexpr char kMagic1[8] = {'W', 'S', 'E', 'G', '0', '0', '0', '1'};  // stored as is (reads only)
+constexpr char kMagic2[8] = {'W', 'S', 'E', 'G', '0', '0', '0', '2'};  // + zstd blocks, index at the end
 
 std::string pathOf(uint64_t id) { return g_segDir + "/" + std::to_string(id) + ".wseg"; }
 
@@ -61,10 +63,180 @@ bool pwriteAll(int fd, const void* buf, size_t len, uint64_t off) {
   return true;
 }
 
-void readCol(const SegFile& f, int c, void* dst) {
-  const auto& col = f.cols[c];
-  if (!preadAll(f.fd, dst, col.len, col.off)) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
+std::atomic<int64_t> g_readBytes{0};
+
+// A small I/O thread pool: reads (several requests in flight on the SSD), decompression, compression.
+struct IoPool {
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::function<void()>> q;
+  std::vector<std::thread> th;
+  IoPool() {
+    const int n = std::clamp<int>((int)std::thread::hardware_concurrency(), 4, 16);
+    for (int i = 0; i < n; ++i)
+      th.emplace_back([this] {
+        for (;;) {
+          std::function<void()> f;
+          {
+            std::unique_lock<std::mutex> g(mu);
+            cv.wait(g, [&] { return !q.empty(); });
+            f = std::move(q.front());
+            q.pop_front();
+          }
+          f();
+        }
+      });
+    for (auto& t : th) t.detach();
+  }
+  void submit(std::function<void()> f) {
+    {
+      std::lock_guard<std::mutex> g(mu);
+      q.push_back(std::move(f));
+    }
+    cv.notify_one();
+  }
+};
+IoPool& ioPool() {
+  static IoPool* p = new IoPool();
+  return *p;
 }
+
+
+// Runs fn(i) for i in [0, n) on the I/O threads and waits (fn must not throw).
+void ioParallel(size_t n, const std::function<void(size_t)>& fn) {
+  if (n <= 1) {
+    for (size_t i = 0; i < n; ++i) fn(i);
+    return;
+  }
+  std::mutex m;
+  std::condition_variable cv;
+  size_t left = n;
+  for (size_t i = 0; i < n; ++i)
+    ioPool().submit([&, i] {
+      fn(i);
+      std::lock_guard<std::mutex> g(m);
+      if (--left == 0) cv.notify_all();
+    });
+  std::unique_lock<std::mutex> g(m);
+  cv.wait(g, [&] { return left == 0; });
+}
+
+constexpr uint32_t kBlockRows = 16384;
+uint64_t prefixOf(uint8_t enc) { return enc ? kEncHeader + (enc == 4 ? 256 * 8 : 0) : 0; }
+uint64_t elemOf(const SegFile::Col& col) { return col.enc ? (uint64_t)encWidth(col.enc) : col.width; }
+
+// Size of what readRows produces for rows [lo, lo + n).
+size_t storedSize(const SegFile& f, int c, int64_t lo, int64_t n) {
+  const auto& col = f.cols[c];
+  if (lo == 0 && n >= f.rows) return col.len;
+  return col.enc ? prefixOf(col.enc) + (size_t)n * elemOf(col) + 16 : (size_t)n * col.width;
+}
+
+thread_local ZSTD_DCtx* tDctx = nullptr;
+// This thread's last decompressed blocks (single-row reads: binary searches, late materialization).
+struct BlockCache {
+  uint64_t file = 0;
+  int c = -1;
+  int64_t b = -1;
+  std::vector<uint8_t> data;
+};
+thread_local BlockCache tBlocks[8];
+thread_local unsigned tBlockNext = 0;
+
+// Block b of a compressed column, uncompressed, into out (rows * elem bytes).
+void readBlock(const SegFile& f, const SegFile::Col& col, int64_t b, uint8_t* out, size_t rawLen) {
+  const uint64_t a = col.blocks[b], e = col.blocks[b + 1], clen = e - a;
+  if (clen == rawLen) {
+    if (!preadAll(f.fd, out, rawLen, a)) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
+  } else {
+    std::vector<uint8_t> z(clen);
+    if (!preadAll(f.fd, z.data(), clen, a)) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
+    if (!tDctx) tDctx = ZSTD_createDCtx();
+    const size_t r = ZSTD_decompressDCtx(tDctx, out, rawLen, z.data(), clen);
+    if (ZSTD_isError(r) || r != rawLen) throw SqlError("corrupt segment file " + pathOf(f.id), 1105);
+  }
+  g_readBytes += (int64_t)clen;
+}
+
+// The stored bytes of rows [lo, lo + n) of column c: the whole column as written when the range is
+// all of it, otherwise the rows from lo (encoded columns: header / dictionary, then the rows' codes,
+// read with ColView::off = 0). parallel: blocks on the I/O threads (not from an I/O thread).
+void readRows(const SegFile& f, int c, int64_t lo, int64_t n, uint8_t* dst, bool parallel) {
+  const auto& col = f.cols[c];
+  const bool whole = lo == 0 && n >= f.rows;
+  const uint64_t pre = prefixOf(col.enc), w = elemOf(col);
+  const size_t total = storedSize(f, c, lo, n);
+  auto fail = [&] { throw SqlError("cannot read segment file " + pathOf(f.id), 1105); };
+  if (!col.blockRows) {  // stored as is
+    std::vector<std::array<uint64_t, 3>> ps;  // file offset, length, destination
+    if (whole) ps.push_back({col.off, col.len, 0});
+    else if (!col.enc) ps.push_back({col.off + (uint64_t)lo * w, (uint64_t)n * w, 0});
+    else {
+      ps.push_back({col.off, pre, 0});
+      ps.push_back({col.off + pre + (uint64_t)lo * w, (uint64_t)n * w, pre});
+      memset(dst + pre + n * w, 0, 16);
+    }
+    std::vector<std::array<uint64_t, 3>> chunks;  // 8 MB pieces
+    for (auto& p : ps)
+      for (uint64_t o = 0; o < p[1]; o += 8 << 20) chunks.push_back({p[0] + o, std::min<uint64_t>(8 << 20, p[1] - o), p[2] + o});
+    std::atomic<bool> bad{false};
+    auto one = [&](size_t i) {
+      if (!preadAll(f.fd, dst + chunks[i][2], chunks[i][1], chunks[i][0])) bad = true;
+      g_readBytes += (int64_t)chunks[i][1];
+    };
+    if (parallel) ioParallel(chunks.size(), one);
+    else
+      for (size_t i = 0; i < chunks.size(); ++i) one(i);
+    if (bad) fail();
+    return;
+  }
+  if (pre && !preadAll(f.fd, dst, pre, col.off)) fail();
+  uint8_t* base = dst + pre;
+  const int64_t hi = whole ? f.rows : lo + n;
+  if (total > pre + (uint64_t)(hi - lo) * w) memset(base + (hi - lo) * w, 0, total - pre - (hi - lo) * w);  // (slack after the codes)
+  if (hi <= lo) return;
+  const int64_t B = col.blockRows, b0 = lo / B, b1 = (hi - 1) / B;
+  std::string err;
+  std::mutex errMu;
+  auto one = [&](size_t i) {
+    const int64_t b = b0 + (int64_t)i, r0 = b * B, r1 = std::min<int64_t>(r0 + B, f.rows);
+    const int64_t s0 = std::max(r0, lo), s1 = std::min(r1, hi);  // rows of this block wanted
+    const size_t rawLen = (size_t)(r1 - r0) * w;
+    try {
+      if (s0 == r0 && s1 == r1) {
+        readBlock(f, col, b, base + (r0 - lo) * w, rawLen);
+        return;
+      }
+      if (hi - lo <= 64) {  // a few rows: through this thread's block cache
+        for (auto& e : tBlocks)
+          if (e.file == f.id && e.c == c && e.b == b) {
+            memcpy(base + (s0 - lo) * w, e.data.data() + (s0 - r0) * w, (s1 - s0) * w);
+            return;
+          }
+        BlockCache& e = tBlocks[tBlockNext++ % 8];
+        e.file = 0;
+        e.data.resize(rawLen);
+        readBlock(f, col, b, e.data.data(), rawLen);
+        e.file = f.id, e.c = c, e.b = b;
+        memcpy(base + (s0 - lo) * w, e.data.data() + (s0 - r0) * w, (s1 - s0) * w);
+        return;
+      }
+      std::vector<uint8_t> tmp(rawLen);
+      readBlock(f, col, b, tmp.data(), rawLen);
+      memcpy(base + (s0 - lo) * w, tmp.data() + (s0 - r0) * w, (s1 - s0) * w);
+    } catch (std::exception& ex) {
+      std::lock_guard<std::mutex> g(errMu);
+      err = ex.what();
+    }
+  };
+  const size_t nb = (size_t)(b1 - b0 + 1);
+  if (parallel) ioParallel(nb, one);
+  else
+    for (size_t i = 0; i < nb; ++i) one(i);
+  if (!err.empty()) throw SqlError(err, 1105);
+}
+
+void readCol(const SegFile& f, int c, void* dst) { readRows(f, c, 0, f.rows, (uint8_t*)dst, true); }
 
 // Raw column bytes from the stored ones (decodes a compressed column).
 void decodeInto(const SegFile::Col& col, const uint8_t* stored, int64_t n, uint8_t* raw) {
@@ -188,7 +360,9 @@ bool segCold(const SegData& d, int c) {
   return (size_t)c < d.cold.size() && __atomic_load_n(&d.cold[c], __ATOMIC_ACQUIRE) != 0;
 }
 
-std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n) {
+// Format 2: header (magic, ncols, rows, index offset, index size), the columns' data from 4096 on,
+// then the index: per column enc, width, blockRows, prefix, len, off, block count and offsets.
+std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n, int rawCol) {
   if (g_segDir.empty()) return nullptr;
   std::lock_guard<std::mutex> g(d.loadMu);
   if (d.file) return d.file;
@@ -203,29 +377,91 @@ std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n) {
   f->fd = ::open(pathOf(f->id).c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (f->fd < 0) throw SqlError("cannot write segment file " + pathOf(f->id), 1105);
   f->cols.resize(nc);
-  uint64_t off = (8 + 16 + nc * 24 + kAlign - 1) / kAlign * kAlign;
-  for (size_t c = 0; c < nc; ++c) {  // (no column is cold: a segment without a file has them all)
-    const bool e = d.enc[c] != 0;
-    const std::vector<uint8_t>& b = e ? d.encHost[c] : d.host[c];
-    f->cols[c] = {d.enc[c], (uint32_t)(n ? d.host[c].size() / (size_t)n : 0), off, b.size()};
-    if (!pwriteAll(f->fd, b.data(), b.size(), off)) throw SqlError("cannot write segment file " + pathOf(f->id) + " (disk full?)", 1105);
-    off = (off + b.size() + kAlign - 1) / kAlign * kAlign;
-  }
-  std::vector<uint8_t> hdr(8 + 16 + nc * 24, 0);
-  memcpy(hdr.data(), kMagic, 8);
-  const uint64_t ncols = nc, rows = (uint64_t)n;
-  memcpy(hdr.data() + 8, &ncols, 8);
-  memcpy(hdr.data() + 16, &rows, 8);
+  // Compress every block of every column on the I/O threads (no column is cold: a segment without
+  // a file has them all).
+  struct Job {
+    size_t c;
+    int64_t b;
+  };
+  std::vector<Job> jobs;
+  std::vector<std::vector<std::vector<uint8_t>>> z(nc);  // [column][block]: compressed, or empty = as is
   for (size_t c = 0; c < nc; ++c) {
-    uint8_t* p = hdr.data() + 24 + c * 24;
-    p[0] = f->cols[c].enc;
-    memcpy(p + 4, &f->cols[c].width, 4);
-    memcpy(p + 8, &f->cols[c].off, 8);
-    memcpy(p + 16, &f->cols[c].len, 8);
+    auto& col = f->cols[c];
+    const std::vector<uint8_t>& bytes = d.enc[c] ? d.encHost[c] : d.host[c];
+    col.enc = d.enc[c];
+    col.width = (uint32_t)(n ? d.host[c].size() / (size_t)n : 0);
+    col.len = bytes.size();
+    const uint64_t w = elemOf(col);
+    if ((int)c == rawCol || n < 4096 || w == 0) continue;
+    col.blockRows = kBlockRows;
+    col.prefix = prefixOf(col.enc);
+    const int64_t nb = (n + kBlockRows - 1) / kBlockRows;
+    z[c].resize(nb);
+    for (int64_t b = 0; b < nb; ++b) jobs.push_back({c, b});
   }
-  if (!pwriteAll(f->fd, hdr.data(), hdr.size(), 0)) throw SqlError("cannot write segment file " + pathOf(f->id), 1105);
+  ioParallel(jobs.size(), [&](size_t i) {
+    static thread_local ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    const Job& j = jobs[i];
+    const auto& col = f->cols[j.c];
+    const std::vector<uint8_t>& bytes = d.enc[j.c] ? d.encHost[j.c] : d.host[j.c];
+    const uint64_t w = elemOf(col);
+    const int64_t r0 = j.b * kBlockRows, r1 = std::min<int64_t>(r0 + kBlockRows, n);
+    const uint8_t* src = bytes.data() + col.prefix + r0 * w;
+    const size_t len = (size_t)(r1 - r0) * w;
+    std::vector<uint8_t> out(ZSTD_compressBound(len));
+    const size_t k = ZSTD_compressCCtx(cctx, out.data(), out.size(), src, len, 1);
+    if (!ZSTD_isError(k) && k < len) {
+      out.resize(k);
+      z[j.c][j.b] = std::move(out);
+    }
+  });
+  uint64_t off = 4096;
+  auto put = [&](const void* p, size_t len) {
+    if (len && !pwriteAll(f->fd, p, len, off)) throw SqlError("cannot write segment file " + pathOf(f->id) + " (disk full?)", 1105);
+    off += len;
+  };
+  for (size_t c = 0; c < nc; ++c) {
+    auto& col = f->cols[c];
+    const std::vector<uint8_t>& bytes = d.enc[c] ? d.encHost[c] : d.host[c];
+    col.off = off;
+    if (!col.blockRows) {
+      put(bytes.data(), bytes.size());
+      continue;
+    }
+    put(bytes.data(), col.prefix);
+    const uint64_t w = elemOf(col);
+    for (size_t b = 0; b < z[c].size(); ++b) {
+      col.blocks.push_back(off);
+      if (!z[c][b].empty()) put(z[c][b].data(), z[c][b].size());
+      else {
+        const int64_t r0 = (int64_t)b * kBlockRows, r1 = std::min<int64_t>(r0 + kBlockRows, n);
+        put(bytes.data() + col.prefix + r0 * w, (size_t)(r1 - r0) * w);
+      }
+    }
+    col.blocks.push_back(off);
+    std::vector<std::vector<uint8_t>>().swap(z[c]);
+  }
+  std::vector<uint8_t> ix;
+  auto u64 = [&](uint64_t v) { ix.insert(ix.end(), (uint8_t*)&v, (uint8_t*)&v + 8); };
+  for (auto& col : f->cols) {
+    u64(col.enc);
+    u64(col.width);
+    u64(col.blockRows);
+    u64(col.prefix);
+    u64(col.len);
+    u64(col.off);
+    u64(col.blocks.size());
+    for (uint64_t b : col.blocks) u64(b);
+  }
+  const uint64_t ixOff = off;
+  put(ix.data(), ix.size());
+  uint8_t hdr[40];
+  const uint64_t hv[4] = {(uint64_t)nc, (uint64_t)n, ixOff, (uint64_t)ix.size()};
+  memcpy(hdr, kMagic2, 8);
+  memcpy(hdr + 8, hv, 32);
+  if (!pwriteAll(f->fd, hdr, sizeof hdr, 0)) throw SqlError("cannot write segment file " + pathOf(f->id), 1105);
   d.file = f;
-    return f;
+  return f;
 }
 
 std::shared_ptr<SegFile> segFileOpen(uint64_t id, size_t ncols, int64_t n) {
@@ -235,30 +471,52 @@ std::shared_ptr<SegFile> segFileOpen(uint64_t id, size_t ncols, int64_t n) {
   {
     std::lock_guard<std::mutex> rg(g_regMu);
     g_live.insert(id);
+    g_installed.insert(id);  // (it is in the snapshot being loaded, which is the installed one)
   }
-  f->synced = true;  // (it is in the snapshot being loaded, which is the installed one)
-  {
-    std::lock_guard<std::mutex> rg(g_regMu);
-    g_installed.insert(id);
-  }
+  f->synced = true;
   f->fd = ::open(pathOf(id).c_str(), O_RDONLY | O_CLOEXEC);
   if (f->fd < 0) throw SqlError("missing segment file " + pathOf(id), 1105);
-  std::vector<uint8_t> hdr(8 + 16 + ncols * 24);
-  uint64_t nc = 0, rows = 0;
-  if (!preadAll(f->fd, hdr.data(), hdr.size(), 0) || memcmp(hdr.data(), kMagic, 8) != 0) throw SqlError("bad segment file " + pathOf(id), 1105);
-  memcpy(&nc, hdr.data() + 8, 8);
-  memcpy(&rows, hdr.data() + 16, 8);
-  if (nc != ncols || rows != (uint64_t)n) throw SqlError("segment file " + pathOf(id) + " does not match the snapshot", 1105);
+  auto bad = [&](const char* what) { throw SqlError(std::string(what) + " segment file " + pathOf(id), 1105); };
   struct stat st;
   fstat(f->fd, &st);
+  const uint64_t size = (uint64_t)st.st_size;
+  char magic[8];
+  uint64_t hv[4] = {0, 0, 0, 0};
+  if (!preadAll(f->fd, magic, 8, 0) || !preadAll(f->fd, hv, 16, 8)) bad("bad");
+  if (hv[0] != ncols || hv[1] != (uint64_t)n) bad("mismatched (does not match the snapshot)");
   f->cols.resize(ncols);
-  for (size_t c = 0; c < ncols; ++c) {
-    const uint8_t* p = hdr.data() + 24 + c * 24;
-    f->cols[c].enc = p[0];
-    memcpy(&f->cols[c].width, p + 4, 4);
-    memcpy(&f->cols[c].off, p + 8, 8);
-    memcpy(&f->cols[c].len, p + 16, 8);
-    if (f->cols[c].off + f->cols[c].len > (uint64_t)st.st_size) throw SqlError("truncated segment file " + pathOf(id), 1105);
+  if (memcmp(magic, kMagic1, 8) == 0) {
+    std::vector<uint8_t> hdr(ncols * 24);
+    if (!preadAll(f->fd, hdr.data(), hdr.size(), 24)) bad("bad");
+    for (size_t c = 0; c < ncols; ++c) {
+      const uint8_t* p = hdr.data() + c * 24;
+      f->cols[c].enc = p[0];
+      memcpy(&f->cols[c].width, p + 4, 4);
+      memcpy(&f->cols[c].off, p + 8, 8);
+      memcpy(&f->cols[c].len, p + 16, 8);
+      if (f->cols[c].off + f->cols[c].len > size) bad("truncated");
+    }
+    return f;
+  }
+  if (memcmp(magic, kMagic2, 8) != 0 || !preadAll(f->fd, hv + 2, 16, 24) || hv[2] + hv[3] > size) bad("bad");
+  std::vector<uint64_t> ix(hv[3] / 8);
+  if (!preadAll(f->fd, ix.data(), ix.size() * 8, hv[2])) bad("bad");
+  size_t k = 0;
+  auto next = [&]() -> uint64_t {
+    if (k >= ix.size()) bad("bad");
+    return ix[k++];
+  };
+  for (auto& col : f->cols) {
+    col.enc = (uint8_t)next();
+    col.width = (uint32_t)next();
+    col.blockRows = (uint32_t)next();
+    col.prefix = next();
+    col.len = next();
+    col.off = next();
+    const uint64_t nb = next();
+    col.blocks.resize(nb);
+    for (auto& b : col.blocks) b = next();
+    if (col.blockRows ? (col.blocks.empty() || col.blocks.back() > size) : col.off + col.len > size) bad("truncated");
   }
   return f;
 }
@@ -303,44 +561,8 @@ void segLoad(SegData& d, int c) {
 }
 
 namespace {
-// ---- Reads from the segment files for scans: a small I/O thread pool, pinned host buffers (pooled)
-// and read-ahead of the column a scan is reading for the batches it visits next.
-std::atomic<int64_t> g_readBytes{0};
-
-struct IoPool {
-  std::mutex mu;
-  std::condition_variable cv;
-  std::deque<std::function<void()>> q;
-  std::vector<std::thread> th;
-  IoPool() {
-    const int n = std::clamp<int>((int)std::thread::hardware_concurrency(), 4, 16);
-    for (int i = 0; i < n; ++i)
-      th.emplace_back([this] {
-        for (;;) {
-          std::function<void()> f;
-          {
-            std::unique_lock<std::mutex> g(mu);
-            cv.wait(g, [&] { return !q.empty(); });
-            f = std::move(q.front());
-            q.pop_front();
-          }
-          f();
-        }
-      });
-    for (auto& t : th) t.detach();
-  }
-  void submit(std::function<void()> f) {
-    {
-      std::lock_guard<std::mutex> g(mu);
-      q.push_back(std::move(f));
-    }
-    cv.notify_one();
-  }
-};
-IoPool& ioPool() {
-  static IoPool* p = new IoPool();
-  return *p;
-}
+// ---- Reads from the segment files for scans: pinned host buffers (pooled) and read-ahead of the
+// column a scan is reading for the batches it visits next.
 
 // Pinned (and mapped) host buffers by power-of-two size class.
 std::mutex g_pinMu;
@@ -399,55 +621,6 @@ void pinPut(void* p, size_t cap) {
   g_pinFreeBytes += (int64_t)cap;
 }
 
-// What to read for rows [lo, lo + n) of a column: one piece (raw), or the encoding's header (and
-// dictionary) plus the codes of the rows (encoded; read with ColView::off = 0).
-struct Piece {
-  uint64_t off, len, dst;
-};
-std::vector<Piece> piecesOf(const SegFile::Col& col, int64_t rows, int64_t lo, int64_t n, size_t& total) {
-  if (lo == 0 && n >= rows) {
-    total = col.len;
-    return {{col.off, col.len, 0}};
-  }
-  if (!col.enc) {
-    total = (size_t)n * col.width;
-    return {{col.off + (uint64_t)lo * col.width, total, 0}};
-  }
-  const uint64_t pre = kEncHeader + (col.enc == 4 ? 256 * 8 : 0), w = (uint64_t)encWidth(col.enc);
-  total = pre + n * w + 16;
-  return {{col.off, pre, 0}, {col.off + pre + (uint64_t)lo * w, (uint64_t)n * w, pre}};
-}
-
-void readPieces(const SegFile& f, const std::vector<Piece>& ps, uint8_t* dst) {
-  for (auto& p : ps)
-    if (!preadAll(f.fd, dst + p.dst, p.len, p.off)) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
-  for (auto& p : ps) g_readBytes += (int64_t)p.len;
-}
-
-// Reads pieces with the I/O threads in 8 MB chunks (several requests in flight on the SSD).
-void readParallel(const SegFile& f, const std::vector<Piece>& ps, uint8_t* dst) {
-  constexpr uint64_t kChunk = 8 << 20;
-  std::vector<Piece> chunks;
-  for (auto& p : ps)
-    for (uint64_t o = 0; o < p.len; o += kChunk) chunks.push_back({p.off + o, std::min(kChunk, p.len - o), p.dst + o});
-  if (chunks.size() <= 1) return readPieces(f, chunks, dst);
-  std::mutex m;
-  std::condition_variable cv;
-  size_t left = chunks.size();
-  bool failed = false;
-  for (auto& ch : chunks)
-    ioPool().submit([&, ch] {
-      bool ok = preadAll(f.fd, dst + ch.dst, ch.len, ch.off);
-      std::lock_guard<std::mutex> g(m);
-      failed |= !ok;
-      if (--left == 0) cv.notify_all();
-    });
-  std::unique_lock<std::mutex> g(m);
-  cv.wait(g, [&] { return left == 0; });
-  if (failed) throw SqlError("cannot read segment file " + pathOf(f.id), 1105);
-  for (auto& ch : chunks) g_readBytes += (int64_t)ch.len;
-}
-
 // A read-ahead in flight: the column's bytes for one batch, into a pinned buffer.
 struct Fetch {
   std::mutex mu;
@@ -490,19 +663,19 @@ void readAhead(int c) {
     const auto& col = file->cols[c];
     if (it.lo == 0 && it.n >= file->rows && g_hostBytes + (int64_t)col.len + (col.enc ? file->rows * (int64_t)col.width : 0) <= g_memLimit)
       continue;  // (it goes into the cache when the scan gets to it)
-    size_t total = 0;
-    auto ps = piecesOf(file->cols[c], file->rows, it.lo, it.n, total);
+    const size_t total = storedSize(*file, c, it.lo, it.n);
+    const int64_t lo = it.lo, n = it.n;
     auto f = std::make_shared<Fetch>();
     f->len = total;
     f->cap = pinClass(std::max<size_t>(total, 1));
     tFetches[{it.d, c, it.lo}] = f;
     tFetchBytes += (int64_t)f->cap;
     ++started;
-    ioPool().submit([f, file, ps] {
+    ioPool().submit([f, file, c, lo, n] {
       bool ok = true;
       try {
         f->buf = pinGet(f->cap);
-        readPieces(*file, ps, (uint8_t*)f->buf);
+        readRows(*file, c, lo, n, (uint8_t*)f->buf, false);
       } catch (...) {
         ok = false;
       }
@@ -549,14 +722,13 @@ void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased) {
       throw SqlError("cannot read segment file " + pathOf(d.file->id), 1105);
     }
   } else {
-    size_t total = 0;
-    auto ps = piecesOf(d.file->cols[c], d.file->rows, lo, n, total);
+    const size_t total = storedSize(*d.file, c, lo, n);
     f = std::make_shared<Fetch>();
     f->len = total;
     f->cap = pinClass(std::max<size_t>(total, 1));
     f->buf = pinGet(f->cap);
     try {
-      readParallel(*d.file, ps, (uint8_t*)f->buf);
+      readRows(*d.file, c, lo, n, (uint8_t*)f->buf, true);
     } catch (...) {
       pinPut(f->buf, f->cap);
       throw;
@@ -631,44 +803,71 @@ const uint8_t* segRawColumn(const SegData& d, int c, std::vector<uint8_t>& tmp) 
   return tmp.data();
 }
 
+void segRawCell(SegData& d, int c, int64_t r, uint8_t* out) {
+  const SegFile& f = *d.file;
+  const auto& col = f.cols[c];
+  std::vector<uint8_t> buf(storedSize(f, c, r, 1));
+  readRows(f, c, r, 1, buf.data(), false);
+  if (!col.enc) memcpy(out, buf.data(), col.width);
+  else decodeInto(SegFile::Col{col.enc, col.width, 0, 0}, buf.data(), 1, out);
+}
+
+void segRawCells(std::vector<CellRead>& reqs) {
+  // Grouped by (segment, column, block of rows): each block is read and decompressed once.
+  std::sort(reqs.begin(), reqs.end(), [](const CellRead& a, const CellRead& b) {
+    return std::tie(a.d, a.c, a.row) < std::tie(b.d, b.c, b.row);
+  });
+  std::vector<std::pair<size_t, size_t>> groups;
+  for (size_t i = 0; i < reqs.size();) {
+    const auto& col = reqs[i].d->file->cols[reqs[i].c];
+    const int64_t B = col.blockRows ? col.blockRows : 1;
+    size_t j = i + 1;
+    while (j < reqs.size() && reqs[j].d == reqs[i].d && reqs[j].c == reqs[i].c && reqs[j].row / B == reqs[i].row / B) ++j;
+    groups.push_back({i, j});
+    i = j;
+  }
+  std::string err;
+  std::mutex errMu;
+  ioParallel(groups.size(), [&](size_t g) {
+    try {
+      auto [i, j] = groups[g];
+      const SegFile& f = *reqs[i].d->file;
+      const int c = reqs[i].c;
+      const auto& col = f.cols[c];
+      const int64_t lo = reqs[i].row, n = reqs[j - 1].row - lo + 1;
+      std::vector<uint8_t> buf(storedSize(f, c, lo, n));
+      readRows(f, c, lo, n, buf.data(), false);
+      const uint64_t pre = prefixOf(col.enc), w = elemOf(col);
+      std::vector<uint8_t> one(pre + w + 16, 0);
+      for (size_t k = i; k < j; ++k) {
+        const int64_t r = reqs[k].row - lo;
+        if (!col.enc) {
+          memcpy(reqs[k].out, buf.data() + r * w, col.width);
+          continue;
+        }
+        memcpy(one.data(), buf.data(), pre);
+        memcpy(one.data() + pre, buf.data() + pre + r * w, w);
+        decodeInto(SegFile::Col{col.enc, col.width, 0, 0}, one.data(), 1, reqs[k].out);
+      }
+    } catch (std::exception& ex) {
+      std::lock_guard<std::mutex> lk(errMu);
+      err = ex.what();
+    }
+  });
+  if (!err.empty()) throw SqlError(err, 1105);
+}
+
 long long segRawInt(SegData& d, int c, int64_t r, bool i64) {
   if (!segCold(d, c)) {
     const uint8_t* h = d.host[c].data();
     return i64 ? (long long)((const int64_t*)h)[r] : (long long)((const int32_t*)h)[r];
   }
-  const auto& col = d.file->cols[c];
-  if (!col.enc) {
-    if (col.width == 4) {
-      int32_t v;
-      if (!preadAll(d.file->fd, &v, 4, col.off + (uint64_t)r * 4)) throw SqlError("cannot read segment file", 1105);
-      return v;
-    }
-    int64_t v;
-    if (!preadAll(d.file->fd, &v, 8, col.off + (uint64_t)r * 8)) throw SqlError("cannot read segment file", 1105);
-    return v;
-  }
-  const int w = encWidth(col.enc);
-  uint8_t buf[kEncHeader + 8] = {};
-  if (!preadAll(d.file->fd, buf, kEncHeader, col.off) || !preadAll(d.file->fd, buf + kEncHeader, w, col.off + kEncHeader + (uint64_t)r * w))
-    throw SqlError("cannot read segment file", 1105);
-  ColView v{};
-  v.p = buf;
-  v.enc = col.enc;
-  v.t = col.width == 4 ? 0 : 1;
-  return encInt(v, 0);
-}
-
-void segRawCell(SegData& d, int c, int64_t r, uint8_t* out) {
-  const auto& col = d.file->cols[c];
-  if (!col.enc) {
-    if (!preadAll(d.file->fd, out, col.width, col.off + (uint64_t)r * col.width)) throw SqlError("cannot read segment file", 1105);
-    return;
-  }
-  const uint64_t pre = kEncHeader + (col.enc == 4 ? 256 * 8 : 0), w = (uint64_t)encWidth(col.enc);
-  std::vector<uint8_t> buf(pre + 8, 0);
-  if (!preadAll(d.file->fd, buf.data(), pre, col.off) || !preadAll(d.file->fd, buf.data() + pre, w, col.off + pre + (uint64_t)r * w))
-    throw SqlError("cannot read segment file", 1105);
-  decodeInto(SegFile::Col{col.enc, col.width, 0, 0}, buf.data(), 1, out);
+  uint8_t v[8];
+  segRawCell(d, c, r, v);
+  int64_t x;
+  int32_t y;
+  if (i64) return memcpy(&x, v, 8), (long long)x;
+  return memcpy(&y, v, 4), (long long)y;
 }
 
 int64_t segEvictBegin(SegData& d, int c, uint32_t& gen) {

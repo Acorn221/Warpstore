@@ -141,8 +141,10 @@ snapshot or segment uses any more are deleted. `BACKUP` files stay self-containe
 Still in memory, whatever the limit: write buffers (up to 1M rows per partition), primary-key and
 secondary indexes, string dictionaries, deleted-row bitmaps. `ALTER TABLE` rebuilds, `BACKUP` and
 CPU-side DML on many rows read whole columns into memory. `SELECT .. ORDER BY .. LIMIT n` (n up to
-10,000) scans only the filter and ORDER BY columns and reads the others for the n rows it returns. The
-files are not compressed beyond the GPU encodings, and there is no GPUDirect Storage yet.
+10,000) scans only the filter and ORDER BY columns and reads the others for the n rows it returns. Segment
+files store each column in zstd-compressed blocks of 16K rows (the SORT KEY column uncompressed) with a
+block index, so reads of row ranges and single rows only decompress the blocks they need (files from
+before, stored uncompressed, still load). No GPUDirect Storage or GPU decompression yet.
 
 ## Usage
 

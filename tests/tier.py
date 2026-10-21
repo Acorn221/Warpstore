@@ -73,6 +73,8 @@ for compress in ("--no-compress", "--compress"):
     queries(cur, f"{tag} again")
     segdir = os.path.join(srv.data_dir, "segments")
     c.check(f"{tag}: segment files written", len(os.listdir(segdir)) > 0)
+    disk = sum(os.path.getsize(os.path.join(segdir, f)) for f in os.listdir(segdir))
+    c.check(f"{tag}: segment files compressed", 0 < disk < 48 << 20, f"{disk} bytes for ~96 MB of column data")
     # DML on cold segments
     q(cur, "UPDATE t SET g = -1 WHERE id = 42")
     q(cur, "DELETE FROM t WHERE id < 1000")

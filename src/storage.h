@@ -268,7 +268,13 @@ struct SegFile {
   struct Col {
     uint8_t enc;     // ColView::enc of the bytes (0: raw)
     uint32_t width;  // bytes per row of the raw column
-    uint64_t off, len;
+    uint64_t off, len;  // where the stored bytes start; len: their size uncompressed
+    // Compressed (format 2): the encoding's header / dictionary (prefix bytes, as is) at off, then the
+    // rows in blocks of blockRows, each zstd-compressed (or as is when that is not smaller): block b
+    // is at [blocks[b], blocks[b + 1]). blockRows 0: stored as is at off.
+    uint32_t blockRows = 0;
+    uint64_t prefix = 0;
+    std::vector<uint64_t> blocks;
   };
   std::vector<Col> cols;
   ~SegFile();  // closes the file; deletes it unless the installed snapshot refers to it
@@ -280,7 +286,8 @@ int64_t tierMemLimit();                                       // INT64_MAX: none
 int64_t tierHostBytes();                                      // segment column bytes in host memory
 int64_t tierPendingBytes();                                   // evicted, freed once older queries finish
 // The segment's file (written and opened if it has none yet; null without a data dir).
-std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n);
+// rawCol: a column stored uncompressed (the sort key: binary searches read single rows of it).
+std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n, int rawCol = -1);
 std::shared_ptr<SegFile> segFileOpen(uint64_t id, size_t ncols, int64_t n);  // throws if missing / bad
 void segFilesInstalled(const std::vector<uint64_t>& ids);  // a snapshot referring to exactly these is installed
 void segFilesCleanup();                                    // startup: deletes files no segment uses
@@ -305,7 +312,14 @@ int64_t tierReadBytes();  // bytes read from segment files for scans
 bool scanWindowFull();
 const uint8_t* segRawColumn(const SegData& d, int c, std::vector<uint8_t>& tmp);  // raw bytes (cold: into tmp)
 long long segRawInt(SegData& d, int c, int64_t r, bool i64);
-void segRawCell(SegData& d, int c, int64_t r, uint8_t* out);  // one raw cell of a cold column, from the file  // one raw integer (cold: read from the file)
+void segRawCell(SegData& d, int c, int64_t r, uint8_t* out);  // one raw cell of a cold column, from the file
+struct CellRead {
+  SegData* d;  // a segment with a file; column c cold
+  int c;
+  int64_t row;
+  uint8_t* out;  // the raw cell
+};
+void segRawCells(std::vector<CellRead>& reqs);  // many cells, each block read once, in parallel  // one raw integer (cold: read from the file)
 // Eviction: begin under the table's exclusive lock, finish (frees) once older queries are done.
 // Returns the bytes evicted (0: the column was not evictable).
 int64_t segEvictBegin(SegData& d, int c, uint32_t& gen);

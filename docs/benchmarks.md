@@ -249,7 +249,8 @@ the cache, the same as with everything in VRAM (the hot columns fit). TPC-H SF1 
 
 ### When the data doesn't fit in RAM
 
-ClickBench 10M rows with `--memory-limit` below the table's size (3.8 GB of segment files): the
+ClickBench 10M rows with `--memory-limit` below the table's size (3.8 GB of column data, 0.78 GB of
+compressed segment files): the
 column data that doesn't fit is evicted to the segment files, read back when scanned and pushed through
 the GPU in windows (`bench/clickbench/tier.py`, results in
 [bench/comparisons](../bench/comparisons/clickbench_warpstore_tier_0.25gb.jsonl)). "Read from the SSD"
@@ -258,11 +259,11 @@ come from the NVMe drive. DuckDB and ClickHouse are compared with their hot, in-
 
 | Warpstore setup | All 43 queries | Geomean | vs DuckDB hot (geomean) | vs ClickHouse hot (geomean) |
 |---|---:|---:|---:|---:|
-| everything in memory | 0.27 s | 2.5 ms | 13.4x faster | 23.8x faster |
-| `--memory-limit 2`, files in the OS page cache | 0.37 s | 3.0 ms | 11.4x faster | 20.3x faster |
-| `--memory-limit 2`, read from the SSD | 0.36 s | 3.0 ms | 11.3x faster | 20.1x faster |
-| `--memory-limit 0.25`, files in the OS page cache | 0.98 s | 11.5 ms | 2.9x faster | 5.2x faster |
-| `--memory-limit 0.25`, read from the SSD | 1.07 s | 12.2 ms | 2.8x faster | 4.9x faster |
+| everything in memory | 0.26 s | 2.5 ms | 13.4x faster | 23.9x faster |
+| `--memory-limit 2`, files in the OS page cache | 0.27 s | 2.8 ms | 12.3x faster | 21.8x faster |
+| `--memory-limit 2`, read from the SSD | 0.25 s | 2.8 ms | 12.3x faster | 21.8x faster |
+| `--memory-limit 0.25`, files in the OS page cache | 0.78 s | 8.8 ms | 3.8x faster | 6.8x faster |
+| `--memory-limit 0.25`, read from the SSD | 0.77 s | 8.6 ms | 4.0x faster | 7.0x faster |
 
 How the disk tier keeps this fast:
 
@@ -272,13 +273,19 @@ How the disk tier keeps this fast:
 - **Read-ahead on several threads.** While a scan works on one segment, the column it is reading is
   already being read for the next segments (I/O threads, several requests in flight on the SSD, into
   pooled pinned buffers that go back to the pool as soon as their copy to the GPU has run).
+- **Compressed segment files.** Each column is stored in blocks of 16K rows, zstd-compressed (on top of
+  the GPU encodings), with a block index, so a range read only reads and decompresses the blocks it
+  covers, on the I/O threads: 3.8 GB of column data take 0.78 GB on disk, and the SSD run went from
+  1.07 s to 0.77 s; it now takes as long as with the files in the page cache. The SORT KEY column is
+  stored uncompressed (binary searches read single rows of it).
 - **Late materialization for top-N.** `SELECT * .. ORDER BY .. LIMIT 10` scans only the filter and
   ORDER BY columns (with each row's location), sorts, and reads the other columns for the 10 rows left
-  (Q24: 2.9 s reading all 105 columns, 0.12 s now).
+  (Q24: 2.9 s reading all 105 columns, 45 ms now; the cells are read grouped by block, each block
+  decompressed once).
 
-Before these three, the 0.25 GB / SSD run took 5.2 s. What is left is mostly reading whole columns for
-full scans (GROUP BY over WatchID / ClientIP): storing the files compressed, and GPUDirect Storage,
-would be next.
+Before these, the 0.25 GB / SSD run took 5.2 s. What is left is mostly decompressing whole columns for
+full scans on the CPU (GROUP BY over WatchID / ClientIP / URL); decompressing on the GPU (nvCOMP) would be
+next.
 
 ### SingleStore's use cases, head to head (`bench/usecases.py`)
 

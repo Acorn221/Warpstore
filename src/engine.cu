@@ -4086,7 +4086,7 @@ void Engine::tierBalance() {
     size_t k = 0;
     while (k < ents.size() && got < need) got += ents[k++].bytes;
     ents.resize(k);
-    for (auto& e : ents) segFileEnsure(*e.seg->d, e.seg->n);  // (outside the table lock: the data is immutable)
+    for (auto& e : ents) segFileEnsure(*e.seg->d, e.seg->n, e.t->sortKey);  // (outside the table lock: the data is immutable)
     std::map<Table*, std::vector<const Ent*>> byTable;
     for (auto& e : ents) byTable[e.t.get()].push_back(&e);
     for (auto& [tp, list] : byTable) {
@@ -8786,19 +8786,27 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     std::vector<int32_t> fi = finalIdx.download(cnt);
     Rel top;
     top.n = cnt;
+    std::vector<CellRead> lateReads;  // all deferred cells on disk, read together
+    std::vector<std::pair<void*, std::vector<uint8_t>>> lateUploads;
     for (auto& rc : rel.cols) {
       RelCol nc{rc.bt, rc.bc, rc.pt, DevVec<uint8_t>(cnt * rc.esize), rc.esize};
       if (!deferred.count(rc.bc)) {
         gpuGatherBytes(rc.data.p, rc.esize, finalIdx.p, cnt, nc.data.p, false);
       } else {
         std::vector<uint8_t> h((size_t)cnt * rc.esize);
-        parallelFor((size_t)cnt, [&](size_t b, size_t e) {
-          for (size_t r = b; r < e; ++r) cellRaw(t0, lateLocs[fi[r]], rc.bc, h.data() + r * rc.esize);
-        }, 1);
-        h2d(nc.data.p, h.data(), h.size());
+        std::vector<CellRead> cold;
+        for (int64_t r = 0; r < cnt; ++r) {
+          const Loc l = lateLocs[fi[r]];
+          if (l.seg >= 0 && segCold(*t0.segs[l.seg]->d, rc.bc)) cold.push_back({t0.segs[l.seg]->d.get(), rc.bc, l.row, h.data() + r * rc.esize});
+          else cellRaw(t0, l, rc.bc, h.data() + r * rc.esize);
+        }
+        lateReads.insert(lateReads.end(), cold.begin(), cold.end());
+        lateUploads.push_back({nc.data.p, std::move(h)});
       }
       top.cols.push_back(std::move(nc));
     }
+    segRawCells(lateReads);
+    for (auto& [dp, h] : lateUploads) h2d(dp, h.data(), h.size());
     rel = std::move(top);
     bindRelCols(comp, rel);
     std::vector<int32_t> seq(cnt);
@@ -11494,7 +11502,7 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
     putU64(f, rs.size());
     for (size_t si : rs) {
       Segment& sg = *t.segs[si];
-      auto file = segFileEnsure(*sg.d, sg.n);
+      auto file = segFileEnsure(*sg.d, sg.n, t.sortKey);
       segFileSync(*file);
       refs->push_back(file->id);
       putU64(f, (uint64_t)sg.part);
@@ -11777,7 +11785,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
         for (auto& sp : t->segs)
           if (sp->uses.size() == sp->dev.size() && sp->n > 0 && sp->ndel() * 2 <= sp->n) segs.push_back(sp);
       }
-      for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n));
+      for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n, t->sortKey));
     }
   std::vector<uint64_t> refs;
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
