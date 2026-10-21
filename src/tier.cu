@@ -18,6 +18,7 @@
 #include <unordered_set>
 #include "devtypes.h"
 #include "gpu.h"
+#include "gpuio.h"
 #include "storage.h"
 
 namespace gdb {
@@ -330,6 +331,7 @@ int64_t tierHostBytes() { return g_hostBytes; }
 int64_t tierPendingBytes() { return g_pending; }
 
 SegFile::~SegFile() {
+  gdsClose(gds);
   if (fd >= 0) ::close(fd);
   std::lock_guard<std::mutex> g(g_regMu);
   g_live.erase(id);
@@ -589,11 +591,40 @@ void* pinGet(size_t cap) {
   return p;
 }
 void pinPut(void* p, size_t cap);
-// Buffers whose copy to the GPU is queued: back to the pool once their event has completed.
+// VRAM buffers for GPUDirect Storage reads (cudaMalloc'd, by size class, reused).
+std::mutex g_devMu;
+std::map<size_t, std::vector<void*>> g_devFree;
+int64_t g_devFreeBytes = 0;
+void* devGet(size_t cap) {
+  {
+    std::lock_guard<std::mutex> g(g_devMu);
+    auto& v = g_devFree[cap];
+    if (!v.empty()) {
+      void* p = v.back();
+      v.pop_back();
+      g_devFreeBytes -= (int64_t)cap;
+      return p;
+    }
+  }
+  void* p = nullptr;
+  CK(cudaMalloc(&p, cap));
+  return p;
+}
+void devPut(void* p, size_t cap) {
+  std::lock_guard<std::mutex> g(g_devMu);
+  if (g_devFreeBytes + (int64_t)cap > (256ll << 20)) {
+    cudaFree(p);
+    return;
+  }
+  g_devFree[cap].push_back(p);
+  g_devFreeBytes += (int64_t)cap;
+}
+// Buffers that queued GPU work still reads: back to their pool once their event has completed.
 struct Pending {
   void* p;
   size_t cap;
   cudaEvent_t ev;
+  bool dev = false;  // devPut, else pinPut
 };
 thread_local std::vector<Pending> tPending;
 void pinReap(bool all) {
@@ -601,7 +632,8 @@ void pinReap(bool all) {
     auto& x = tPending[i];
     if (all ? cudaEventSynchronize(x.ev) == cudaSuccess || true : cudaEventQuery(x.ev) == cudaSuccess) {
       cudaEventDestroy(x.ev);
-      pinPut(x.p, x.cap);
+      if (x.dev) devPut(x.p, x.cap);
+      else pinPut(x.p, x.cap);
       x = tPending.back();
       tPending.pop_back();
     } else {
@@ -626,9 +658,58 @@ struct Fetch {
   std::mutex mu;
   std::condition_variable cv;
   bool done = false, failed = false;
-  void* buf = nullptr;
+  void* buf = nullptr;  // pinned: the stored bytes (CPU path) or the compressed blocks (GPU path)
   size_t cap = 0, len = 0;
+  // GPU path: blocks b0..b1, compressed in buf (or dbuf: read into VRAM with GPUDirect Storage), and
+  // the encoding's prefix.
+  bool gpu = false;
+  int64_t b0 = 0, b1 = -1;
+  uint64_t span = 0;
+  std::vector<uint8_t> prefix;
+  void* dbuf = nullptr;
+  size_t dcap = 0;
 };
+void fetchFree(Fetch& f) {
+  if (f.buf) pinPut(f.buf, f.cap);
+  if (f.dbuf) devPut(f.dbuf, f.dcap);
+  f.buf = f.dbuf = nullptr;
+}
+// Decompress this column's blocks on the GPU? (Small reads, like a narrow SORT KEY range, are faster
+// on the CPU.)
+bool gpuPath(const SegFile::Col& col, int64_t n) { return col.blockRows && nvcompAvailable() && (uint64_t)n * elemOf(col) >= (1u << 20); }
+void* gdsHandle(SegFile& f) {
+  std::lock_guard<std::mutex> g(f.gdsMu);
+  if (!f.gdsTried) {
+    f.gdsTried = true;
+    f.gds = gdsOpen(pathOf(f.id));
+  }
+  return f.gds;
+}
+// GPU path: the compressed blocks with rows [lo, lo + n) and the prefix (on an I/O thread or not).
+void readCompressed(SegFile& file, int c, int64_t lo, int64_t n, Fetch& f) {
+  const auto& col = file.cols[c];
+  const int64_t B = col.blockRows;
+  f.gpu = true;
+  f.b0 = lo / B;
+  f.b1 = (std::min(lo + n, file.rows) - 1) / B;
+  f.span = col.blocks[f.b1 + 1] - col.blocks[f.b0];
+  f.prefix.resize(col.prefix);
+  if (col.prefix && !preadAll(file.fd, f.prefix.data(), col.prefix, col.off)) throw SqlError("cannot read segment file " + pathOf(file.id), 1105);
+  if (void* h = gdsHandle(file)) {
+    f.dcap = pinClass(std::max<size_t>(f.span, 1));
+    f.dbuf = devGet(f.dcap);
+    if (gdsRead(h, f.dbuf, f.span, col.blocks[f.b0])) {
+      g_readBytes += (int64_t)f.span;
+      return;
+    }
+    devPut(f.dbuf, f.dcap);  // (failed: through host memory)
+    f.dbuf = nullptr;
+  }
+  f.cap = pinClass(std::max<size_t>(f.span, 1));
+  f.buf = pinGet(f.cap);
+  if (!preadAll(file.fd, f.buf, f.span, col.blocks[f.b0])) throw SqlError("cannot read segment file " + pathOf(file.id), 1105);
+  g_readBytes += (int64_t)f.span;
+}
 struct FetchKey {
   const SegData* d;
   int c;
@@ -667,15 +748,20 @@ void readAhead(int c) {
     const int64_t lo = it.lo, n = it.n;
     auto f = std::make_shared<Fetch>();
     f->len = total;
-    f->cap = pinClass(std::max<size_t>(total, 1));
+    const bool gpu = gpuPath(col, n);
+    const size_t cap = pinClass(std::max<size_t>(gpu ? col.blocks[(std::min(lo + n, file->rows) - 1) / col.blockRows + 1] - col.blocks[lo / col.blockRows] : total, 1));
     tFetches[{it.d, c, it.lo}] = f;
-    tFetchBytes += (int64_t)f->cap;
+    tFetchBytes += (int64_t)cap;
     ++started;
-    ioPool().submit([f, file, c, lo, n] {
+    ioPool().submit([f, file, c, lo, n, gpu, cap] {
       bool ok = true;
       try {
-        f->buf = pinGet(f->cap);
-        readRows(*file, c, lo, n, (uint8_t*)f->buf, false);
+        if (gpu) readCompressed(*file, c, lo, n, *f);
+        else {
+          f->cap = cap;
+          f->buf = pinGet(f->cap);
+          readRows(*file, c, lo, n, (uint8_t*)f->buf, false);
+        }
       } catch (...) {
         ok = false;
       }
@@ -695,19 +781,116 @@ void scanAheadExchange(std::vector<ScanAheadItem>& items, size_t& pos) {
 void scanAheadAt(size_t pos) { tAheadPos = pos; }
 int64_t tierReadBytes() { return g_readBytes; }
 
-void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased) {
-  rebased = false;
-  if (!segCold(d, c)) return d.dev[c];
-  const bool whole = lo == 0 && n >= d.file->rows;
+namespace {
+// Queued GPU decompressions: run as one nvCOMP call (it costs ~0.4 ms however much it does) before
+// kernels read the data (scanFlush), with the buffers they read released after.
+struct Queued {
+  std::vector<const void*> in;
+  std::vector<size_t> inLen, outLen;
+  std::vector<void*> out;
+  std::vector<void*> freeAfter;  // VRAM (cudaFreeAsync once the decompression has run)
+  std::vector<Pending> pending;  // pool buffers (back once it has run; ev set at the flush)
+  size_t bytes = 0;
+} tQueue;
+
+void flushQueue() {
+  if (tQueue.in.empty() && tQueue.freeAfter.empty() && tQueue.pending.empty()) return;
+  gpuZstdDecompress(tQueue.in, tQueue.inLen, tQueue.out, tQueue.outLen);
+  const cudaStream_t s = cudaStreamPerThread;
+  for (void* p : tQueue.freeAfter) cudaFreeAsync(p, s);
+  for (Pending p : tQueue.pending) {
+    CK(cudaEventCreateWithFlags(&p.ev, cudaEventDisableTiming));
+    CK(cudaEventRecord(p.ev, s));
+    tPending.push_back(p);
+  }
+  tQueue = Queued{};
+}
+
+// A Fetch of the GPU path -> the batch's rows decompressed in VRAM (a scan temp). Returns the pointer
+// to the decompressed blocks (prefix first for encoded columns); first = the first row in it.
+void* decompressOnGpu(SegFile& file, int c, Fetch& f, int64_t& first) {
+  const auto& col = file.cols[c];
+  const int64_t B = col.blockRows, r0 = f.b0 * B, r1 = std::min<int64_t>((f.b1 + 1) * B, file.rows);
+  const uint64_t pre = col.prefix, w = elemOf(col);
+  const size_t outLen = pre + (size_t)(r1 - r0) * w + 16;
+  first = r0;
+  const cudaStream_t s = cudaStreamPerThread;
+  uint8_t* out = nullptr;
+  if (cudaMallocAsync((void**)&out, outLen, s) != cudaSuccess) {
+    cudaGetLastError();
+    return nullptr;
+  }
+  tTemps.push_back({out, 0, 0});
+  tTempBytes += (int64_t)outLen;
+  if (pre) {  // (through pinned memory: a copy from pageable memory would wait for the stream)
+    void* hp = pinGet(pinClass(pre));
+    memcpy(hp, f.prefix.data(), pre);
+    CK(cudaMemcpyAsync(out, hp, pre, cudaMemcpyHostToDevice, s));
+    tQueue.pending.push_back({hp, pinClass(pre), nullptr, false});
+  }
+  CK(cudaMemsetAsync(out + pre + (r1 - r0) * w, 0, 16, s));
+  uint8_t* z = (uint8_t*)f.dbuf;
+  bool zOwned = false;
+  if (!z) {  // compressed blocks in pinned memory: to VRAM first
+    if (cudaMallocAsync((void**)&z, std::max<uint64_t>(f.span, 1), s) != cudaSuccess) {
+      cudaGetLastError();
+      return nullptr;
+    }
+    zOwned = true;
+    CK(cudaMemcpyAsync(z, f.buf, f.span, cudaMemcpyHostToDevice, s));
+  }
+  std::vector<const void*> in;
+  std::vector<size_t> inLen, outLens;
+  std::vector<void*> outs;
+  const uint64_t base = col.blocks[f.b0];
+  for (int64_t b = f.b0; b <= f.b1; ++b) {
+    const uint64_t clen = col.blocks[b + 1] - col.blocks[b];
+    const size_t rawLen = (size_t)(std::min<int64_t>((b + 1) * B, file.rows) - b * B) * w;
+    uint8_t* dst = out + pre + (b - f.b0) * B * w;
+    if (clen == rawLen) CK(cudaMemcpyAsync(dst, z + (col.blocks[b] - base), rawLen, cudaMemcpyDeviceToDevice, s));  // (stored as is)
+    else {
+      in.push_back(z + (col.blocks[b] - base));
+      inLen.push_back(clen);
+      outs.push_back(dst);
+      outLens.push_back(rawLen);
+    }
+  }
+  // Queued (scanFlush runs it); the compressed input goes once it has run.
+  tQueue.in.insert(tQueue.in.end(), in.begin(), in.end());
+  tQueue.inLen.insert(tQueue.inLen.end(), inLen.begin(), inLen.end());
+  tQueue.out.insert(tQueue.out.end(), outs.begin(), outs.end());
+  tQueue.outLen.insert(tQueue.outLen.end(), outLens.begin(), outLens.end());
+  if (zOwned) tQueue.freeAfter.push_back(z);
+  if (f.dbuf) tQueue.pending.push_back({f.dbuf, f.dcap, nullptr, true});
+  else tQueue.pending.push_back({f.buf, f.cap, nullptr, false});
+  f.buf = f.dbuf = nullptr;
+  tQueue.bytes += outLen;
+  if (tQueue.bytes >= (256u << 20)) flushQueue();
+  return out;
+}
+}  // namespace
+
+void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, int64_t& encOff) {
+  encOff = 0;
+  SegFile& file = *d.file;  // (called for columns that were cold: they have a file)
+  const auto& col = file.cols[c];
+  auto present = [&](void* p) -> void* {  // a column in memory: row lo of it
+    if (col.enc) {
+      encOff = lo;
+      return p;
+    }
+    return (char*)p + lo * (int64_t)col.width;
+  };
+  if (!segCold(d, c)) return present(d.dev[c]);
+  const bool whole = lo == 0 && n >= file.rows;
   auto it = tFetches.find({&d, c, lo});
   {
     std::lock_guard<std::mutex> g(d.loadMu);
-    if (!d.cold[c] || revive(d, c)) return d.dev[c];
-    const auto& col = d.file->cols[c];
-    const int64_t need = (int64_t)col.len + (col.enc ? (int64_t)d.file->rows * col.width : 0);
+    if (!d.cold[c] || revive(d, c)) return present(d.dev[c]);
+    const int64_t need = (int64_t)col.len + (col.enc ? (int64_t)file.rows * col.width : 0);
     if (whole && it == tFetches.end() && g_hostBytes + need <= g_memLimit) {  // room in the cache
-      loadLocked(d, c, d.file->rows);
-      return d.dev[c];
+      loadLocked(d, c, file.rows);
+      return present(d.dev[c]);
     }
   }
   // Over the budget: the rows of this batch, for this scan only (read ahead if possible).
@@ -716,27 +899,44 @@ void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased) {
     f = it->second;
     tFetches.erase(it);
     waitFetch(*f);
-    tFetchBytes -= (int64_t)f->cap;
+    tFetchBytes -= (int64_t)std::max(f->cap, f->dcap);
     if (f->failed) {
-      if (f->buf) pinPut(f->buf, f->cap);
-      throw SqlError("cannot read segment file " + pathOf(d.file->id), 1105);
+      fetchFree(*f);
+      throw SqlError("cannot read segment file " + pathOf(file.id), 1105);
     }
   } else {
-    const size_t total = storedSize(*d.file, c, lo, n);
     f = std::make_shared<Fetch>();
-    f->len = total;
-    f->cap = pinClass(std::max<size_t>(total, 1));
-    f->buf = pinGet(f->cap);
+    f->len = storedSize(file, c, lo, n);
     try {
-      readRows(*d.file, c, lo, n, (uint8_t*)f->buf, true);
+      if (gpuPath(col, n)) readCompressed(file, c, lo, n, *f);
+      else {
+        f->cap = pinClass(std::max<size_t>(f->len, 1));
+        f->buf = pinGet(f->cap);
+        readRows(file, c, lo, n, (uint8_t*)f->buf, true);
+      }
     } catch (...) {
-      pinPut(f->buf, f->cap);
+      fetchFree(*f);
       throw;
     }
   }
   pinReap(false);
   readAhead(c);
-  rebased = !whole;
+  if (f->gpu) {
+    int64_t first = 0;
+    if (uint8_t* p = (uint8_t*)decompressOnGpu(file, c, *f, first)) {
+      if (col.enc) {
+        encOff = lo - first;
+        return p;
+      }
+      return p + (lo - first) * (int64_t)col.width;
+    }
+    // (out of VRAM: decompressed on the CPU into mapped pinned memory below)
+    fetchFree(*f);
+    f->gpu = false;
+    f->cap = pinClass(std::max<size_t>(f->len, 1));
+    f->buf = pinGet(f->cap);
+    readRows(file, c, lo, n, (uint8_t*)f->buf, true);
+  }
   tTempBytes += (int64_t)f->len;
   void* p = nullptr;
   if (cudaMallocAsync(&p, std::max<size_t>(f->len, 1), 0) == cudaSuccess) {
@@ -754,7 +954,10 @@ void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased) {
   return p;
 }
 
+void scanFlush() { flushQueue(); }
+
 void releaseScanTemps() {
+  flushQueue();
   if (tTemps.empty()) return;
   bool synced = false;
   for (auto& t : tTemps) {
@@ -773,7 +976,7 @@ void releaseStatementTemps() {
   pinReap(true);
   for (auto& [k, f] : tFetches) {  // read-aheads the scans did not get to
     waitFetch(*f);
-    if (f->buf) pinPut(f->buf, f->cap);
+    fetchFree(*f);
   }
   tFetches.clear();
   tFetchBytes = 0;

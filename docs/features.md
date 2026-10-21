@@ -144,7 +144,13 @@ CPU-side DML on many rows read whole columns into memory. `SELECT .. ORDER BY ..
 10,000) scans only the filter and ORDER BY columns and reads the others for the n rows it returns. Segment
 files store each column in zstd-compressed blocks of 16K rows (the SORT KEY column uncompressed) with a
 block index, so reads of row ranges and single rows only decompress the blocks they need (files from
-before, stored uncompressed, still load). No GPUDirect Storage or GPU decompression yet.
+before, stored uncompressed, still load). With NVIDIA nvCOMP installed (`scripts/install-nvcomp.sh`,
+loaded at run time; `WARPSTORE_NVCOMP_DIR`), scans copy the compressed blocks to the GPU and decompress
+them there, batched per flush (before the kernels that read them); reads under 1 MB, and the cache's own
+loads, are decompressed on the CPU. `WARPSTORE_GPU_DECOMPRESS=0` turns it off. GPUDirect Storage:
+with the nvidia-fs driver loaded, the compressed blocks are read straight into VRAM through cuFile
+(`WARPSTORE_GPUDIRECT=auto` (default) | `on` (also in cuFile's compatibility mode) | `off`). The server
+log says which are in use at startup.
 
 ## Usage
 

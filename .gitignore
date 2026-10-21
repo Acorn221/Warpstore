@@ -5,3 +5,4 @@ warpstore-data/
 __pycache__/
 node_modules/
 gpudb-data/
+cufile.log

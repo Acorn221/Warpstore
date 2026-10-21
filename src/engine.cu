@@ -3278,11 +3278,9 @@ inline void bindView(ColView& v, const BatchRef& b, int c) {
   v.enc = b.enc ? (*b.enc)[c] : 0;
   v.off = v.enc ? b.off : 0;
   if (!v.p && b.seg && (size_t)c < b.seg->d->cold.size()) {  // a cold column (disk tier): read it
-    bool rebased = false;
-    void* p = segScanColumn(*b.seg->d, c, b.off, b.n, rebased);
-    if (rebased) v.off = 0;  // (only the batch's rows were read)
-    else if (p && b.off && !v.enc) p = (char*)p + (int64_t)b.off * b.seg->d->file->cols[c].width;
-    v.p = p;
+    int64_t encOff = 0;
+    v.p = segScanColumn(*b.seg->d, c, b.off, b.n, encOff);
+    if (v.enc) v.off = (int32_t)encOff;
   }
 }
 
@@ -3382,6 +3380,12 @@ void scanTable(Table& t, const std::vector<int>& parts, const std::vector<ExprP>
       if (on) scanAheadExchange(a, pos);
     }
   } restore{ahead, aheadPos, !dryRun};
+  struct Flush {  // GPU decompressions of the columns read by the last batches (before their kernels)
+    bool on;
+    ~Flush() {
+      if (on) scanFlush();
+    }
+  } flush{!dryRun};
   size_t aheadAt = 0;
   std::vector<void*> adj;
   for (auto& vis : plan) {
@@ -3591,6 +3595,7 @@ Rel materialize(BindCtx& ctx, int bt, const std::vector<ExprP>& preds, const std
   int windows = 0;
   auto window = [&] {
     if (bn.empty()) return;
+    scanFlush();
     ++windows;
     DevVec<int32_t> sel;
     std::vector<int64_t> perBatch;
@@ -6741,6 +6746,7 @@ ResultSet Engine::doModify(Stmt& s) {
       const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
       struct Temps { ~Temps() { releaseScanTemps(); } } temps;
       for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
+      scanFlush();
       DevVec<int32_t> idx(sg.n);
       int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
       for (int32_t r : idx.download(m)) matched.push_back(Loc{(int32_t)si, r});
@@ -7262,6 +7268,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
           struct Temps { ~Temps() { releaseScanTemps(); } } temps;
           for (size_t kk = 0; kk < wcomp.slotCols.size(); ++kk) bindView(wcomp.env.cols[kk], br, wcomp.slotCols[kk].second);
+          scanFlush();
           DevVec<int32_t> idx(sg.n);
           const int64_t m = gpuSelect(wcomp.env, true, wprog, sg.n, sdel, idx.p);
           if (m == 0) continue;
@@ -8185,7 +8192,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         st = ScanStats();
         forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
           a1.addBatch(env, ncols, n, del);
-          if (scanWindowFull()) a1.runWindow(comp.env, jit1), releaseScanTemps();  // (disk tier)
+          if (scanWindowFull()) scanFlush(), a1.runWindow(comp.env, jit1), releaseScanTemps();  // (disk tier)
           return true;
         });
         a1.run(comp.env, jit1);
@@ -8264,7 +8271,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         } else {
           forEachBatch(ctx, 0, comp, conj, st, [&](ExprEnv& env, int64_t n, const uint32_t* del) {
             agg.addBatch(env, ncols, n, del);
-            if (scanWindowFull()) agg.runWindow(comp.env, jit), releaseScanTemps();  // (disk tier)
+            if (scanWindowFull()) scanFlush(), agg.runWindow(comp.env, jit), releaseScanTemps();  // (disk tier)
             return true;
           });
         }

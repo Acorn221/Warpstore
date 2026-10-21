@@ -28,6 +28,7 @@
 #include "engine.h"
 #include "monitor.h"
 #include "storage.h"
+#include "gpuio.h"
 #include "jit.h"
 #include "gpu.h"
 
@@ -1474,6 +1475,8 @@ int main(int argc, char** argv) {
     tierInit(dataDir, lim);
     if (!dataDir.empty() && lim > 0)
       fprintf(stderr, "[warpstore] table data in host memory up to %.1f GB, the rest in %s/segments (--memory-limit)\n", lim / 1073741824.0, dataDir.c_str());
+    if (!dataDir.empty())
+      fprintf(stderr, "[warpstore] segment files: decompression %s; reads: %s\n", nvcompStatus().c_str(), gdsStatus().c_str());
   }
   Engine engine(dataDir, sync, partitions);
   fprintf(stderr, "[warpstore] %d partitions per sharded table\n", partitions);

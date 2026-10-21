@@ -100,5 +100,5 @@ src/embed.*        BERT-style sentence embeddings on cuBLAS (EMBED())
 src/proc.cpp       stored procedures, UDFs
 tests/             run.py (the suite), lib.py, fuzz.py, ORM projects in tests/orm
 bench/             TPC-H, ClickBench, use-case and HTAP benchmarks (DuckDB / SingleStore comparisons)
-scripts/           install-deps.sh, test-containers.sh, install-cuvs.sh, fetch-embed-model.sh
+scripts/           install-deps.sh, test-containers.sh, install-cuvs.sh, install-nvcomp.sh, fetch-embed-model.sh
 ```

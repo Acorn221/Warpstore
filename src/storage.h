@@ -277,6 +277,9 @@ struct SegFile {
     std::vector<uint64_t> blocks;
   };
   std::vector<Col> cols;
+  std::mutex gdsMu;
+  void* gds = nullptr;  // GPUDirect Storage handle (opened on first use)
+  bool gdsTried = false;
   ~SegFile();  // closes the file; deletes it unless the installed snapshot refers to it
 };
 struct SegData;
@@ -293,10 +296,14 @@ void segFilesInstalled(const std::vector<uint64_t>& ids);  // a snapshot referri
 void segFilesCleanup();                                    // startup: deletes files no segment uses
 bool segCold(const SegData& d, int c);
 void segLoad(SegData& d, int c);            // makes a cold column present (host mirror + device copy)
-// Device pointer to column c for a scan batch of rows [lo, lo + n). A cold column is read into the
-// cache (whole batches, while there is room) or for the scan only: then just the batch's rows, and
-// rebased is set (the pointer is to row lo; read encoded columns with ColView::off = 0).
-void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, bool& rebased);
+// Device data of column c for a scan batch of rows [lo, lo + n): raw columns, a pointer to row lo;
+// encoded ones, a pointer to the encoding's header, with encOff the ColView::off of row lo. A cold
+// column is read into the cache (whole batches, while there is room) or for the scan only: then just
+// the blocks with the batch's rows, decompressed on the GPU when nvCOMP is there (gpuio.h).
+void* segScanColumn(SegData& d, int c, int64_t lo, int64_t n, int64_t& encOff);
+// Runs the queued GPU decompressions of columns read for the scan: before launching kernels that read
+// columns bound since the last flush (scanTable flushes when it ends).
+void scanFlush();
 void releaseScanTemps();       // frees this thread's scan-only column copies (after the kernels using them)
 void releaseStatementTemps();  // ... and read-aheads not used (end of statement)
 // The segment batches the running scan visits, in order, for read-ahead (exchange: save / restore).

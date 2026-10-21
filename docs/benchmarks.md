@@ -260,10 +260,10 @@ come from the NVMe drive. DuckDB and ClickHouse are compared with their hot, in-
 | Warpstore setup | All 43 queries | Geomean | vs DuckDB hot (geomean) | vs ClickHouse hot (geomean) |
 |---|---:|---:|---:|---:|
 | everything in memory | 0.26 s | 2.5 ms | 13.4x faster | 23.9x faster |
-| `--memory-limit 2`, files in the OS page cache | 0.27 s | 2.8 ms | 12.3x faster | 21.8x faster |
-| `--memory-limit 2`, read from the SSD | 0.25 s | 2.8 ms | 12.3x faster | 21.8x faster |
-| `--memory-limit 0.25`, files in the OS page cache | 0.78 s | 8.8 ms | 3.8x faster | 6.8x faster |
-| `--memory-limit 0.25`, read from the SSD | 0.77 s | 8.6 ms | 4.0x faster | 7.0x faster |
+| `--memory-limit 2`, files in the OS page cache | 0.29 s | 2.9 ms | 11.9x faster | 21.1x faster |
+| `--memory-limit 2`, read from the SSD | 0.29 s | 2.8 ms | 12.1x faster | 21.4x faster |
+| `--memory-limit 0.25`, files in the OS page cache | 0.64 s | 7.6 ms | 4.5x faster | 7.9x faster |
+| `--memory-limit 0.25`, read from the SSD | 0.72 s | 7.4 ms | 4.6x faster | 8.1x faster |
 
 How the disk tier keeps this fast:
 
@@ -283,9 +283,30 @@ How the disk tier keeps this fast:
   (Q24: 2.9 s reading all 105 columns, 45 ms now; the cells are read grouped by block, each block
   decompressed once).
 
-Before these, the 0.25 GB / SSD run took 5.2 s. What is left is mostly decompressing whole columns for
-full scans on the CPU (GROUP BY over WatchID / ClientIP / URL); decompressing on the GPU (nvCOMP) would be
-next.
+- **Decompression on the GPU.** With nvCOMP installed (`scripts/install-nvcomp.sh`), the compressed
+  blocks go to the GPU as they are (4-5x less over PCIe) and are decompressed there, all the columns of
+  a batch in one nvCOMP call (each call costs ~0.4 ms however much it does, so small reads, like a
+  narrow SORT KEY range, stay on the CPU). Here: 0.72 s from the SSD, 0.77 s with the CPU doing it
+  (`WARPSTORE_GPU_DECOMPRESS=0`; it already decompresses on all cores, so the gain is modest).
+  GPUDirect Storage (`WARPSTORE_GPUDIRECT`, via cuFile) reads the compressed blocks straight into VRAM
+  when the nvidia-fs driver is loaded; this machine (a GeForce card) doesn't have it, so it is untested
+  for speed here: in cuFile's compatibility mode the results are the same.
+
+Before these, the 0.25 GB / SSD run took 5.2 s.
+
+GPU compression formats on ClickBench columns (13 columns, 1M rows each, sorted like the table, in
+chunks of 16K rows; RTX 3080, nvCOMP 5.3). zstd compresses the best and still decompresses at 10+ GB/s
+on the GPU, and files stay readable on the CPU (and without nvCOMP), so segment files use it:
+
+| Format | Ratio | GPU decompression, 806 chunks | One call |
+|---|---:|---:|---:|
+| zstd | 4.33 | 10-11.5 GB/s | 0.35-0.4 ms |
+| Cascaded (RLE + delta + bit-packing) | 3.58 | (failed in this test) | |
+| GDeflate | 3.34 | 13.3 GB/s | 3.2 ms |
+| Bitcomp | 2.81 | (failed in this test) | 0.23 ms |
+| LZ4 | 2.70 | 9.5 GB/s | 0.58 ms |
+| frame of reference + bit-packing per chunk | 1.91 | | |
+| ANS | 1.69 | 239 GB/s | 0.02 ms |
 
 ### SingleStore's use cases, head to head (`bench/usecases.py`)
 

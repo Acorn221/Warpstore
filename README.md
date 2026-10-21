@@ -39,8 +39,8 @@ what it is good and bad at.
 - **It is fastest when the columns your queries touch fit in RAM.** Tables can be larger than RAM:
   column data beyond `--memory-limit` (default: half the RAM) lives in segment files and streams
   through the GPU in windows when scanned. With ClickBench's working set in memory nothing changes;
-  with only 0.25 GB of RAM for a 3.8 GB table, reading from the SSD, the 43 queries take 0.77 s instead
-  of 0.26 s (still 4x DuckDB with its data in memory, see [benchmarks](docs/benchmarks.md#when-the-data-doesnt-fit-in-ram)).
+  with only 0.25 GB of RAM for a 3.8 GB table, reading from the SSD, the 43 queries take 0.72 s instead
+  of 0.26 s (still 4.6x DuckDB with its data in memory, see [benchmarks](docs/benchmarks.md#when-the-data-doesnt-fit-in-ram)).
   Write buffers, primary-key and secondary indexes and string dictionaries still live in RAM, so
   billions of rows need a lot of it.
 - **An NVIDIA GPU is required** (Turing or newer, CUDA 12). No AMD, Apple or CPU-only mode.
@@ -105,8 +105,10 @@ mysql -h 127.0.0.1 -P 3307 -u root
 ```
 
 Optional extras: `scripts/install-cuvs.sh` (NVIDIA cuVS, ~3 GB: the GPU graph vector index; rerun
-cmake afterwards) and `scripts/fetch-embed-model.sh` (the ~90 MB model behind `EMBED()`). Without
-them vector indexes fall back to IVF and `EMBED()` reports that the model is missing.
+cmake afterwards), `scripts/install-nvcomp.sh` (NVIDIA nvCOMP: decompresses segment files on the GPU
+for tables larger than RAM) and `scripts/fetch-embed-model.sh` (the ~90 MB model behind `EMBED()`).
+Without them vector indexes fall back to IVF, segment files are decompressed on the CPU and `EMBED()`
+reports that the model is missing.
 
 By default the server listens on 127.0.0.1 only and root has no password; it refuses to listen on
 other addresses until root has one (`--root-password` / `WARPSTORE_ROOT_PASSWORD`). TLS is on with a
