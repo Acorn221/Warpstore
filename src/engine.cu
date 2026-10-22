@@ -9185,10 +9185,19 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           for (int g = 0; g < plan.nkeys; ++g)
             if (canon(groupBy[g]) == k) key = g;
           if (key >= 0) {
-            if (ty == LType::VARCHAR) {
+            if (ty == LType::VARCHAR) {  // the derived table shares the dictionary (it only grows), or a copy
               const Dict* d = ctx.dict(*e);
-              if (!d || d->strs.size() > (1u << 20)) { ok = false; break; }
-              dicts[i] = std::make_shared<Dict>(*d);
+              if (!d) { ok = false; break; }
+              if (e->kind == Expr::COL && e->bt >= 0) dicts[i] = ctx.tabs[e->bt]->dicts[e->bc];
+              for (auto& sd : ctx.sharedDicts)
+                if (!dicts[i] && sd.get() == d) dicts[i] = sd;
+              for (auto& tb : ctx.tabs)  // (e.g. canonical case-insensitive codes of a column: its dictionary)
+                for (auto& td : tb->dicts)
+                  if (!dicts[i] && td.get() == d) dicts[i] = td;
+              if (!dicts[i]) {
+                if (d->strs.size() > (1u << 20)) { ok = false; break; }
+                dicts[i] = std::make_shared<Dict>(*d);
+              }
             }
             sp.src = 0;
             sp.idx = key;
@@ -9449,7 +9458,17 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         if (t == LType::DECIMAL) t = LType::DOUBLE;
       res.colDicts.assign(items.size(), nullptr);
       for (size_t i = 0; i < items.size(); ++i)
-        if (items[i].e->ty == LType::VARCHAR) res.colDicts[i] = std::make_shared<Dict>(*ctx.dict(*items[i].e));
+        if (items[i].e->ty == LType::VARCHAR) {  // (shared when it is a column's or a cached derived one)
+          const ExprP& e = items[i].e;
+          const Dict* d = ctx.dict(*e);
+          if (e->kind == Expr::COL && e->bt >= 0) res.colDicts[i] = ctx.tabs[e->bt]->dicts[e->bc];
+          for (auto& sd : ctx.sharedDicts)
+            if (!res.colDicts[i] && sd.get() == d) res.colDicts[i] = sd;
+          for (auto& tb : ctx.tabs)
+            for (auto& td : tb->dicts)
+              if (!res.colDicts[i] && td.get() == d) res.colDicts[i] = td;
+          if (!res.colDicts[i]) res.colDicts[i] = std::make_shared<Dict>(*d);
+        }
       phost.done((int64_t)nr, "columnar result for a derived table");
       res.info = single ? "gpu-aggregate" : "gpu-join-aggregate";
       return res;
@@ -9909,7 +9928,7 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
       seg->mn[c] = r.devCols[c]->mn;
       seg->mx[c] = r.devCols[c]->mx;
       seg->devBytes += n * t->colBytes((int)c);
-      if (cols[c].lt == LType::VARCHAR) *t->dicts[c] = *r.colDicts[c];
+      if (cols[c].lt == LType::VARCHAR) t->dicts[c] = r.colDicts[c];  // (shared: temp tables add no strings)
       t->hasNull[c] = 1;
     }
     seg->del->host.assign((size_t)(n + 31) / 32, 0);
@@ -9926,7 +9945,7 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
       const ColumnMeta& m = cols[c];
       if (m.lt == LType::VARCHAR) {  // dictionary codes: the column takes a copy of their dictionary
         if (c >= r.colDicts.size() || !r.colDicts[c]) throw SqlError("internal: string column without a dictionary", 1105);
-        *t->dicts[c] = *r.colDicts[c];
+        t->dicts[c] = r.colDicts[c];  // (shared: temp tables add no strings)
       }
       const int sz = t->colBytes((int)c);
       std::vector<uint8_t> bytes(n * sz);
