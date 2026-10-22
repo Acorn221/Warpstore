@@ -43,10 +43,22 @@ void gpuInit() {
   // Per-thread stack: the default 1 KB overflows in aggregation kernels that call FP64 division
   // (DECIMAL scaling) on top of their accumulator arrays. Costs about stack x resident threads of VRAM.
   CK(cudaDeviceSetLimit(cudaLimitStackSize, 2048));
+  // Query temporaries come from the stream-ordered pool, which keeps what is freed for the next
+  // queries (returning memory at every synchronization costs ~30% of throughput); an allocation that
+  // fails gives the pool's unused memory back first (gpuTrimPool) and tries again.
   cudaMemPool_t pool;
   CK(cudaDeviceGetDefaultMemPool(&pool, 0));
   uint64_t thresh = UINT64_MAX;
   CK(cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &thresh));
+}
+
+// Gives the pool's unused memory back to the device (after an allocation failed: maybe it was there).
+void gpuTrimPool() {
+  cudaMemPool_t pool;
+  if (cudaDeviceGetDefaultMemPool(&pool, 0) != cudaSuccess) return;
+  cudaDeviceSynchronize();
+  cudaMemPoolTrimTo(pool, 0);
+  cudaGetLastError();
 }
 
 std::string gpuDescribe() {
@@ -83,7 +95,8 @@ void* placeColumn(void* host, size_t bytes, bool& mapped, bool hostOnly) {
   if (!bytes) return nullptr;
   if (!hostOnly && g_vramUsed + (int64_t)bytes <= g_vramLimit) {
     void* p = nullptr;
-    if (cudaMalloc(&p, bytes) == cudaSuccess) {
+    if (cudaMalloc(&p, bytes) != cudaSuccess) cudaGetLastError(), gpuTrimPool();  // (pool memory to spare?)
+    if (p || cudaMalloc(&p, bytes) == cudaSuccess) {
       g_vramUsed += (int64_t)bytes;
       CK(cudaMemcpy(p, host, bytes, cudaMemcpyHostToDevice));
       return p;
@@ -151,7 +164,12 @@ void gpuGatherEnc(const ColView& v, PType t, const int32_t* idx, int64_t m, void
 
 void* tmpAlloc(size_t bytes) {
   void* p = nullptr;
-  if (bytes) CK(cudaMallocAsync(&p, bytes, 0));
+  if (!bytes) return p;
+  if (cudaMallocAsync(&p, bytes, 0) != cudaSuccess) {  // once more with the pool's spare memory released
+    cudaGetLastError();
+    gpuTrimPool();
+    CK(cudaMallocAsync(&p, bytes, 0));
+  }
   return p;
 }
 void tmpFree(void* p) { if (p) cudaFreeAsync(p, 0); }
@@ -248,13 +266,19 @@ GpuAggregator::GpuAggregator(const AggPlan& plan, int64_t capacity, const DenseS
   while (c < capacity) c <<= 1;
   cap_ = plan.nkeys ? (dense_.G ? dense_.G : c) : 1;
   if (plan.nkeys == 0) return;  // accumulators are allocated and initialized with the batches in run()
-  CK(cudaMallocAsync(&flags_, sizeof(int) * 2, 0));
-  CK(cudaMemsetAsync(flags_, 0, sizeof(int) * 2, 0));
-  CK(cudaMallocAsync(&count_, sizeof(unsigned long long), 0));
-  CK(cudaMemsetAsync(count_, 0, sizeof(unsigned long long), 0));
-  CK(cudaMallocAsync(&gkeys_, sizeof(unsigned long long) * cap_, 0));
-  CK(cudaMallocAsync(&gkv_, sizeof(double) * cap_ * plan.nkeys, 0));
-  CK(cudaMallocAsync(&gacc_, sizeof(double) * cap_ * std::max(plan.naggs, 1), 0));
+  try {  // (a constructor that throws gets no destructor: what was allocated is freed here)
+    flags_ = (int*)tmpAlloc(sizeof(int) * 2);
+    CK(cudaMemsetAsync(flags_, 0, sizeof(int) * 2, 0));
+    count_ = (unsigned long long*)tmpAlloc(sizeof(unsigned long long));
+    CK(cudaMemsetAsync(count_, 0, sizeof(unsigned long long), 0));
+    gkeys_ = (unsigned long long*)tmpAlloc(sizeof(unsigned long long) * cap_);
+    gkv_ = (double*)tmpAlloc(sizeof(double) * cap_ * plan.nkeys);
+    gacc_ = (double*)tmpAlloc(sizeof(double) * cap_ * std::max(plan.naggs, 1));
+  } catch (...) {
+    for (void* p : {(void*)gkeys_, (void*)gkv_, (void*)gacc_, (void*)flags_, (void*)count_})
+      if (p) cudaFreeAsync(p, 0);
+    throw;
+  }
   GTable t{gkeys_, gkv_, gacc_, (unsigned long long)(cap_ - 1), flags_, count_};
   initTable<<<gridFor(cap_), 256>>>(t, plan.nkeys, plan.naggs, plan_);
   CK(cudaGetLastError());

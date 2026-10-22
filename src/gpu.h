@@ -30,7 +30,8 @@ void* hostMap(void* host, size_t bytes);
 void hostUnmap(void* host);
 int64_t gpuVramLimit();  // INT64_MAX: no --vram-limit
 int64_t gpuVramFree();   // free device memory
-void* tmpAlloc(size_t bytes);         // stream-ordered pool allocation
+void* tmpAlloc(size_t bytes);
+void gpuTrimPool();  // returns the allocation pool's unused memory to the device         // stream-ordered pool allocation
 void tmpFree(void* p);
 void h2d(void* dst, const void* src, size_t bytes);
 void d2h(void* dst, const void* src, size_t bytes);

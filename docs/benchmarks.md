@@ -357,6 +357,13 @@ values per row, at about 2M rows/s, and stopped at 20M rows); an UPDATE of 5.3M 
 (new rows start as the old rows' stored cells, so only the SET columns are converted; it was about
 0.9M rows/s); DELETE of 5.3M rows 1.0 s.
 
+**Concurrent analytics** (ClickBench 10M rows, clients each running random queries of the 43, hot):
+1 client 250 q/s; 4, 8 and 16 clients about 340 q/s with no errors. Before, concurrent queries
+could run the GPU out of memory: a GROUP BY's hash table leaked when its allocation failed half way,
+and the allocation pool never gave memory back, so the failures cascaded (thousands of errors per
+run). Now at most 4 queries use the GPU at once (`WARPSTORE_GPU_QUERIES`), a query that still runs
+out of memory runs again alone, and failed allocations release the pool's spare memory first.
+
 ### Against SingleStore's published "trillion rows per second" query
 
 SingleStore's headline benchmark ([blog](https://www.singlestore.com/blog/how-to-process-trillion-rows-per-second-ad-hoc-analytic-queries/))

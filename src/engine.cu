@@ -11,6 +11,7 @@
 #include <openssl/sha.h>
 #include <random>
 #include <zlib.h>
+#include <semaphore>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
@@ -5166,9 +5167,53 @@ ResultSet runSelect(Engine* e, const std::function<ResultSet()>& fn, const std::
 }  // namespace
 
 thread_local int tExecDepth = 0;
+// Concurrent queries share the GPU's memory: their temporary buffers (hash tables, gathered columns)
+// can add up to more than there is. A query that runs out takes this gate exclusively, once the ones
+// in flight are done, and runs again alone; queries take it shared. (Writes don't: they aren't
+// retried, and a long LOAD would hold up every query behind a waiting retry.)
+static FairSharedMutex gGpuGate;
+// And at most this many run at once (WARPSTORE_GPU_QUERIES, default 4): more only queue on the GPU
+// while their temporaries add up, and running out means retries.
+static std::counting_semaphore<1024>& gpuSlots() {
+  static std::counting_semaphore<1024> s(std::clamp(envSetting("GPU_QUERIES") ? atoi(envSetting("GPU_QUERIES")) : 4, 1, 1024));
+  return s;
+}
+
 ResultSet Engine::execute(const std::string& sql) {
+  const std::string fw = tExecDepth == 0 ? firstWord(sql) : std::string();
+  const bool query = fw == "SELECT" || fw == "WITH" || fw == "EXPLAIN" || fw == "PROFILE" || fw == "(";
   try {
-    return executeStmt(sql);
+    if (!query) return executeStmt(sql);
+    gpuSlots().acquire();
+    struct Slot {
+      ~Slot() { gpuSlots().release(); }
+    } slot;
+    try {
+      std::shared_lock<FairSharedMutex> gate(gGpuGate);
+      return executeStmt(sql);
+    } catch (SqlError& e) {
+      if (e.code != 1041 || sql.find("INTO OUTFILE") != std::string::npos) throw;
+    }
+    // Out of GPU memory: once every other query is done, alone (this attempt's buffers are freed).
+    std::unique_lock<FairSharedMutex> alone(gGpuGate);
+    gpuTrimPool();
+    try {
+      return executeStmt(sql);
+    } catch (SqlError& e) {
+      if (e.code == 1041) {
+        size_t mapDev = 0;
+        {
+          std::lock_guard<std::mutex> g(gDerivMu);
+          for (auto& [k, v] : gMapDev)
+            if (v.second) mapDev += v.second->n * 8;
+          for (auto& [k, v] : gDeriv)
+            if (v.bitsDev) mapDev += v.bitsDev->n * 4;
+        }
+        fprintf(stderr, "[warpstore] out of GPU memory even alone (%.0f MB free; columns %.0f MB, derived maps %.0f MB): %.200s\n",
+                gpuVramFree() / 1048576.0, gpuVramUsed() / 1048576.0, mapDev / 1048576.0, sql.c_str());
+      }
+      throw;
+    }
   } catch (SqlError& e) {
     if (e.code == 1213 && tExecDepth == 0 && tTxn.active) rollbackTxn();  // deadlock victim: the whole transaction (MySQL)
     throw;
