@@ -7679,7 +7679,12 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     std::vector<std::vector<int64_t>> iv(nc);
     std::vector<std::vector<double>> dv(nc);
     std::vector<std::exception_ptr> errs(nc);
-    ioParallel(nc, [&](size_t c) {  // one column per task (each its own dictionary)
+    // String columns first (the long tasks: dictionary coding), so they don't start last.
+    std::vector<size_t> order(nc);
+    for (size_t c = 0; c < nc; ++c) order[c] = c;
+    std::stable_partition(order.begin(), order.end(), [&](size_t c) { return t->cols[c].lt == LType::VARCHAR && in[c].dict.empty(); });
+    ioParallel(nc, [&](size_t oc) {  // one column per task (each its own dictionary)
+      const size_t c = order[oc];
       struct ColTime {  // (WARPSTORE_TRACE: per-column conversion time)
         double& acc;
         Clock::time_point t0 = Clock::now();

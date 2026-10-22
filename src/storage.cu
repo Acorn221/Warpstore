@@ -754,6 +754,8 @@ void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std
       ioParallel(nc, [&](size_t c) {
         std::vector<uint8_t>& dst = buf.cols[c];
         const size_t w = (size_t)psize(cols[c].pt), o = dst.size();
+        if (k >= 4096 && dst.capacity() < o + k * w)  // bulk: room for a whole segment at once, no copy per growth (pages touched as filled)
+          dst.reserve(std::max<size_t>(o + k * w, (size_t)kSegRows * w));
         dst.resize(o + k * w);
         uint8_t* d = dst.data() + o;
         if (run) {
