@@ -151,7 +151,8 @@ struct Stmt {
   std::vector<std::pair<std::string, ExprP>> onDup;  // ON DUPLICATE KEY UPDATE
   // ALTER TABLE actions
   struct Alter {
-    enum Kind { ADD_COL, DROP_COL, RENAME_COL, MODIFY_COL, RENAME_TABLE, ADD_INDEX, DROP_INDEX, SET_VRAM, ADD_FK, DROP_FK, NOOP } kind = NOOP;
+    enum Kind { ADD_COL, DROP_COL, RENAME_COL, MODIFY_COL, RENAME_TABLE, ADD_INDEX, DROP_INDEX, SET_VRAM, ADD_FK, DROP_FK, SET_AUTOINC, NOOP } kind = NOOP;
+    int64_t autoInc = 0;  // SET_AUTOINC: ALTER TABLE t AUTO_INCREMENT = n
     ForeignKeyDef fk;
     int vram = 0;  // SET_VRAM: the hint; name: the column (empty: the table)
     ColumnDef col;

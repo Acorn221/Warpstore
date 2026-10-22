@@ -1837,6 +1837,10 @@ struct Parser {
           a.kind = Stmt::Alter::MODIFY_COL;
           a.name = ident();
           a.col = columnDef();
+        } else if (acceptKw("AUTO_INCREMENT")) {  // ALTER TABLE t AUTO_INCREMENT [=] n
+          acceptSym("=");
+          a.kind = Stmt::Alter::SET_AUTOINC;
+          a.autoInc = intLit();
         } else if (acceptKw("VRAM")) {  // ALTER TABLE t VRAM = PIN
           a.kind = Stmt::Alter::SET_VRAM;
           a.vram = vramHint();

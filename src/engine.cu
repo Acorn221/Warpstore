@@ -5994,7 +5994,7 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
   if (tExecDepth == 0 && !replaying_) {
     // (not: reads, and statements made durable by a snapshot of their own instead of the WAL)
     static const std::set<std::string> reads = {"SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH", "SET", "USE", "(",
-                                                "SNAPSHOT", "BACKUP", "RESTORE", "PROFILE", "KILL", "PROMOTE", "HELP"};
+                                                "SNAPSHOT", "BACKUP", "RESTORE", "OPTIMIZE", "PROFILE", "KILL", "PROMOTE", "HELP"};
     if (!reads.count(firstWord(sql))) writeGate = std::shared_lock<FairSharedMutex>(writeGate_);
   }
   struct GateHeld {
@@ -6744,6 +6744,9 @@ ResultSet Engine::doAlter(Stmt& s) {
         ix.erase(jt);
         continue;
       }
+      case Stmt::Alter::SET_AUTOINC:  // the next AUTO_INCREMENT value (never below the values in use)
+        cur->autoNext = std::max<int64_t>(cur->autoNext, a.autoInc);
+        continue;
       case Stmt::Alter::SET_VRAM: {  // placement hint only: the VRAM cache applies it within a second
         if (a.name.empty()) cur->vram = a.vram;
         else {
@@ -7996,6 +7999,26 @@ ResultSet Engine::doLoad(Stmt& s) {
   return okResult(n, info);
 }
 
+// Share of a string column's dictionary that live rows still use (dictionaries only grow: strings
+// of deleted / updated rows stay). (table lock held)
+static double dictUse(const Table& t, int c) {
+  const Dict& d = *t.dicts[c];
+  const size_t n = d.strs.size();
+  if (n == 0) return 1;
+  std::vector<uint8_t> used(n, 0);
+  auto mark = [&](const uint8_t* raw, int64_t rows, const DelBits& del) {
+    const int32_t* v = (const int32_t*)raw;
+    for (int64_t r = 0; r < rows; ++r)
+      if (!del.test(r) && v[r] >= 0 && (size_t)v[r] < n) used[v[r]] = 1;
+  };
+  std::vector<uint8_t> tmp;
+  for (auto& sg : t.segs) mark(segRawColumn(*sg->d, c, tmp), sg->n, *sg->del);
+  for (auto& b : t.bufs) mark(b->cols[c].data(), b->n, *b->del);
+  size_t k = 0;
+  for (uint8_t u : used) k += u;
+  return (double)k / (double)n;
+}
+
 ResultSet Engine::doOptimize(Stmt& s) {
   auto t = cat_.get(s.table);
   std::unique_lock<FairSharedMutex> lk(t->mu);
@@ -8003,13 +8026,43 @@ ResultSet Engine::doOptimize(Stmt& s) {
   t->flush(true);
   for (auto& ix : t->indexes)
     if (ix.vec) t->buildIndex(ix);  // retrain vector indexes on the current data
+  // Dictionaries mostly made of strings no row uses any more: the table is rebuilt (as MySQL's
+  // OPTIMIZE TABLE does), which codes only the live strings.
+  std::string garbage;
+  if (t->txnPending.empty() && t->db != "__tmp")
+    for (size_t c = 0; c < t->cols.size(); ++c)
+      if (t->cols[c].lt == LType::VARCHAR && t->dicts[c] && t->dicts[c]->strs.size() >= 4096) {
+        const double u = dictUse(*t, (int)c);
+        if (u < 0.5) {
+          char b[64];
+          snprintf(b, sizeof b, "%s%s %.0f%% used", garbage.empty() ? "" : ", ", t->cols[c].name.c_str(), u * 100);
+          garbage += b;
+        }
+      }
+  const int64_t autoNext = t->autoNext;
   lk.unlock();
+  std::string msg = "flushed " + std::to_string(n) + " buffered rows to GPU segments";
+  if (!garbage.empty() && !dir_.empty()) {
+    // Each step is a logged statement (a replay rebuilds the same way); writes wait meanwhile.
+    std::unique_lock<FairSharedMutex> gate(writeGate_);
+    const std::string q = "`" + t->db + "`.`", base = q + t->name, tmp = q + t->name + "__ws_rebuild`", old = q + t->name + "__ws_old`";
+    const auto t0 = Clock::now();
+    execute("DROP TABLE IF EXISTS " + tmp);  // (left over by a crash during an earlier rebuild)
+    execute("DROP TABLE IF EXISTS " + old);
+    execute("CREATE TABLE " + tmp + " LIKE " + base + "`");
+    execute("INSERT INTO " + tmp + " SELECT * FROM " + base + "`");
+    if (t->autoIncCol >= 0) execute("ALTER TABLE " + tmp + " AUTO_INCREMENT = " + std::to_string(autoNext));
+    execute("RENAME TABLE " + base + "` TO " + old + ", " + tmp + " TO " + base + "`");
+    execute("DROP TABLE " + old);
+    t = cat_.get(s.table);
+    msg += "; rebuilt the table in " + fmtMs(msSince(t0)) + " ms to drop unused dictionary strings (" + garbage + ")";
+  }
   warmDicts(t);
   ResultSet r;
   r.isResult = true;
   r.names = {"Table", "Op", "Msg_type", "Msg_text"};
   r.types = {LType::VARCHAR, LType::VARCHAR, LType::VARCHAR, LType::VARCHAR};
-  r.rows = {{t->name, "optimize", "status", "flushed " + std::to_string(n) + " buffered rows to GPU segments"}};
+  r.rows = {{t->name, "optimize", "status", msg}};
   return r;
 }
 
