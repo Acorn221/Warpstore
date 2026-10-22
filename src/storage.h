@@ -263,6 +263,7 @@ class StrVec {
   const_iterator end() const { return {this, size()}; }
 };
 
+bool ioPoolCrowded();  // this thread is an I/O pool worker and others are busy too (work in parallel already)
 struct Dict {
   StrVec strs;
   // Dictionary file (snapshots in a data dir; engine.cu): strs [0, fileStrs) are in it, ending at
@@ -331,8 +332,11 @@ struct Dict {
       for (size_t i = 0; i < n; ++i) out[i] = s[i].data() ? add(s[i], hash32(s[i])) : nullCode;
       return;
     }
-    auto par = [](size_t m, const std::function<void(size_t, size_t)>& f) {
-      const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), m / 16384 + 1);
+    // On an I/O pool worker with others busy (e.g. one column of a load, the others coded at the same
+    // time) one thread: the stages are memory-bound, 12 threads did 1.8x the speed for 7x the CPU.
+    const bool serial = ioPoolCrowded();
+    auto par = [serial](size_t m, const std::function<void(size_t, size_t)>& f) {
+      const size_t nth = serial ? 1 : std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), m / 16384 + 1);
       std::vector<std::thread> th;
       for (size_t t = 1; t < nth; ++t) th.emplace_back([&, t] { f(m * t / nth, m * (t + 1) / nth); });
       f(0, m / nth);
