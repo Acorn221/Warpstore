@@ -21,7 +21,8 @@ def start(mem):
     p = subprocess.Popen([BIN, "--data-dir", data, "--port", "3399", "--memory-limit", mem], stdout=log, stderr=log)
     for _ in range(600):
         try:
-            c = pymysql.connect(host="127.0.0.1", port=3399, user="root", autocommit=True, read_timeout=600)
+            c = pymysql.connect(host="127.0.0.1", port=3399, user="root", autocommit=True, read_timeout=600,
+                                database=os.environ.get("WARPSTORE_TIER_DB"))  # (the database with hits, if not the default)
             return p, c.cursor()
         except pymysql.err.OperationalError:
             time.sleep(0.5)

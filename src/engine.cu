@@ -7234,33 +7234,49 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     }
   } flush{t};
   const size_t nc = t.cols.size();
-  std::vector<int64_t> ints(nc);
-  std::vector<double> dbls(nc);
   std::vector<Value> cur(nc), vals(sets.size());
   PostCtx pc;
   pc.row = &cur;
   pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
-  std::vector<const uint8_t*> base(nc);
-  int32_t baseSeg = INT32_MIN;
-  for (const Loc& l : matched) {
-    if (l.seg != baseSeg || l.seg < 0) {  // (write buffer columns may move as rows are appended)
-      for (size_t c = 0; c < nc; ++c) base[c] = t.colData(l, (int)c).data();
-      baseSeg = l.seg;
-    }
-    for (size_t c = 0; c < nc; ++c) switch (t.cols[c].pt) {
-        case PType::I32: ints[c] = ((const int32_t*)base[c])[l.row]; break;
-        case PType::I64: ints[c] = ((const int64_t*)base[c])[l.row]; break;
-        default: dbls[c] = ((const double*)base[c])[l.row]; break;
+  // In chunks: the matched rows' cells, a column per task; the SET values, row by row; then the new
+  // rows appended a column at a time.
+  const size_t kChunk = 262144;
+  std::vector<std::vector<int64_t>> iv(nc);
+  std::vector<std::vector<double>> dv(nc);
+  for (size_t from = 0; from < matched.size(); from += kChunk) {
+    const size_t n = std::min(kChunk, matched.size() - from);
+    const Loc* ls = matched.data() + from;
+    ioParallel(nc, [&](size_t c) {
+      const PType pt = t.cols[c].pt;
+      if (pt == PType::F64) dv[c].resize(n);
+      else iv[c].resize(n);
+      const uint8_t* base = nullptr;
+      int32_t baseSeg = INT32_MIN;
+      for (size_t i = 0; i < n; ++i) {
+        const Loc l = ls[i];
+        if (l.seg != baseSeg) base = t.colData(l, (int)c).data(), baseSeg = l.seg;
+        switch (pt) {
+          case PType::I32: iv[c][i] = ((const int32_t*)base)[l.row]; break;
+          case PType::I64: iv[c][i] = ((const int64_t*)base)[l.row]; break;
+          default: dv[c][i] = ((const double*)base)[l.row]; break;
+        }
       }
-    for (int c : reads) cur[c] = cellValue(t, l, c);
-    for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
-    for (size_t j = 0; j < sets.size(); ++j) {
-      const int c = sets[j].first;
-      Value& v = vals[j];
-      if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
-      t.rawOf(c, v, ints[c], dbls[c]);
+    }, true);
+    int64_t i0;
+    double d0;
+    for (size_t i = 0; i < n; ++i) {
+      for (int c : reads) cur[c] = cellValue(t, ls[i], c);
+      for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
+      for (size_t j = 0; j < sets.size(); ++j) {
+        const int c = sets[j].first;
+        Value& v = vals[j];
+        if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+        t.rawOf(c, v, i0, d0);
+        if (t.cols[c].pt == PType::F64) dv[c][i] = d0;
+        else iv[c][i] = i0;
+      }
     }
-    t.appendRaw(ints, dbls);
+    t.appendColumns(iv, dv, (int64_t)n);
   }
   return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
 }
