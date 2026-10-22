@@ -2025,7 +2025,8 @@ bool likeCI(const std::string& s, const std::string& pat) { return pat.empty() |
 
 // Rebuilds a table with a new schema (ALTER TABLE): `from[i]` is the old column feeding new column i,
 // or -1 for a new column (filled with its default).
-std::shared_ptr<Table> Engine::rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from) {
+std::shared_ptr<Table> Engine::rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from,
+                                      const std::vector<int>* newPk) {
   auto mapCol = [&](int old) {
     for (size_t i = 0; i < from.size(); ++i)
       if (from[i] == old) return (int)i;
@@ -2039,8 +2040,19 @@ std::shared_ptr<Table> Engine::rebuild(Table& t, const std::vector<ColumnMeta>& 
     shard.push_back(mapCol(c));
   }
   int pk = t.pk >= 0 ? mapCol(t.pk) : -1;
+  if (newPk) {  // ADD PRIMARY KEY (as CREATE TABLE: a single integer column gets the hash index)
+    pkCols = *newPk;
+    pk = pkCols.size() == 1 && cols[pkCols[0]].lt != LType::VARCHAR && cols[pkCols[0]].lt != LType::DOUBLE ? pkCols[0] : -1;
+  }
   int sk = t.sortKey >= 0 ? mapCol(t.sortKey) : -1;
   auto nt = std::make_shared<Table>(t.name, cols, pk, sk, pkCols, shard, t.nparts, t.reference);
+  if (newPk && pk < 0) {  // composite or string PRIMARY KEY: a unique index
+    IndexMeta m;
+    m.name = "PRIMARY";
+    m.unique = true;
+    m.cols = pkCols;
+    nt->indexes.push_back(m);
+  }
   nt->db = t.db;
   nt->vram = t.vram;
   nt->fks = t.fks;
@@ -2081,6 +2093,7 @@ ResultSet Engine::doAlter(Stmt& s) {
   std::unique_lock<FairSharedMutex> lk(t->mu);
   std::shared_ptr<Table> cur = t;
   for (auto& a : s.alters) {
+    std::vector<int> addPk;
     std::vector<ColumnMeta> cols = cur->cols;
     std::vector<int> from(cols.size());
     for (size_t i = 0; i < from.size(); ++i) from[i] = (int)i;
@@ -2182,10 +2195,24 @@ ResultSet Engine::doAlter(Stmt& s) {
         }
         continue;
       }
-      case Stmt::Alter::ADD_PK: {  // only the one it has (adding / changing a primary key: not supported)
-        const bool same = cur->pk >= 0 && a.index.cols.size() == 1 && strcasecmp(a.index.cols[0].c_str(), cur->cols[cur->pk].name.c_str()) == 0;
-        if (cur->pk >= 0 && !same) throw SqlError("Multiple primary key defined", 1068);
-        continue;
+      case Stmt::Alter::ADD_PK: {
+        std::vector<int> pkc;
+        for (auto& c : a.index.cols) {
+          const int k = cur->colIndex(c);
+          if (k < 0) throw SqlError("Key column '" + c + "' doesn't exist in table", 1072);
+          pkc.push_back(k);
+        }
+        if (cur->pk >= 0 || !cur->pkCols.empty()) {  // the one it has: nothing to do; another: refused
+          if (pkc != cur->pkCols) throw SqlError("Multiple primary key defined", 1068);
+          continue;
+        }
+        if (pkc.size() == 1 && cols[pkc[0]].lt == LType::DOUBLE) throw SqlError("PRIMARY KEY on DOUBLE is not supported", 1235);
+        for (int c : cur->shardKey)
+          if (std::find(pkc.begin(), pkc.end(), c) == pkc.end())
+            throw SqlError("The unique key named: 'PRIMARY' must contain all columns specified in the shard key", 1705);
+        for (int c : pkc) cols[c].notNull = true;
+        addPk = pkc;  // (the rebuild refuses NULLs and repeated keys, leaving the table as it was)
+        break;
       }
       case Stmt::Alter::DROP_INDEX: {
         auto& ix = cur->indexes;
@@ -2193,7 +2220,7 @@ ResultSet Engine::doAlter(Stmt& s) {
         continue;
       }
     }
-    auto nt = rebuild(*cur, cols, from);
+    auto nt = rebuild(*cur, cols, from, addPk.empty() ? nullptr : &addPk);
     std::lock_guard<std::mutex> g(cat_.mu);
     cat_.tables[Catalog::key(cur->db + "." + cur->name)] = nt;
     cur = nt;

@@ -274,7 +274,8 @@ class Engine {
   void snapshotStatement(const Stmt& s);  // multi-table statements: all snapshots at one moment
   std::vector<std::vector<std::string>> processRows(bool truncateInfo);
   std::string showCreate(const Table& t);
-  std::shared_ptr<Table> rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from);
+  std::shared_ptr<Table> rebuild(Table& t, const std::vector<ColumnMeta>& cols, const std::vector<int>& from,
+                                 const std::vector<int>* newPk = nullptr);
   ResultSet doDescribe(Stmt& s);
   ResultSet doShowSegments(Stmt& s);
 };

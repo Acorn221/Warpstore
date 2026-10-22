@@ -236,6 +236,24 @@ cur.execute("UPDATE ak SET v = 2 WHERE id = 3")
 cur.execute("ALTER TABLE ak ADD UNIQUE KEY (v)")
 c.raises("the UNIQUE key added is enforced", lambda: cur.execute("INSERT INTO ak VALUES (5, 2)"), 1062)
 
+# ADD PRIMARY KEY on a table without one: refused over NULLs / repeated keys (table unchanged),
+# then enforced (an integer column: the hash index; several columns: a unique index)
+cur.execute("CREATE TABLE apk (id INT, s VARCHAR(10), v INT)")
+cur.execute("INSERT INTO apk VALUES (1, 'a', 1), (2, 'b', 2), (NULL, 'd', 4)")
+c.raises("ADD PRIMARY KEY over a NULL refused", lambda: cur.execute("ALTER TABLE apk ADD PRIMARY KEY (id)"), 1048)
+cur.execute("DELETE FROM apk WHERE id IS NULL")
+cur.execute("INSERT INTO apk VALUES (2, 'c', 3)")
+c.raises("ADD PRIMARY KEY over repeated keys refused", lambda: cur.execute("ALTER TABLE apk ADD PRIMARY KEY (id)"), 1062)
+c.eq("the table is unchanged", q("SELECT COUNT(*), SUM(v) FROM apk"), [(3, Decimal(6))])
+cur.execute("UPDATE apk SET id = 3 WHERE s = 'c'")
+cur.execute("ALTER TABLE apk ADD PRIMARY KEY (id)")
+c.raises("the PRIMARY KEY added is enforced", lambda: cur.execute("INSERT INTO apk VALUES (3, 'x', 9)"), 1062)
+c.eq("point lookup by the new key", q("SELECT s FROM apk WHERE id = 3"), [("c",)])
+cur.execute("CREATE TABLE apk2 (a VARCHAR(5), b INT)")
+cur.execute("INSERT INTO apk2 VALUES ('x', 1), ('x', 2)")
+cur.execute("ALTER TABLE apk2 ADD PRIMARY KEY (a, b)")
+c.raises("a composite PRIMARY KEY added is enforced", lambda: cur.execute("INSERT INTO apk2 VALUES ('x', 1)"), 1062)
+
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
 out = {}
