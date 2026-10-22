@@ -57,4 +57,6 @@ c.eq("GROUP BY DATE_FORMAT", got, want)
 cur.execute("DROP DATABASE smoke2")
 c.eq("NULL-safe equality", q("SELECT 1 <=> 1, NULL <=> NULL, 1 <=> NULL, 1 IS NOT DISTINCT FROM 1, NULL IS DISTINCT FROM NULL, 2 IS DISTINCT FROM NULL"),
      [(1, 1, 0, 1, 0, 1)])
+c.eq("REGEXP / RLIKE operators", q("SELECT 'video one' REGEXP 'video|music', 'news' NOT REGEXP '^n', 'abc' RLIKE 'b'"), [(1, 0, 1)])
+c.eq("UNION drops duplicates", q("SELECT COUNT(*) FROM (SELECT 1 x UNION SELECT 1 UNION SELECT 2 UNION ALL SELECT 2) t"), [(3,)])
 c.done()

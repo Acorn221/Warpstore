@@ -11128,7 +11128,9 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     std::vector<Stmt*> parts;
     for (Stmt* p = &s; p; p = p->unionNext.get()) parts.push_back(p);
     bool dedupe = false;
-    for (size_t i = 0; i + 1 < parts.size(); ++i) dedupe |= !parts[i]->unionAll || parts[i]->setOp != 0;
+    size_t dedupeUpTo = 0;  // rows of parts [0, dedupeUpTo) are deduplicated (a UNION DISTINCT covers all to its left; UNION ALL after it doesn't)
+    for (size_t i = 0; i + 1 < parts.size(); ++i)
+      if (!parts[i]->unionAll || parts[i]->setOp != 0) dedupe = true, dedupeUpTo = i + 2;
     auto rowKey = [](const std::vector<Value>& v) {
       std::string k;
       for (auto& x : v) k += (x.isNull() ? std::string("\x02") : x.toString()) + '\x1f';
@@ -11137,10 +11139,14 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     ResultSet out;
     out.isResult = true;
     out.typed = true;
+    bool allUnion = dedupe;  // UNION (no INTERSECT / EXCEPT): each part can drop its duplicates first, on the GPU
+    for (size_t i = 0; i + 1 < parts.size(); ++i) allUnion = allUnion && parts[i]->setOp == 0 && !parts[i]->unionAll;
+    size_t dedupeRows = 0;  // rows from the parts the deduplication covers
     for (size_t i = 0; i < parts.size(); ++i) {
       Stmt ps = cloneStmt(*parts[i]);
       ps.unionNext.reset();
       ps.ctes.clear();
+      if (allUnion && ps.limit < 0 && !(i == 0 && s.unionOrder && !ps.orderBy.empty())) ps.distinct = true;
       if (i == 0 && s.unionOrder) {
         ps.orderBy.clear();
         ps.limit = -1;
@@ -11163,23 +11169,31 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       const int op = i == 0 ? 0 : parts[i - 1]->setOp;
       if (op == 0) {
         for (auto& v : r.vals) out.vals.push_back(std::move(v));
+        if (i < dedupeUpTo) dedupeRows = out.vals.size();
       } else {  // INTERSECT / EXCEPT against the rows accumulated so far
-        std::set<std::string> other;
+        std::unordered_set<std::string> other;
+        other.reserve(r.vals.size() * 2);
         for (auto& v : r.vals) other.insert(rowKey(v));
         std::vector<std::vector<Value>> keep;
         for (auto& v : out.vals)
           if ((other.count(rowKey(v)) > 0) == (op == 1)) keep.push_back(std::move(v));
         out.vals.swap(keep);
+        if (i < dedupeUpTo) dedupeRows = out.vals.size();
       }
     }
     if (dedupe) {
-      std::set<std::string> seen;
+      // keys built on all cores, then a hash set (the first of equal rows stays, in order)
+      const size_t m = std::min(dedupeRows, out.vals.size());
+      std::vector<std::string> keyOf(m);
+      parallelFor(m, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) keyOf[i] = rowKey(out.vals[i]);
+      });
+      std::unordered_set<std::string_view> seen;
+      seen.reserve(m * 2);
       std::vector<std::vector<Value>> keep;
-      for (auto& v : out.vals) {
-        std::string k;
-        for (auto& x : v) k += (x.isNull() ? std::string("\x02") : x.toString()) + '\x1f';
-        if (seen.insert(k).second) keep.push_back(std::move(v));
-      }
+      for (size_t i = 0; i < m; ++i)
+        if (seen.insert(keyOf[i]).second) keep.push_back(std::move(out.vals[i]));
+      for (size_t i = m; i < out.vals.size(); ++i) keep.push_back(std::move(out.vals[i]));  // (after the last UNION DISTINCT: kept)
       out.vals.swap(keep);
     }
     if (!s.orderBy.empty()) {

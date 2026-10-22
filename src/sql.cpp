@@ -395,6 +395,22 @@ struct Parser {
         l = e;
         continue;
       }
+      if (acceptKw("REGEXP") || acceptKw("RLIKE")) {  // a [NOT] REGEXP 'pattern'
+        auto e = std::make_shared<Expr>();
+        e->kind = Expr::FUNC;
+        e->op = "REGEXP_LIKE";
+        e->args = {l, addExpr()};
+        if (neg) {
+          auto nt = std::make_shared<Expr>();
+          nt->kind = Expr::UNARY;
+          nt->op = "NOT";
+          nt->args = {e};
+          l = nt;
+        } else {
+          l = e;
+        }
+        continue;
+      }
       p = save;
       return l;
     }
