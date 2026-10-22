@@ -97,6 +97,7 @@ struct Stmt {
   } type = EMPTY;
   // SELECT
   bool distinct = false;
+  bool keepDerived = false;  // a derived table the query layer must not merge into its outer query
   std::vector<SelectItem> items;
   std::vector<TableRef> from;
   std::vector<ExprP> joinConds;

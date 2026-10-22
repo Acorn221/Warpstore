@@ -184,7 +184,11 @@ Also supported:
 S3, HTTP and in pipelines; files are recognized by their magic bytes. A native reader handles flat
 and nested schemas, PLAIN / dictionary / DELTA_BINARY_PACKED encodings, nullable columns, data pages v1 and
 v2, and snappy / gzip / zstd compression. Logical types: DATE, TIMESTAMP (milli / micro / nano),
-DECIMAL and legacy INT96 timestamps. Columns are matched to the table by name.
+DECIMAL and legacy INT96 timestamps. Columns are matched to the table by name. A local file's flat
+columns are decoded straight into typed column arrays (row groups in turn, their columns in
+parallel) and appended a column at a time; nested columns go through text as JSON. ClickBench, 2M
+rows: 3.5 s from Parquet (37 s through text before), against 2.9 s from the same rows as TSV; the
+WAL keeps a copy of the Parquet file itself.
 
 Nested columns load as JSON text. Structs become objects and maps become `{key: value}` objects.
 Lists become arrays, in both the 3-level LIST and legacy repeated forms, lists of structs included,

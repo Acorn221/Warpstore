@@ -2714,6 +2714,9 @@ bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi);
 // A host-only expression over one integer / DATE column with a small value range: evaluated once per
 // value in [min, max] into a GPU lookup map indexed by (value - min), like the per-dictionary-entry
 // encoding of string columns. NULL input: the map's NULL, or a CASE when the result isn't NULL.
+// hi - lo + 1 values (hi >= lo), without overflowing for ranges wider than INT64_MAX.
+static inline uint64_t span64(int64_t lo, int64_t hi) { return (uint64_t)hi - (uint64_t)lo; }
+
 void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
   const Table& t = *c.tabs[bt];
   const LType lt = t.cols[bc].lt;
@@ -2723,8 +2726,8 @@ void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
     if (es.find(f) != std::string::npos) return;
   const bool udf = es.find("#UDF(") != std::string::npos;  // runs the procedure interpreter: one thread, fewer values
   int64_t lo, hi;
-  if (!colRange(t, bc, lo, hi) || hi - lo >= (udf ? (1 << 16) : (1 << 20))) return;
-  const size_t N = (size_t)(hi - lo + 1);
+  if (!colRange(t, bc, lo, hi) || span64(lo, hi) >= (udf ? (1u << 16) : (1u << 20))) return;
+  const size_t N = (size_t)span64(lo, hi) + 1;
   auto colSlot = [bt = bt, bc = bc](int tt, int cc) { return tt == bt && cc == bc ? 0 : -1; };
   std::vector<Value> res(N);
   auto evalRange = [&](size_t b, size_t en) {
@@ -5067,6 +5070,7 @@ static bool keyLookup(const Table& t, const ExprP& w) {
 
 thread_local std::string tLoadLogPath;  // doLoad loaded a copy of the file: the WAL names the copy
 static void copyFile(const std::string& from, const std::string& to);
+static bool readFile(const std::string& path, std::string& out);
 // The statement as logged: LOAD DATA INFILE of a copy (doLoad) names the copy's path.
 static std::string loggedSql(const std::string& sql, const Stmt& s) {
   std::string logged = sql;
@@ -5391,9 +5395,9 @@ ResultSet Engine::executeStmt(const std::string& sql) {
     case Stmt::UPDATE: r = doModify(s); break;
     case Stmt::LOAD:
       if ((s.setValue != "FS" && !s.setValue.empty()) || s.path.rfind("http://", 0) == 0 || s.path.rfind("https://", 0) == 0 ||
-          s.format == "JSON" || s.format == "PARQUET" || s.format == "AVRO" || s.format == "ORC" ||
+          s.format == "JSON" || (s.format == "PARQUET" && s.path.find_first_of("*?[") != std::string::npos) || s.format == "AVRO" || s.format == "ORC" ||
           (s.path.size() > 4 && lower(s.path.substr(s.path.size() - 4)) == ".orc") ||
-          (s.path.size() > 8 && lower(s.path.substr(s.path.size() - 8)) == ".parquet") ||
+          ((s.path.size() > 8 && lower(s.path.substr(s.path.size() - 8)) == ".parquet") && s.path.find_first_of("*?[") != std::string::npos) ||
           (s.path.size() > 5 && lower(s.path.substr(s.path.size() - 5)) == ".avro"))
         return loadRemote(s);  // logs the staged LOAD DATA INFILE statements it runs, not this one
       try {
@@ -6724,6 +6728,167 @@ int64_t Engine::insertRows(Table& t, const std::vector<int>& map, std::vector<st
   return affected;
 }
 
+
+static bool isParquetFile(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return false;
+  char m[4];
+  const bool pq = fread(m, 1, 4, f) == 4 && memcmp(m, "PAR1", 4) == 0;
+  fclose(f);
+  return pq;
+}
+
+// LOAD DATA INFILE of a Parquet file: flat columns are decoded to typed arrays (parquetScan) and
+// appended a column at a time; nested ones go through text (parquetToTsv + the text loader). The
+// WAL names a copy of the file (it is compressed already), which replays the same way.
+ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const std::vector<int>& srcOf) {
+  const auto t0 = Clock::now();
+  std::string data;
+  if (!readFile(s.path, data)) throw SqlError("File '" + s.path + "' not found", 29);
+  std::vector<std::string> wanted;  // per table column: the Parquet column it comes from ("": none)
+  for (size_t c = 0; c < t->cols.size(); ++c)
+    wanted.push_back(srcOf.empty() ? t->cols[c].name : srcOf[c] >= 0 ? s.insertCols[srcOf[c]] : std::string());
+  std::string copyTo;
+  if (!replaying_ && !dir_.empty() && s.path.rfind(dir_ + "/", 0) != 0) {
+    static std::atomic<uint64_t> seq{0};
+    uint64_t gen;
+    {
+      std::lock_guard<std::mutex> g(walMu_);
+      gen = walGen_;
+    }
+    mkdirs(dir_ + "/loads");
+    copyTo = dir_ + "/loads/g" + std::to_string(gen) + "-" + std::to_string(nowUs()) + "-" + std::to_string(++seq) + ".parquet";
+  }
+  std::unique_lock<FairSharedMutex> lk(t->mu);
+  waitTxnFree(*t, lk);
+  bool vec = false;
+  for (auto& cm : t->cols) vec = vec || cm.pt == PType::VEC;
+  int64_t n = 0;
+  const std::vector<Value> defs = defaultRow(*t);
+  const bool direct = !vec && parquetScan(data, wanted, [&](int64_t rows, std::vector<PqChunk>& in) {
+    const size_t nc = t->cols.size();
+    std::vector<std::vector<int64_t>> iv(nc);
+    std::vector<std::vector<double>> dv(nc);
+    std::vector<std::exception_ptr> errs(nc);
+    ioParallel(nc, [&](size_t c) {  // one column per task (each its own dictionary)
+      try {
+        const ColumnMeta& cm = t->cols[c];
+        const PqChunk& p = in[c];
+        const bool f64 = cm.pt == PType::F64;
+        if (f64) dv[c].resize(rows);
+        else iv[c].resize(rows);
+        const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+        auto null = [&](int64_t r) {
+          if ((int)c == t->autoIncCol) {
+            iv[c][r] = 0;  // (numbered below)
+            return;
+          }
+          if (cm.notNull || (int)c == t->pk) throw SqlError("Column '" + cm.name + "' cannot be null (row " + std::to_string(n + r + 1) + ")", 1048);
+          t->hasNull[c] = 1;
+          if (f64) dv[c][r] = nullv();
+          else iv[c][r] = nul;
+        };
+        if (p.kind == 0) {
+          for (int64_t r = 0; r < rows; ++r) null(r);
+          return;
+        }
+        const double pw = pow10i(p.scale);
+        if (p.kind == 3 && cm.lt == LType::VARCHAR) {  // strings: coded in row order, one lock
+          std::vector<std::string_view> sv(p.s);
+          for (int64_t r = 0; r < rows; ++r)
+            if (!p.valid[r]) sv[r] = std::string_view();
+          t->dicts[c]->getOrAddMany(sv.data(), (size_t)rows, iv[c].data(), kNullI32);
+          for (int64_t r = 0; r < rows; ++r)
+            if (!p.valid[r]) null(r);
+          return;
+        }
+        const bool intExact = p.kind == 1 && p.unit == 0 && (cm.lt == LType::INT || cm.lt == LType::BIGINT);
+        const bool dblExact = p.kind == 2 && cm.lt == LType::DOUBLE;
+        const bool dateExact = p.kind == 1 && p.unit == 1 && cm.lt == LType::DATE;
+        const bool tsExact = p.kind == 1 && p.unit == 2 && cm.lt == LType::DATETIME;
+        const bool decExact = p.kind == 1 && p.unit == 3 && cm.lt == LType::DECIMAL && p.scale == cm.scale;
+        int64_t i0;
+        double d0;
+        for (int64_t r = 0; r < rows; ++r) {
+          if (!p.valid[r]) {
+            null(r);
+            continue;
+          }
+          if (intExact || dateExact || tsExact || decExact) {
+            iv[c][r] = p.i[r];
+            continue;
+          }
+          if (dblExact) {
+            dv[c][r] = p.d[r];
+            continue;
+          }
+          Value v = p.kind == 2 ? Value::D(p.d[r])
+                  : p.kind == 3 ? Value::S(std::string(p.s[r]))
+                  : p.unit == 1 ? Value::Dt(p.i[r])
+                  : p.unit == 2 ? Value::Ts(p.i[r])
+                  : p.unit == 3 ? Value::Dec((double)p.i[r] / pw, p.scale)
+                                : Value::I(p.i[r]);
+          if (p.unit == 3 && cm.lt == LType::DECIMAL) {  // exact rescale (no detour through a double)
+            const int64_t u = p.i[r];
+            iv[c][r] = cm.scale >= p.scale ? u * (int64_t)pow10i(cm.scale - p.scale)
+                                           : (int64_t)std::llround((double)u / pow10i(p.scale - cm.scale));
+            continue;
+          }
+          if (cm.lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+          t->rawOf((int)c, v, i0, d0);
+          if (f64) dv[c][r] = d0;
+          else iv[c][r] = i0;
+        }
+      } catch (...) {
+        errs[c] = std::current_exception();
+      }
+    }, true);
+    for (auto& e : errs)
+      if (e) std::rethrow_exception(e);
+    if (t->autoIncCol >= 0) {
+      for (int64_t r = 0; r < rows; ++r) {
+        int64_t& v = iv[t->autoIncCol][r];
+        if (v == 0) v = t->autoNext++;
+        else t->autoNext = std::max<int64_t>(t->autoNext, v + 1);
+      }
+    }
+    t->appendColumns(iv, dv, rows);
+    n += rows;
+    checkKilled();
+    lk.unlock();  // (readers get in between row groups)
+    std::this_thread::yield();
+    lk.lock();
+  });
+  if (!direct) {  // nested columns etc.: as text, through the text loader
+    std::vector<std::string> names;
+    for (auto& w : wanted) names.push_back(w.empty() ? std::string("\x01") : w);
+    const std::string tsv = parquetToTsv(data, names);
+    const std::string staged = (dir_.empty() ? std::string("/tmp/warpstore-") : dir_ + "/loads/staged-") + std::to_string(nowUs()) + ".tsv";
+    {
+      FILE* f = fopen(staged.c_str(), "wb");
+      if (!f) throw SqlError("cannot stage " + staged, 1105);
+      fwrite(tsv.data(), 1, tsv.size(), f);
+      fclose(f);
+    }
+    try {
+      n = t->loadFile(staged, '\t', 0, {}, {}, '\\');
+    } catch (...) {
+      unlink(staged.c_str());
+      throw;
+    }
+    unlink(staged.c_str());
+  }
+  lk.unlock();
+  if (!copyTo.empty()) {
+    copyFile(s.path, copyTo);
+    tLoadLogPath = copyTo;
+  }
+  warmDicts(t);
+  char info[128];
+  snprintf(info, sizeof info, "Records: %lld  Loaded in %.1f s", (long long)n, msSince(t0) / 1000);
+  return okResult(n, info);
+}
+
 ResultSet Engine::doLoad(Stmt& s) {
   if (s.setValue != "FS" && !s.setValue.empty())
     throw SqlError("LOAD DATA " + s.setValue + " is not supported (use a local path / FS, S3, KAFKA or MYSQL)", 1235);
@@ -6742,6 +6907,10 @@ ResultSet Engine::doLoad(Stmt& s) {
     }
   }
   if (replaying_) replayedLoads_.insert(s.path);
+  if (isParquetFile(s.path)) {  // (also a copy the WAL names, on replay)
+    lk.unlock();
+    return loadParquet(s, t, srcOf);
+  }
   std::string path = s.path;
   if (replaying_ && access(path.c_str(), F_OK) != 0 && !gWalArchive.empty() && path.find("/loads/g") != std::string::npos) {
     const std::string alt = gWalArchive + path.substr(path.rfind("/loads/"));  // moved to the archive already
@@ -8165,7 +8334,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         // dictionary sizes / value ranges; a many-to-many join on a low-cardinality column is huge).
         auto ndv = [&](int bt, int bc, double rows) {
           int64_t lo, hi;
-          double n = colRange(*ctx.tabs[bt], bc, lo, hi) ? (double)(hi - lo + 1) : rows;
+          double n = colRange(*ctx.tabs[bt], bc, lo, hi) ? (double)span64(lo, hi) + 1 : rows;
           return std::max(1.0, std::min(n, rows));
         };
         const double nd = std::max(ndv(curCol.first, curCol.second, (double)cur.n), ndv(other, otherCol, (double)ctx.tabs[other]->liveRows()));
@@ -8208,9 +8377,9 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           int64_t lo, hi;
           if (ri < 0 || cur.cols[ri].pt == PType::F64 || ctx.tabs[best]->cols[oc].pt == PType::F64 ||
               ctx.tabs[ct]->cols[cc].lt == LType::VARCHAR ||  // dictionary codes differ per table
-              !colRange(*ctx.tabs[ct], cc, lo, hi) || hi - lo + 1 > (int64_t)1 << 30)
+              !colRange(*ctx.tabs[ct], cc, lo, hi) || span64(lo, hi) >= (uint64_t)1 << 30)
             continue;
-          const int64_t nbits = hi - lo + 1;
+          const int64_t nbits = (int64_t)span64(lo, hi) + 1;
           bitmaps.emplace_back((nbits + 31) / 32);
           gpuKeyBitmap(viewOf(cur.cols[ri].data.p, cur.cols[ri].pt), cur.n, lo, nbits, bitmaps.back().p);
           jfs.push_back({oc, lo, nbits, bitmaps.back().p,
@@ -8362,8 +8531,9 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           ok = false;
           break;
         }
-        const int64_t range = hi - lo + 1;
-        if (range <= 0 || G > (int64_t)(1ll << 26) / range) { ok = false; break; }
+        if (span64(lo, hi) >= (uint64_t)1 << 26) { ok = false; break; }
+        const int64_t range = (int64_t)span64(lo, hi) + 1;
+        if (G > (int64_t)(1ll << 26) / range) { ok = false; break; }
         dspec.kmin[k] = lo;
         dspec.range[k] = range;
         dspec.stride[k] = G;
@@ -9217,8 +9387,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       items[0].e->ty != LType::DOUBLE && items[0].e->ty != LType::DECIMAL && items[0].e->ty != LType::VECTOR && cnt > 4096) {
     int64_t lo, hi;
     const ExprP& ce = items[0].e;
-    if (colRange(*ctx.tabs[ce->bt], ce->bc, lo, hi) && hi - lo < (int64_t)(1ll << 31)) {
-      std::vector<int64_t> d = gpuDistinctInts(comp.env, projs[0], finalIdx.p, cnt, lo, hi - lo + 1);
+    if (colRange(*ctx.tabs[ce->bt], ce->bc, lo, hi) && span64(lo, hi) < (uint64_t)1 << 31) {
+      std::vector<int64_t> d = gpuDistinctInts(comp.env, projs[0], finalIdx.p, cnt, lo, (int64_t)span64(lo, hi) + 1);
       auto nc = std::make_shared<std::vector<double>>(d.begin(), d.end());
       res.numCol = nc;
       res.typed = true;
@@ -10050,7 +10220,7 @@ void Engine::flattenDerived(Stmt& s) {
   while (s.from.size() == 1 && s.from[0].sub && s.joinConds.empty()) {
     Stmt& in = *s.from[0].sub;
     if (in.type != Stmt::SELECT || in.from.size() != 1 || in.from[0].sub || in.from[0].join || !in.joinConds.empty() ||
-        !in.groupBy.empty() || in.having || in.distinct || in.limit >= 0 || in.unionNext || !in.ctes.empty() || in.items.empty() ||
+        !in.groupBy.empty() || in.having || in.distinct || in.keepDerived || in.limit >= 0 || in.unionNext || !in.ctes.empty() || in.items.empty() ||
         !cat_.find(in.from[0].name))
       return;
     std::function<bool(const ExprP&)> complex = [&](const ExprP& e) -> bool {
@@ -10314,6 +10484,7 @@ static bool hostRewrite(const Stmt& s, Stmt& out) {
   const std::string alias = multi ? std::string("__hj") : s.from[0].alias.empty() ? s.from[0].name : s.from[0].alias;
   auto inner = std::make_shared<Stmt>();
   inner->type = Stmt::SELECT;
+  inner->keepDerived = true;  // (merging it back would undo the rewrite)
   auto star = std::make_shared<Expr>();
   star->kind = Expr::STAR;
   if (!multi) inner->items.push_back(SelectItem{star, ""});
@@ -10391,6 +10562,47 @@ static bool hostRewrite(const Stmt& s, Stmt& out) {
   lift(out.where);
   for (auto& o : out.orderBy) lift(o.e);
   if (done.empty() && !inner->where) return false;
+  if (!multi) {  // only the columns the outer query still uses (not *: every column would be evaluated on the host)
+    std::set<std::string> itemAliases, lifted, cols;
+    for (auto& it : out.items)
+      if (!it.alias.empty()) itemAliases.insert(lower(it.alias));
+    for (auto& [k, v] : done) lifted.insert(lower(v));
+    bool star = false;
+    std::function<void(const ExprP&)> scan = [&](const ExprP& x) {
+      if (!x || x->kind == Expr::SUBQUERY) return;
+      if (x->kind == Expr::COL) {
+        const std::string n = lower(x->name);
+        if (!lifted.count(n) && !(x->table.empty() && itemAliases.count(n))) cols.insert(x->name);
+        return;
+      }
+      for (auto& a : x->args) scan(a);
+    };
+    for (auto& it : out.items) {
+      if (it.e && it.e->kind == Expr::STAR) star = true;
+      scan(it.e);
+    }
+    for (auto& g : out.groupBy) scan(g);
+    scan(out.having);
+    scan(out.where);
+    for (auto& o : out.orderBy) scan(o.e);
+    if (!star) {
+      inner->items.erase(inner->items.begin());  // (the *)
+      std::set<std::string> seen;
+      for (auto& n : cols) {
+        if (!seen.insert(lower(n)).second) continue;
+        auto c = std::make_shared<Expr>();
+        c->kind = Expr::COL;
+        c->name = n;
+        inner->items.push_back(SelectItem{c, ""});
+      }
+      if (inner->items.empty()) {
+        auto one = std::make_shared<Expr>();
+        one->kind = Expr::LIT;
+        one->lit = Value::I(1);
+        inner->items.push_back(SelectItem{one, "__one"});
+      }
+    }
+  }
   if (multi) {  // the join's columns the outer query still uses, each under a unique name
     std::map<std::string, std::string> cols;
     std::set<std::string> itemAliases;  // GROUP BY / ORDER BY / HAVING may name select items
@@ -11307,7 +11519,9 @@ int64_t Engine::ingest(const std::string& table, char delim, int64_t skip, const
       auto t = cat_.get(table);
       for (auto& c : t->cols) names.push_back(c.name);
     }
+    const auto tc = Clock::now();
     body = parquet ? parquetToTsv(data, names) : avro ? avroToTsv(data, names) : orcToTsv(data, names);
+    if (envSetting("TRACE")) fprintf(stderr, "[trace] %s to text: %.0f ms (%zu MB)\n", parquet ? "Parquet" : avro ? "Avro" : "ORC", msSince(tc), body.size() >> 20);
     delim = '\t';
     skip = 0;
     escaped = true;

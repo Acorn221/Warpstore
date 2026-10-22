@@ -1,5 +1,5 @@
 # Shared helpers for the test suite: start/stop throwaway servers, assertions, DuckDB comparison.
-import datetime, decimal, os, shutil, signal, socket, subprocess, sys, tempfile, time
+import atexit, datetime, decimal, os, shutil, signal, socket, subprocess, sys, tempfile, time
 
 import pymysql
 
@@ -15,6 +15,21 @@ def free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+_started = []  # servers to kill if the test script ends without stopping them (a failure)
+
+
+def _kill_leftovers():
+    for srv in _started:
+        if srv.proc and srv.proc.poll() is None:
+            try:
+                srv.kill()
+            except Exception:
+                pass
+
+
+atexit.register(_kill_leftovers)
 
 
 class Server:
@@ -41,6 +56,8 @@ class Server:
         if self.mem and shutil.which("systemd-run"):
             cmd = ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={self.mem}"] + cmd
         self.proc = subprocess.Popen(cmd, stdout=open(self.log, "w"), stderr=subprocess.STDOUT)
+        if self not in _started:
+            _started.append(self)
         t = time.time()
         while time.time() - t < timeout:
             if self.proc.poll() is not None:

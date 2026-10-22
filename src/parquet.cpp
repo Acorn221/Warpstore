@@ -6,17 +6,21 @@
 #include <zlib.h>
 #include <zstd.h>
 
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <atomic>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common.h"
 #include "sources.h"
+#include "storage.h"  // ioParallel
 
 namespace gdb {
 
@@ -313,7 +317,7 @@ struct Col {
   int typeLen = 0;
   bool optional = false;
   int conv = -1;      // converted type
-  int scale = 0;
+  int scale = 0, precision = 0;
   int tsUnit = 0;     // timestamps: 1 millis, 2 micros, 3 nanos
   bool isDate = false, isDecimal = false, isTime = false;
   int maxDef = 0, maxRep = 0;  // definition / repetition levels of the leaf
@@ -559,13 +563,14 @@ Col colOf(const TVal& se) {
   c.typeLen = (int)se.fi(2);
   c.conv = (int)se.fi(6, -1);
   c.scale = (int)se.fi(7);
+  c.precision = (int)se.fi(8);
   c.isDate = c.conv == 6;
   c.isDecimal = c.conv == 5;
   if (c.conv == 9) c.tsUnit = 1;
   if (c.conv == 10) c.tsUnit = 2;
   if (const TVal* lt = se.f(10)) {  // LogicalType union
     if (lt->f(6)) c.isDate = true;
-    if (const TVal* dec = lt->f(5)) c.isDecimal = true, c.scale = (int)dec->fi(1);
+    if (const TVal* dec = lt->f(5)) c.isDecimal = true, c.scale = (int)dec->fi(1), c.precision = (int)dec->fi(2);
     if (const TVal* ts = lt->f(8))
       if (const TVal* unit = ts->f(2)) c.tsUnit = unit->f(1) ? 1 : unit->f(2) ? 2 : unit->f(3) ? 3 : 2;
   }
@@ -658,18 +663,28 @@ struct Assembler {
 };
 }  // namespace
 
-std::string parquetToTsv(const std::string& file, const std::vector<std::string>& wanted) {
+struct PqSchema {
+  TVal md;
+  std::vector<PNode> nodes;
+  std::vector<Col> leaves;
+  std::vector<int> top;  // the top-level fields
+};
+// The footer and the schema tree (leaves get their maximum definition / repetition levels).
+static PqSchema parquetSchema(const std::string& file) {
+  PqSchema sc;
+  auto& nodes = sc.nodes;
+  auto& leaves = sc.leaves;
+  auto& top = sc.top;
   if (file.size() < 12 || file.compare(0, 4, "PAR1") != 0 || file.compare(file.size() - 4, 4, "PAR1") != 0) bad("not a Parquet file");
   uint32_t flen;
   memcpy(&flen, file.data() + file.size() - 8, 4);
   if (flen > file.size() - 8) bad("bad footer length");
   Thrift t{(const uint8_t*)file.data() + file.size() - 8 - flen, (const uint8_t*)file.data() + file.size() - 8};
-  TVal md = t.structure();
+  sc.md = t.structure();
+  const TVal& md = sc.md;
   const TVal* schema = md.f(2);
   if (!schema || schema->list.empty()) bad("no schema");
   // Rebuild the tree; leaves get their maximum definition / repetition levels.
-  std::vector<PNode> nodes;
-  std::vector<Col> leaves;
   size_t pos = 1;
   std::function<int(int, int, bool)> build = [&](int defL, int repL, bool underJson) -> int {
     if (pos >= schema->list.size()) bad("truncated schema");
@@ -704,9 +719,17 @@ std::string parquetToTsv(const std::string& file, const std::vector<std::string>
     }
     return idx;
   };
-  std::vector<int> top;
   const int rootKids = (int)schema->list[0].fi(5);
   for (int k = 0; k < rootKids; ++k) top.push_back(build(0, 0, false));
+  return sc;
+}
+
+std::string parquetToTsv(const std::string& file, const std::vector<std::string>& wanted) {
+  PqSchema sc = parquetSchema(file);
+  const TVal& md = sc.md;
+  const std::vector<PNode>& nodes = sc.nodes;
+  const std::vector<Col>& leaves = sc.leaves;
+  const std::vector<int>& top = sc.top;
   // Output column k comes from top-level field map[k] (-1: absent -> NULL).
   std::vector<int> map;
   for (auto& w : wanted) {
@@ -727,59 +750,354 @@ std::string parquetToTsv(const std::string& file, const std::vector<std::string>
   std::string out;
   const TVal* rgs = md.f(4);
   if (!rgs) return out;
-  std::vector<LeafData> data(leaves.size());
+  std::vector<bool> need(leaves.size(), false);
+  for (int m : map)
+    if (m >= 0)
+      for (int l : leavesOf[m]) need[l] = true;
+  // Row groups in batches: their column chunks are decoded in parallel (one task per row group and
+  // column), then each row group's text is put together in parallel, and appended in order.
+  const size_t ng = rgs->list.size();
+  const size_t batch = 2;  // (decoded cells are strings: a row group of 100K+ rows can take 1 GB)
+  for (size_t g0 = 0; g0 < ng; g0 += batch) {
+    const size_t g1 = std::min(ng, g0 + batch);
+    std::vector<std::vector<LeafData>> data(g1 - g0, std::vector<LeafData>(leaves.size()));
+    std::vector<std::pair<size_t, size_t>> tasks;  // (row group, leaf)
+    for (size_t g = g0; g < g1; ++g) {
+      const TVal& rg = rgs->list[g];
+      const TVal* chunks = rg.f(1);
+      if (!chunks) continue;
+      for (size_t l = 0; l < leaves.size(); ++l) {
+        if (!need[l]) continue;
+        if (l >= chunks->list.size()) bad("row group without column chunk " + leaves[l].name);
+        if (!chunks->list[l].f(3)) bad("column chunk without metadata (external file?)");
+        tasks.push_back({g, l});
+      }
+    }
+    std::vector<std::exception_ptr> errs(tasks.size());
+    ioParallel(tasks.size(), [&](size_t i) {
+      try {
+        const auto [g, l] = tasks[i];
+        const TVal& rg = rgs->list[g];
+        const int64_t rows = rg.fi(3);
+        LeafData& d = data[g - g0][l];
+        readLeaf(file, leaves[l], *rg.f(1)->list[l].f(3), d.reps, d.defs, d.vals);
+        const int64_t entries = leaves[l].maxDef ? (int64_t)d.defs.size() : (int64_t)d.vals.size();
+        d.valAt.assign(entries, -1);
+        int64_t vi = 0;
+        for (int64_t e = 0; e < entries; ++e)
+          if (!leaves[l].maxDef || d.defs[e] == (uint32_t)leaves[l].maxDef) d.valAt[e] = vi++;
+        d.rowStart.clear();
+        for (int64_t e = 0; e < entries; ++e)
+          if (!leaves[l].maxRep || d.reps[e] == 0) d.rowStart.push_back(e);
+        while ((int64_t)d.rowStart.size() < rows) d.rowStart.push_back(entries);
+        d.rowStart.push_back(entries);
+      } catch (...) {
+        errs[i] = std::current_exception();
+      }
+    });
+    for (auto& e : errs)
+      if (e) std::rethrow_exception(e);
+    std::vector<std::array<int64_t, 3>> pieces;  // (row group, first row, end row): put together in parallel
+    for (size_t g = g0; g < g1; ++g) {
+      if (!rgs->list[g].f(1)) continue;
+      const int64_t rows = rgs->list[g].fi(3);
+      for (int64_t r = 0; r < rows; r += 16384) pieces.push_back({(int64_t)(g - g0), r, std::min<int64_t>(rows, r + 16384)});
+    }
+    std::vector<std::string> text(pieces.size());
+    std::vector<std::exception_ptr> errs2(pieces.size());
+    ioParallel(pieces.size(), [&](size_t pi) {
+      try {
+        const size_t gi = (size_t)pieces[pi][0];
+        std::vector<LeafData>& dd = data[gi];
+        Assembler as{nodes, leaves, dd, {}};
+        as.init();
+        Assembler::Ranges rr(leaves.size());
+        std::string& o = text[pi];
+        for (int64_t r = pieces[pi][1]; r < pieces[pi][2]; ++r) {
+          for (size_t l = 0; l < leaves.size(); ++l)
+            if (need[l]) rr[l] = {dd[l].rowStart[r], dd[l].rowStart[r + 1]};
+          for (size_t k = 0; k < map.size(); ++k) {
+            if (k) o += '\t';
+            if (map[k] < 0) {
+              o += "\\N";
+              continue;
+            }
+            const PNode& nd = nodes[top[map[k]]];
+            if (nd.leaf >= 0 && nd.rep != 2) {  // a flat column
+              const LeafData& d = dd[nd.leaf];
+              const int64_t e = d.rowStart[r];
+              const int64_t vi = e < (int64_t)d.valAt.size() ? d.valAt[e] : -1;
+              if (vi < 0) o += "\\N";
+              else o += d.vals[vi];
+              continue;
+            }
+            const std::string j = as.json(top[map[k]], rr);
+            if (j == "null") o += "\\N";
+            else tsvAppend(o, j.data(), j.size());
+          }
+          o += '\n';
+        }
+      } catch (...) {
+        errs2[pi] = std::current_exception();
+      }
+    });
+    for (auto& e : errs2)
+      if (e) std::rethrow_exception(e);
+    size_t add = 0;
+    for (auto& t : text) add += t.size();
+    out.reserve(out.size() + add);
+    for (auto& t : text) out += t;
+  }
+  return out;
+}
+
+
+// ---- Typed decoding of flat columns (LOAD DATA appends them directly, without going through text)
+namespace {
+struct NeedsText {};  // a column this path doesn't decode: the caller loads the file through text
+
+// One flat column chunk, decoded: values at their rows (NULL rows: valid = 0).
+void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, int64_t rows, PqChunk& out) {
+  const int codec = (int)meta.fi(4);
+  int64_t off = meta.fi(9);
+  if (const TVal* dp = meta.f(11)) off = std::min(off, dp->i ? dp->i : off);
+  const int64_t total = meta.fi(7);
+  if (off < 0 || off + total > (int64_t)file.size()) bad("column chunk outside the file");
+  const uint8_t* p = (const uint8_t*)file.data() + off;
+  const uint8_t* end = p + total;
+  out.kind = col.type == 4 || col.type == 5 ? 2 : (col.type == 6 || col.type == 7) && !col.isDecimal ? 3 : 1;
+  out.unit = col.isDate ? 1 : col.tsUnit || col.type == 3 ? 2 : col.isDecimal ? 3 : col.type == 0 ? 4 : 0;
+  out.scale = col.scale;
+  // Present values, in order (then spread over the rows by the definition levels).
+  std::vector<int64_t> vi;
+  std::vector<double> vd;
+  std::vector<std::string_view> vs;
+  std::vector<int64_t> di;
+  std::vector<double> dd;
+  std::vector<std::string_view> ds;  // dictionary
+  std::vector<uint8_t> valid;
+  valid.reserve(rows);
+  auto toInt = [&](int64_t v) -> int64_t {  // physical integer -> its meaning (timestamps: microseconds)
+    if (col.tsUnit == 1) return v * 1000;
+    if (col.tsUnit == 3) return v / 1000;
+    return v;
+  };
+  auto dec = [&](const uint8_t* q, size_t len) -> int64_t {
+    if (len > 8) {  // (up to 18 digits are checked up front; wider storage of small values still fits)
+      for (size_t b = 0; b + 8 < len; ++b)
+        if (q[b] != ((q[len - 8] & 0x80) ? 0xff : 0x00)) throw NeedsText{};
+    }
+    __int128 v = len && (q[0] & 0x80) ? -1 : 0;
+    for (size_t b = 0; b < len; ++b) v = (v << 8) | q[b];
+    return (int64_t)v;
+  };
+  // n PLAIN values from q into ints / doubles / views.
+  auto plain = [&](const uint8_t*& q, const uint8_t* qe, size_t n, std::vector<int64_t>& oi, std::vector<double>& od,
+                   std::vector<std::string_view>& os) {
+    for (size_t k = 0; k < n; ++k) {
+      switch (col.type) {
+        case 0: oi.push_back((q[k / 8] >> (k % 8)) & 1); break;
+        case 1: { int32_t v; memcpy(&v, q, 4); q += 4; oi.push_back(toInt(v)); break; }
+        case 2: { int64_t v; memcpy(&v, q, 8); q += 8; oi.push_back(toInt(v)); break; }
+        case 3: {
+          int64_t nanos;
+          int32_t jd;
+          memcpy(&nanos, q, 8);
+          memcpy(&jd, q + 8, 4);
+          q += 12;
+          oi.push_back(((int64_t)jd - 2440588) * 86400000000ll + nanos / 1000);
+          break;
+        }
+        case 4: { float v; memcpy(&v, q, 4); q += 4; od.push_back(v); break; }
+        case 5: { double v; memcpy(&v, q, 8); q += 8; od.push_back(v); break; }
+        case 6: {
+          uint32_t len;
+          memcpy(&len, q, 4);
+          q += 4;
+          if (q + len > qe) bad("byte array past the page");
+          if (col.isDecimal) oi.push_back(dec(q, len));
+          else os.emplace_back((const char*)q, len);
+          q += len;
+          break;
+        }
+        case 7: {
+          const size_t len = (size_t)col.typeLen;
+          if (q + len > qe) bad("fixed-length value past the page");
+          if (col.isDecimal) oi.push_back(dec(q, len));
+          else os.emplace_back((const char*)q, len);
+          q += len;
+          break;
+        }
+        default: bad("unsupported physical type");
+      }
+    }
+    if (col.type == 0) q += (n + 7) / 8;
+  };
+  std::vector<uint32_t> defs, idx;
+  std::vector<int64_t> delta;
+  const int dbw = bitWidth(col.maxDef);
+  int64_t seen = 0;
+  while (p < end && seen < rows) {
+    Thrift t{p, end};
+    TVal ph = t.structure();
+    p = t.p;
+    const int ptype = (int)ph.fi(1);
+    const int64_t usize = ph.fi(2), csize = ph.fi(3);
+    if (p + csize > end) bad("page past the column chunk");
+    const uint8_t* body = p;
+    p += csize;
+    if (ptype == 2) {  // dictionary page
+      const TVal* dh = ph.f(7);
+      out.keep.push_back(decompress(codec, body, csize, usize));
+      const std::string& raw = out.keep.back();
+      const uint8_t* q = (const uint8_t*)raw.data();
+      di.clear(), dd.clear(), ds.clear();
+      plain(q, q + raw.size(), dh ? (size_t)dh->fi(1) : 0, di, dd, ds);
+      continue;
+    }
+    if (ptype != 0 && ptype != 3) continue;
+    const uint8_t *q, *qe;
+    size_t n;
+    int enc;
+    if (ptype == 0) {
+      const TVal* dh = ph.f(5);
+      if (!dh) bad("data page without header");
+      n = (size_t)dh->fi(1);
+      enc = (int)dh->fi(2);
+      out.keep.push_back(decompress(codec, body, csize, usize));
+      q = (const uint8_t*)out.keep.back().data();
+      qe = q + out.keep.back().size();
+      if (col.maxDef) {
+        uint32_t len;
+        memcpy(&len, q, 4);
+        rleHybrid(q + 4, q + 4 + len, dbw, n, defs);
+        q += 4 + len;
+      }
+    } else {
+      const TVal* dh = ph.f(8);
+      if (!dh) bad("data page v2 without header");
+      n = (size_t)dh->fi(1);
+      enc = (int)dh->fi(4);
+      const int64_t defLen = dh->fi(5), repLen = dh->fi(6);
+      if (col.maxDef) rleHybrid(body + repLen, body + repLen + defLen, dbw, n, defs);
+      const int64_t lv = repLen + defLen;
+      const bool compressed = dh->f(7) ? dh->fi(7) != 0 : true;
+      out.keep.push_back(compressed ? decompress(codec, body + lv, csize - lv, usize - lv) : std::string((const char*)body + lv, csize - lv));
+      q = (const uint8_t*)out.keep.back().data();
+      qe = q + out.keep.back().size();
+    }
+    size_t present = n;
+    if (col.maxDef) {
+      present = 0;
+      for (size_t k = 0; k < n; ++k) {
+        const bool v = defs[k] == (uint32_t)col.maxDef;
+        valid.push_back(v);
+        present += v;
+      }
+    } else {
+      valid.insert(valid.end(), n, 1);
+    }
+    if (enc == 0) {
+      plain(q, qe, present, vi, vd, vs);
+    } else if (enc == 2 || enc == 8) {
+      const int bw = q < qe ? *q : 0;
+      rleHybrid(q + 1, qe, bw, present, idx);
+      for (uint32_t i : idx) {
+        if (out.kind == 1) {
+          if (i >= di.size()) bad("dictionary index out of range");
+          vi.push_back(di[i]);
+        } else if (out.kind == 2) {
+          if (i >= dd.size()) bad("dictionary index out of range");
+          vd.push_back(dd[i]);
+        } else {
+          if (i >= ds.size()) bad("dictionary index out of range");
+          vs.push_back(ds[i]);
+        }
+      }
+    } else if (enc == 5 && out.kind == 1 && !col.isDecimal) {
+      deltaBinaryPacked(q, qe, delta);
+      for (size_t k = 0; k < present && k < delta.size(); ++k) vi.push_back(toInt(delta[k]));
+    } else {
+      throw NeedsText{};  // (other encodings: through the text path, which reports them)
+    }
+    seen += (int64_t)n;
+  }
+  if ((int64_t)valid.size() < rows) valid.resize(rows, 0);
+  // Spread the present values over the rows.
+  out.valid.assign(valid.begin(), valid.begin() + rows);
+  size_t k = 0;
+  if (out.kind == 1) {
+    out.i.assign(rows, 0);
+    for (int64_t r = 0; r < rows; ++r)
+      if (out.valid[r]) {
+        if (k >= vi.size()) bad("fewer values than rows");
+        out.i[r] = vi[k++];
+      }
+  } else if (out.kind == 2) {
+    out.d.assign(rows, 0);
+    for (int64_t r = 0; r < rows; ++r)
+      if (out.valid[r]) {
+        if (k >= vd.size()) bad("fewer values than rows");
+        out.d[r] = vd[k++];
+      }
+  } else {
+    out.s.assign(rows, std::string_view());
+    for (int64_t r = 0; r < rows; ++r)
+      if (out.valid[r]) {
+        if (k >= vs.size()) bad("fewer values than rows");
+        out.s[r] = vs[k++];
+      }
+  }
+}
+}  // namespace
+
+bool parquetScan(const std::string& file, const std::vector<std::string>& wanted,
+                 const std::function<void(int64_t, std::vector<PqChunk>&)>& fn) {
+  PqSchema sc = parquetSchema(file);
+  std::vector<int> leafOf(wanted.size(), -1);  // wanted column -> its leaf (-1: absent)
+  for (size_t k = 0; k < wanted.size(); ++k) {
+    int found = -1;
+    for (size_t i = 0; i < sc.top.size() && found < 0; ++i)
+      if (strcasecmp(sc.nodes[sc.top[i]].name.c_str(), wanted[k].c_str()) == 0) found = (int)i;
+    if (found < 0) continue;
+    const PNode& nd = sc.nodes[sc.top[found]];
+    if (nd.leaf < 0 || nd.rep == 2) return false;  // nested: as JSON text
+    const Col& c = sc.leaves[nd.leaf];
+    if (c.maxRep || c.isTime || c.type < 0 || c.type > 7 || (c.isDecimal && c.precision > 18)) return false;
+    leafOf[k] = nd.leaf;
+  }
+  const TVal* rgs = sc.md.f(4);
+  if (!rgs) return true;
+  bool first = true;
   for (const TVal& rg : rgs->list) {
     const int64_t rows = rg.fi(3);
     const TVal* chunks = rg.f(1);
-    if (!chunks) continue;
-    std::vector<bool> need(leaves.size(), false);
-    for (int m : map)
-      if (m >= 0)
-        for (int l : leavesOf[m]) need[l] = true;
-    for (size_t l = 0; l < leaves.size(); ++l) {
-      LeafData& d = data[l];
-      d = LeafData{};
-      if (!need[l]) continue;
-      if (l >= chunks->list.size()) bad("row group without column chunk " + leaves[l].name);
-      const TVal* meta = chunks->list[l].f(3);
-      if (!meta) bad("column chunk without metadata (external file?)");
-      readLeaf(file, leaves[l], *meta, d.reps, d.defs, d.vals);
-      const int64_t entries = leaves[l].maxDef ? (int64_t)d.defs.size() : (int64_t)d.vals.size();
-      d.valAt.assign(entries, -1);
-      int64_t vi = 0;
-      for (int64_t e = 0; e < entries; ++e)
-        if (!leaves[l].maxDef || d.defs[e] == (uint32_t)leaves[l].maxDef) d.valAt[e] = vi++;
-      d.rowStart.clear();
-      for (int64_t e = 0; e < entries; ++e)
-        if (!leaves[l].maxRep || d.reps[e] == 0) d.rowStart.push_back(e);
-      while ((int64_t)d.rowStart.size() < rows) d.rowStart.push_back(entries);
-      d.rowStart.push_back(entries);
-    }
-    Assembler as{nodes, leaves, data, {}};
-    as.init();
-    Assembler::Ranges rr(leaves.size());
-    for (int64_t r = 0; r < rows; ++r) {
-      for (size_t l = 0; l < leaves.size(); ++l)
-        if (need[l]) rr[l] = {data[l].rowStart[r], data[l].rowStart[r + 1]};
-      for (size_t k = 0; k < map.size(); ++k) {
-        if (k) out += '\t';
-        if (map[k] < 0) { out += "\\N"; continue; }
-        const PNode& nd = nodes[top[map[k]]];
-        if (nd.leaf >= 0 && nd.rep != 2) {  // a flat column
-          const LeafData& d = data[nd.leaf];
-          const int64_t e = d.rowStart[r];
-          const int64_t vi = e < (int64_t)d.valAt.size() ? d.valAt[e] : -1;
-          out += vi < 0 ? std::string("\\N") : d.vals[vi];
-          continue;
-        }
-        const std::string j = as.json(top[map[k]], rr);
-        if (j == "null") out += "\\N";
-        else tsvAppend(out, j.data(), j.size());
+    if (!chunks || rows <= 0) continue;
+    std::vector<PqChunk> cols(wanted.size());
+    std::vector<std::exception_ptr> errs(wanted.size());
+    std::atomic<bool> text{false};
+    ioParallel(wanted.size(), [&](size_t k) {
+      if (leafOf[k] < 0) return;  // absent: kind 0 (all NULL)
+      try {
+        const size_t l = (size_t)leafOf[k];
+        if (l >= chunks->list.size() || !chunks->list[l].f(3)) bad("row group without column chunk " + sc.leaves[l].name);
+        readLeafTyped(file, sc.leaves[l], *chunks->list[l].f(3), rows, cols[k]);
+      } catch (const NeedsText&) {
+        text = true;
+      } catch (...) {
+        errs[k] = std::current_exception();
       }
-      out += '\n';
+    });
+    if (text) {
+      if (first) return false;  // (nothing loaded yet: the caller goes through text instead)
+      bad("a column chunk needs an encoding the direct path doesn't read");
     }
+    for (auto& e : errs)
+      if (e) std::rethrow_exception(e);
+    first = false;
+    fn(rows, cols);
   }
-  return out;
+  return true;
 }
 
 }  // namespace gdb

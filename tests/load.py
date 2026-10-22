@@ -139,19 +139,93 @@ open(empty, "w").close()
 cur.execute(f"LOAD DATA INFILE '{empty}' INTO TABLE zt")
 c.eq("empty file", q("SELECT COUNT(*) FROM zt"), [(100000,)])
 
-# 7) The WAL's copies are compressed; they replay after the sources are gone and the server is killed.
+# 7) Parquet, decoded straight into columns: every physical type, dates, timestamps (ms / us / ns),
+# decimals, NULLs, small dictionaries, several row groups and codecs, absent columns, a column list;
+# nested columns go through text (JSON).
+import datetime as dt
+import pyarrow as pa, pyarrow.parquet as pq
+PN = 30000
+prng = random.Random(11)
+pdata = {
+    "id": pa.array(list(range(PN)), pa.int64()),
+    "i32": pa.array([prng.randint(-2**31, 2**31 - 1) if i % 13 else None for i in range(PN)], pa.int32()),
+    "f": pa.array([i / 4 for i in range(PN)], pa.float32()),
+    "d": pa.array([prng.uniform(-1e6, 1e6) if i % 17 else None for i in range(PN)], pa.float64()),
+    "b": pa.array([i % 3 == 0 for i in range(PN)], pa.bool_()),
+    "tiny": pa.array([["5", "g", "6"][i % 3] for i in range(PN)], pa.string()),  # (a dictionary page of a few bytes)
+    "s": pa.array([f"str{prng.randint(0, 5000)}" if i % 7 else None for i in range(PN)], pa.string()),
+    "day": pa.array([dt.date(2020, 1, 1) + dt.timedelta(days=i % 1500) for i in range(PN)], pa.date32()),
+    "tms": pa.array([dt.datetime(2021, 3, 4, 5, 6, 7) + dt.timedelta(milliseconds=i * 1000) for i in range(PN)], pa.timestamp("ms")),
+    "tus": pa.array([dt.datetime(2022, 1, 1) + dt.timedelta(microseconds=i * 1000001) for i in range(PN)], pa.timestamp("us")),
+    "tns": pa.array([dt.datetime(2023, 6, 1) + dt.timedelta(seconds=i) for i in range(PN)], pa.timestamp("ns")),
+    "dec": pa.array([Decimal(f"{prng.randint(-10**8, 10**8)}.{prng.randint(0, 99):02d}") for i in range(PN)], pa.decimal128(12, 2)),
+    "dec4": pa.array([Decimal(f"{i % 1000}.{i % 10000:04d}") for i in range(PN)], pa.decimal128(8, 4)),
+}
+ptab = pa.table(pdata)
+cur.execute("CREATE TABLE pq (id BIGINT, i32 INT, f DOUBLE, d DOUBLE, b INT, tiny VARCHAR(4), s VARCHAR(20), day DATE, "
+            "tms DATETIME, tus DATETIME, tns DATETIME, `dec` DECIMAL(12,2), dec4 DECIMAL(10,2), extra INT)")
+pqfiles = []
+for codec in ("snappy", "zstd", "gzip", "none"):
+    pf = path(f"p-{codec}.parquet")
+    pq.write_table(ptab, pf, compression=codec, row_group_size=7000, use_dictionary=codec != "none")
+    pqfiles.append(pf)
+    cur.execute(f"LOAD DATA INFILE '{pf}' INTO TABLE pq")
+
+
+def pq_expect(k):
+    rows = ptab.to_pylist()
+    i32s = [r["i32"] for r in rows if r["i32"] is not None]
+    ds = [r["d"] for r in rows if r["d"] is not None]
+    return (k * PN, k * len(i32s), k * sum(i32s), k * sum(1 for r in rows if r["b"]), k * len(ds),
+            len({r["s"] for r in rows if r["s"] is not None}), sorted({r["tiny"] for r in rows}))
+
+
+def pq_got():
+    r = q("SELECT COUNT(*), COUNT(i32), SUM(i32), SUM(b), COUNT(d), COUNT(DISTINCT s) FROM pq")[0]
+    tiny = sorted(x[0] for x in q("SELECT DISTINCT tiny FROM pq"))
+    return (r[0], r[1], int(r[2]), int(r[3]), r[4], r[5], tiny)
+
+
+c.eq("Parquet: counts, NULLs, sums, small dictionaries (4 codecs)", pq_got(), pq_expect(4))
+c.check("Parquet: double sum", abs(q("SELECT SUM(d) FROM pq")[0][0] - 4 * sum(x for x in pdata["d"].to_pylist() if x is not None)) < 1e-3)
+sample = [0, 1, 13, 777, 29999]
+got = [a + b[1:] for a, b in zip(q("SELECT DISTINCT id, f, day, tms, tus FROM pq WHERE id IN (0, 1, 13, 777, 29999) ORDER BY id"),
+                                  q("SELECT DISTINCT id, tns, `dec`, dec4, extra, s FROM pq WHERE id IN (0, 1, 13, 777, 29999) ORDER BY id"))]
+want = []
+for i in sample:
+    r = ptab.slice(i, 1).to_pylist()[0]
+    want.append((i, float(r["f"]), r["day"], r["tms"], r["tus"].replace(microsecond=r["tus"].microsecond), r["tns"].to_pydatetime() if hasattr(r["tns"], "to_pydatetime") else r["tns"],
+                 r["dec"], r["dec4"].quantize(Decimal("0.01")), None, r["s"]))
+c.eq("Parquet: values (float, date, timestamps, decimals, absent column, NULL string)", [tuple(g) for g in got], want)
+# a column list, by name
+cur.execute("CREATE TABLE pq2 (a BIGINT, z VARCHAR(10), s VARCHAR(20))")
+cur.execute(f"LOAD DATA INFILE '{pqfiles[0]}' INTO TABLE pq2 (a, s)")
+c.eq("Parquet: column list", q("SELECT COUNT(*), COUNT(a), COUNT(z), COUNT(s) FROM pq2"), [(PN, 0, 0, sum(1 for x in pdata['s'].to_pylist() if x is not None))])
+# NOT NULL violated by a NULL in the file
+cur.execute("CREATE TABLE pq3 (i32 INT NOT NULL)")
+c.raises("Parquet: NULL into NOT NULL", lambda: cur.execute(f"LOAD DATA INFILE '{pqfiles[1]}' INTO TABLE pq3"), 1048)
+# nested: a list column loads as JSON text
+nested = path("nested.parquet")
+pq.write_table(pa.table({"k": pa.array([1, 2, 3]), "tags": pa.array([["a", "b"], [], None], pa.list_(pa.string()))}), nested)
+cur.execute("CREATE TABLE pqn (k INT, tags VARCHAR(40))")
+cur.execute(f"LOAD DATA INFILE '{nested}' INTO TABLE pqn")
+c.eq("Parquet: nested column as JSON", q("SELECT k, tags FROM pqn ORDER BY k"), [(1, '["a","b"]'), (2, "[]"), (3, None)])
+
+# 8) The WAL's copies are compressed; they replay after the sources are gone and the server is killed.
 loads = os.path.join(srv.data_dir, "loads")
 copies = sum(os.path.getsize(os.path.join(loads, f)) for f in os.listdir(loads))
 c.check("compressed copies are much smaller than the big file", copies < os.path.getsize(big) / 2, (copies, os.path.getsize(big)))
-for p in (big, pk, sk, csv, esc, bad, zin + ".zst", empty):
+for p in [big, pk, sk, csv, esc, bad, zin + ".zst", empty, nested] + pqfiles:
     os.unlink(p)
-before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai")]
+pq_before = pq_got()
+before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn")]
 srv.kill()
 srv.start()
 cur = srv.cursor()
 cur.execute("USE l")
 check_big("after crash replay")
-c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai")], before)
+c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn")], before)
+c.eq("Parquet tables after replay", pq_got(), pq_before)
 c.eq("pk table after replay", q("SELECT COUNT(*), MAX(id), SUM(score) FROM pk"), [(50000, 50000, 3 * 49999 * 50000 // 2)])
 srv.stop()
 c.done()
