@@ -13104,7 +13104,48 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     fclose(f);
     throw SqlError("bad snapshot file " + path, 1105);
   }
-  if (magic[7] >= '2') f = zstdReader(f);
+  std::string whole;  // the decompressed snapshot, when it was checked first (see below)
+  if (magic[7] >= '2') {
+    // Decompress it all first, so the zstd checksum is verified before anything is parsed (a
+    // damaged file must not be half-loaded, or send the parser off on a garbage count). Very large
+    // ones (backups with their data inline) are read as a stream; the checksum is then checked at
+    // the end.
+    const long at = ftell(f);
+    ZSTD_DCtx* dz = ZSTD_createDCtx();
+    std::vector<char> in(1 << 20);
+    std::string out(1 << 20, '\0');
+    size_t used = 0, rc = 1;
+    bool ok = true, big = false;
+    for (size_t got; ok && !big && (got = fread(in.data(), 1, in.size(), f)) > 0;) {
+      ZSTD_inBuffer ib{in.data(), got, 0};
+      while (ib.pos < ib.size) {
+        if (used == out.size()) {
+          if (out.size() >= ((size_t)1 << 30)) { big = true; break; }
+          out.resize(out.size() * 2);
+        }
+        ZSTD_outBuffer ob{out.data() + used, out.size() - used, 0};
+        rc = ZSTD_decompressStream(dz, &ob, &ib);
+        if (ZSTD_isError(rc)) { ok = false; break; }
+        used += ob.pos;
+      }
+    }
+    ZSTD_freeDCtx(dz);
+    if (!ok || (!big && rc != 0)) {
+      fclose(f);
+      throw SqlError("corrupt snapshot " + path + (ok ? " (truncated)" : " (checksum mismatch or damaged data)"), 1105);
+    }
+    if (big) {
+      fseek(f, at, SEEK_SET);
+      f = zstdReader(f);
+    } else {
+      fclose(f);
+      out.resize(used);
+      whole = std::move(out);
+      f = fmemopen(whole.data(), std::max<size_t>(whole.size(), 1), "rb");
+      if (!f) throw SqlError("cannot read snapshot " + path, 1105);
+      if (whole.empty()) fgetc(f);  // (an empty stream: EOF at once)
+    }
+  }
   const bool columnar = magic[7] >= '3';
   uint64_t n;
   getU64(f, n);
@@ -13171,7 +13212,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
       }
       pipes_[lower(p->name)] = p;
     }
-  if (magic[7] >= '2') {  // the end of the zstd stream: its checksum is verified there
+  if (magic[7] >= '2' && whole.empty()) {  // (streamed: the end of the zstd stream, where its checksum is verified)
     char extra;
     const size_t k = fread(&extra, 1, 1, f);
     if (k != 0 || ferror(f)) {
