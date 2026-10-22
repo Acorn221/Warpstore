@@ -11144,7 +11144,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     const std::string msg = e.what();
     // GROUP BY the GPU can't run (a string key it can't group, more than 8 keys): on the host.
     if (pristine && (msg.find("GROUP BY on this string") != std::string::npos || msg.find("GROUP BY expressions are supported") != std::string::npos)) {
-      if (pristine->groupBy.empty()) {  // SELECT DISTINCT ..: GROUP BY its items
+      if (pristine->groupBy.empty() && pristine->distinct) {  // SELECT DISTINCT ..: GROUP BY its items
         bool star = false;
         for (auto& it : pristine->items) star = star || it.e->kind == Expr::STAR;
         if (star) {  // (DISTINCT *: every column of the one table)
@@ -11162,6 +11162,19 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
           if (hasAgg(it.e)) throw;
         for (auto& it : pristine->items) pristine->groupBy.push_back(cloneExpr(it.e));
         pristine->distinct = false;
+      }
+      if (msg.find("GROUP BY expressions are supported") != std::string::npos) {
+        Stmt packed = cloneStmt(*pristine);
+        if (packGroupKeys(packed)) {  // integer keys packed into one: on the GPU after all
+          tWantVals = typed;
+          try {
+            out = doSelect(packed, explain);
+            tWantVals = savedWant;
+            return out;
+          } catch (SqlError&) {
+            tWantVals = savedWant;
+          }
+        }
       }
       return hostAggregate(*pristine, q, explain, typed);
     }
@@ -11879,6 +11892,90 @@ ResultSet Engine::showPipelines() {
 // Host aggregation: the GPU produces the filtered / joined rows (group keys and aggregate arguments),
 // the host groups them and computes every aggregate, then HAVING / ORDER BY / LIMIT run over a temp
 // table of the groups. Used for aggregates without a GPU implementation and as a fallback.
+// GROUP BY with more keys than the GPU path takes: plain INT / BIGINT columns of one table whose value
+// ranges are known are packed into one BIGINT key (each value's offset from its minimum, NULL as one
+// more value, times the product of the ranges before it); select list, HAVING and ORDER BY read them
+// back from it. False if that doesn't bring the keys down to kMaxKeys.
+bool Engine::packGroupKeys(Stmt& s) {
+  if (s.from.size() != 1 || s.from[0].sub || !s.joinConds.empty() || s.unionNext) return false;
+  auto t = cat_.find(s.from[0].name.find('.') == std::string::npos ? currentDb() + "." + s.from[0].name : s.from[0].name);
+  if (!t) return false;
+  const std::string alias = s.from[0].alias.empty() ? s.from[0].name : s.from[0].alias;
+  auto resolve = [&](const ExprP& g) -> ExprP {  // GROUP BY 2 / GROUP BY alias
+    if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size()) return s.items[g->lit.i - 1].e;
+    if (g->kind == Expr::COL && g->table.empty())
+      for (auto& it : s.items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), g->name.c_str()) == 0) return it.e;
+    return g;
+  };
+  struct Key {
+    int col;
+    int64_t lo;
+    uint64_t width;  // values + 1 (NULL)
+  };
+  std::vector<Key> pack;
+  std::vector<ExprP> rest;
+  long double product = 1;
+  for (auto& g0 : s.groupBy) {
+    const ExprP g = resolve(g0);
+    int c = -1;
+    if (g->kind == Expr::COL && (g->table.empty() || strcasecmp(g->table.c_str(), alias.c_str()) == 0)) c = t->colIndex(g->name);
+    int64_t lo, hi;
+    bool dup = false;
+    for (auto& k : pack) dup = dup || k.col == c;
+    if (c >= 0 && !dup && (t->cols[c].lt == LType::INT || t->cols[c].lt == LType::BIGINT) && colRange(*t, c, lo, hi) && hi >= lo &&
+        (uint64_t)hi - (uint64_t)lo < ((uint64_t)1 << 40) && product * ((long double)((uint64_t)hi - (uint64_t)lo) + 2) < 9.0e15L) {
+      pack.push_back({c, lo, (uint64_t)hi - (uint64_t)lo + 2});
+      product *= (long double)pack.back().width;
+    } else {
+      rest.push_back(g0);
+    }
+  }
+  if (pack.size() < 2 || rest.size() + 1 > (size_t)kMaxKeys) return false;
+  auto q = [&](int c) { return "`" + t->cols[c].name + "`"; };
+  std::string p;
+  uint64_t mult = 1;
+  std::vector<uint64_t> mults;
+  for (auto& k : pack) {
+    mults.push_back(mult);
+    p += (p.empty() ? "" : " + ") + std::string("COALESCE(") + q(k.col) + " - (" + std::to_string(k.lo) + "), " + std::to_string(k.width - 1) + ") * " + std::to_string(mult);
+    mult *= k.width;
+  }
+  p = "(" + p + ")";
+  auto parseExpr = [](const std::string& x) { return parseSql("SELECT " + x).items.at(0).e; };
+  std::vector<ExprP> decode;
+  for (size_t i = 0; i < pack.size(); ++i) {
+    const std::string slot = "((" + p + " DIV " + std::to_string(mults[i]) + ") % " + std::to_string(pack[i].width) + ")";
+    decode.push_back(parseExpr("IF(" + slot + " = " + std::to_string(pack[i].width - 1) + ", NULL, " + slot + " + (" + std::to_string(pack[i].lo) + "))"));
+  }
+  std::function<void(ExprP&)> rw = [&](ExprP& x) {
+    if (!x || x->kind == Expr::SUBQUERY || x->sub) return;
+    if (x->kind == Expr::COL && (x->table.empty() || strcasecmp(x->table.c_str(), alias.c_str()) == 0)) {
+      const int c = t->colIndex(x->name);
+      for (size_t i = 0; i < pack.size(); ++i)
+        if (pack[i].col == c) {
+          x = cloneExpr(decode[i]);
+          return;
+        }
+      return;
+    }
+    if (x->kind == Expr::FUNC && (isAggName(x->op) || isHostAggName(x->op))) return;  // (aggregates read the rows)
+    for (auto& a : x->args) rw(a);
+  };
+  for (auto& it : s.items) {
+    if (it.alias.empty() && it.e->kind == Expr::COL) it.alias = it.e->name;  // (keep the column header)
+    rw(it.e);
+  }
+  rw(s.having);
+  for (auto& o : s.orderBy) {
+    if (o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT) continue;  // ORDER BY 1: the item
+    rw(o.e);
+  }
+  s.groupBy = rest;
+  s.groupBy.insert(s.groupBy.begin(), parseExpr(p));
+  return true;
+}
+
 ResultSet Engine::hostAggregate(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   auto resolveGroup = [&](const ExprP& g) -> ExprP {
     if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size())

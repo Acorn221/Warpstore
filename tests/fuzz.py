@@ -80,8 +80,21 @@ g.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id")
 got = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in g.fetchall()]
 want = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in d.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id").fetchall()]
 INSERT_CHECK = (got, want)  # (checked with the queries below)
-# More GROUP BY keys than the GPU path takes (8): DISTINCT / GROUP BY on the host.
+# More GROUP BY keys than the GPU path takes (8): integer columns packed into one key (t4), other
+# expressions on the host.
+T4 = ", ".join(f"k{i} INT" for i in range(10)) + ", v BIGINT"
+g.execute(f"CREATE TABLE t4 ({T4})")
+d.execute(f"CREATE TABLE t4 ({T4})")
+rows4 = ",".join("(" + ",".join(lit(maybe(R.randint(-3, 3) * (i + 1), 0.1)) for i in range(10)) + f", {R.randint(0, 1000)})" for _ in range(4000))
+g.execute(f"INSERT INTO t4 VALUES {rows4}")
+d.execute(f"INSERT INTO t4 VALUES {rows4}")
+ks = ", ".join(f"k{i}" for i in range(10))
 MANY_KEYS = []
+for sql in (f"SELECT DISTINCT {ks} FROM t4 ORDER BY {ks}",
+            f"SELECT {ks}, COUNT(*), SUM(v) FROM t4 GROUP BY {ks} HAVING COUNT(*) > 1 ORDER BY 11 DESC, {ks} LIMIT 50",
+            f"SELECT k3 + k4, {ks}, MAX(v) FROM t4 WHERE k0 IS NOT NULL GROUP BY {ks} ORDER BY {ks} LIMIT 40"):
+    g.execute(sql)
+    MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 for sql in ("SELECT DISTINCT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d FROM t1 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
             "SELECT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d, m > 0, COUNT(*), SUM(c) FROM t1 "
             "GROUP BY a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d, m > 0 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"):
