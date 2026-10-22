@@ -658,6 +658,114 @@ struct Loc {
   int32_t row;
   bool operator==(const Loc& o) const { return seg == o.seg && row == o.row; }
 };
+
+// int64 -> V hash map with open addressing (linear probing, tombstones): the primary-key index.
+// ~17 bytes per slot instead of a node per entry (std::unordered_map: 15M keys took ~1 GB and seconds
+// to rebuild). Iterators stay valid across erase(); inserts may rehash.
+template <class V>
+class FlatMap {
+  std::vector<int64_t> keys_;
+  std::vector<V> vals_;
+  std::vector<uint8_t> state_;  // 0 empty, 1 full, 2 erased
+  size_t n_ = 0, used_ = 0;     // full; full + erased
+  static size_t mix(int64_t k) {
+    uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ull;
+    return (size_t)(x ^ (x >> 29));
+  }
+  void rehash(size_t cap) {
+    FlatMap o;
+    o.keys_.assign(cap, 0);
+    o.vals_.assign(cap, V{});
+    o.state_.assign(cap, 0);
+    for (size_t i = 0; i < state_.size(); ++i)
+      if (state_[i] == 1) o.insertNew(keys_[i], vals_[i]);
+    *this = std::move(o);
+  }
+  size_t insertNew(int64_t k, const V& v) {  // (k absent, room made)
+    const size_t mask = state_.size() - 1;
+    size_t i = mix(k) & mask;
+    while (state_[i] == 1) i = (i + 1) & mask;
+    if (state_[i] == 0) ++used_;
+    keys_[i] = k, vals_[i] = v, state_[i] = 1, ++n_;
+    return i;
+  }
+  size_t slotOf(int64_t k) const {  // index, or SIZE_MAX
+    if (state_.empty()) return SIZE_MAX;
+    const size_t mask = state_.size() - 1;
+    for (size_t i = mix(k) & mask;; i = (i + 1) & mask) {
+      if (state_[i] == 0) return SIZE_MAX;
+      if (state_[i] == 1 && keys_[i] == k) return i;
+    }
+  }
+
+ public:
+  struct Item {
+    int64_t first;
+    V& second;
+  };
+  struct iterator {
+    using iterator_category = std::forward_iterator_tag;
+    using value_type = Item;
+    using difference_type = std::ptrdiff_t;
+    using pointer = void;
+    using reference = Item;
+    FlatMap* m;
+    size_t i;
+    void skip() {
+      while (i < m->state_.size() && m->state_[i] != 1) ++i;
+    }
+    Item operator*() const { return {m->keys_[i], m->vals_[i]}; }
+    struct Arrow {
+      Item it;
+      Item* operator->() { return &it; }
+    };
+    Arrow operator->() const { return {**this}; }
+    iterator& operator++() {
+      ++i;
+      skip();
+      return *this;
+    }
+    bool operator==(const iterator& o) const { return i == o.i; }
+    bool operator!=(const iterator& o) const { return i != o.i; }
+  };
+  size_t size() const { return n_; }
+  bool empty() const { return n_ == 0; }
+  void clear() { *this = FlatMap(); }
+  void reserve(size_t n) {
+    size_t cap = 16;
+    while (cap < n * 2) cap <<= 1;
+    if (cap > state_.size()) rehash(cap);
+  }
+  iterator begin() {
+    iterator it{this, 0};
+    it.skip();
+    return it;
+  }
+  iterator end() { return {this, state_.size()}; }
+  iterator find(int64_t k) {
+    const size_t i = slotOf(k);
+    return i == SIZE_MAX ? end() : iterator{this, i};
+  }
+  size_t count(int64_t k) const { return slotOf(k) != SIZE_MAX; }
+  std::pair<iterator, bool> try_emplace(int64_t k, const V& v) {
+    const size_t f = slotOf(k);
+    if (f != SIZE_MAX) return {iterator{this, f}, false};
+    if ((used_ + 1) * 10 > state_.size() * 7) rehash(std::max<size_t>(16, n_ * 4 > state_.size() ? state_.size() * 2 : state_.size()));
+    return {iterator{this, insertNew(k, v)}, true};
+  }
+  V& operator[](int64_t k) { return (*try_emplace(k, V{}).first).second; }
+  size_t erase(int64_t k) {
+    const size_t i = slotOf(k);
+    if (i == SIZE_MAX) return 0;
+    state_[i] = 2, --n_;
+    return 1;
+  }
+  iterator erase(iterator it) {
+    state_[it.i] = 2, --n_;
+    ++it;
+    return it;
+  }
+};
 inline Loc bufLoc(int part, int64_t row) { return Loc{-1 - part, (int32_t)row}; }
 inline int bufPart(Loc l) { return -1 - l.seg; }
 
@@ -815,7 +923,7 @@ struct Table {
   bool isShadow() const { return base != nullptr; }
   // Is location l (from base's indexes) a live row of this snapshot?
   bool shadowHas(Loc l) const;
-  std::unordered_map<int64_t, Loc> pkIndex;
+  FlatMap<Loc> pkIndex;
   FairSharedMutex mu;
   int64_t flushes = 0;
   mutable int64_t nextPart = 0;

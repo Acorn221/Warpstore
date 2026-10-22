@@ -15469,7 +15469,9 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     std::unique_lock<FairSharedMutex> lk(t->mu);
     std::vector<Value> row(t->cols.size());
     const std::string dictDir = dir_ + "/dicts";
+    const auto tt0 = Clock::now();
     if (columnar) readColumnar(f, *t, magic[7] >= '4', magic[7] >= '5' ? &dictDir : nullptr), rows = 0;  // (rows: counted below from the table)
+    if (envSetting("TRACE")) fprintf(stderr, "[trace] snapshot: table %s in %.0f ms\n", t->name.c_str(), msSince(tt0));
     for (uint64_t r = 0; r < rows; ++r) {
       for (auto& v : row) getVal(f, v);
       t->appendRow(row);
