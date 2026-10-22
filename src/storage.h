@@ -114,41 +114,59 @@ class StrVec {
   static constexpr int kShift = 12;
   static constexpr size_t kBlock = size_t(1) << kShift, kMask = kBlock - 1;
   static constexpr size_t kChunk = size_t(1) << 20;
-  std::atomic<std::string_view**> dir_{nullptr};
+  // An entry: 48-bit pointer | 16-bit length (0xFFFF: the length is the 8 bytes before the string).
+  static constexpr uint64_t kLong = 0xFFFF;
+  static uint64_t pack(const char* p, size_t len) { return (uint64_t)(uintptr_t)p | (std::min<uint64_t>(len, kLong) << 48); }
+  static std::string_view unpack(uint64_t e) {
+    const char* p = (const char*)(uintptr_t)(e & ((uint64_t(1) << 48) - 1));
+    const uint64_t len = e >> 48;
+    if (len < kLong) return std::string_view(p, len);
+    uint64_t l;
+    memcpy(&l, p - 8, 8);
+    return std::string_view(p, l);
+  }
+  static size_t room(size_t len) { return len + (len >= kLong ? 8 : 0); }  // arena bytes for a string
+  std::atomic<uint64_t**> dir_{nullptr};
   size_t dirCap_ = 0, nblocks_ = 0;
   std::atomic<size_t> n_{0};
-  std::vector<std::unique_ptr<std::string_view*[]>> dirs_;  // every directory ever used (the last is current)
-  std::vector<std::unique_ptr<std::string_view[]>> blocks_;
+  std::vector<std::unique_ptr<uint64_t*[]>> dirs_;  // every directory ever used (the last is current)
+  std::vector<std::unique_ptr<uint64_t[]>> blocks_;
   std::vector<std::unique_ptr<char[]>> chunks_;
   char* cur_ = nullptr;
   size_t left_ = 0;
   uint64_t bytes_ = 0;
-  std::string_view& slot(size_t i) {
+  uint64_t& slot(size_t i) {
     if (i >= nblocks_ * kBlock) {
       if (nblocks_ == dirCap_) {
         const size_t cap = std::max<size_t>(16, dirCap_ * 2);
-        std::unique_ptr<std::string_view*[]> d(new std::string_view*[cap]());
+        std::unique_ptr<uint64_t*[]> d(new uint64_t*[cap]());
         for (size_t b = 0; b < nblocks_; ++b) d[b] = blocks_[b].get();
         dir_.store(d.get(), std::memory_order_release);
         dirs_.push_back(std::move(d));
         dirCap_ = cap;
       }
-      blocks_.emplace_back(new std::string_view[kBlock]);
+      blocks_.emplace_back(new uint64_t[kBlock]());
       dirs_.back()[nblocks_++] = blocks_.back().get();
     }
     return dir_.load(std::memory_order_relaxed)[i >> kShift][i & kMask];
   }
   const char* store(std::string_view s) {
     if (s.empty()) return "";
-    if (s.size() > left_) {
-      const size_t sz = std::max(kChunk, s.size());
+    const size_t need = room(s.size());
+    if (need > left_) {
+      const size_t sz = std::max(kChunk, need);
       chunks_.emplace_back(new char[sz]);
       cur_ = chunks_.back().get();
       left_ = sz;
     }
     char* p = cur_;
+    if (need != s.size()) {  // (long: its length first)
+      const uint64_t l = s.size();
+      memcpy(p, &l, 8);
+      p += 8;
+    }
     memcpy(p, s.data(), s.size());
-    cur_ += s.size(), left_ -= s.size(), bytes_ += s.size();
+    cur_ += need, left_ -= need, bytes_ += s.size();
     return p;
   }
 
@@ -165,12 +183,12 @@ class StrVec {
   size_t size() const { return n_.load(std::memory_order_acquire); }
   bool empty() const { return size() == 0; }
   uint64_t bytes() const { return bytes_; }  // string bytes stored
-  std::string_view operator[](size_t i) const { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
+  std::string_view operator[](size_t i) const { return unpack(dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]); }
   std::string_view back() const { return (*this)[size() - 1]; }
   void push_back(std::string_view s) {
     const size_t i = n_.load(std::memory_order_relaxed);
     const char* p = store(s);
-    slot(i) = std::string_view(p, s.size());
+    slot(i) = pack(p, s.size());
     n_.store(i + 1, std::memory_order_release);
   }
   void emplace_back(std::string_view s) { push_back(s); }
@@ -184,16 +202,16 @@ class StrVec {
     }
     const size_t base = n_.load(std::memory_order_relaxed);
     std::vector<uint64_t> off(k + 1, 0);
-    for (size_t j = 0; j < k; ++j) off[j + 1] = off[j] + get(j).size();
+    for (size_t j = 0; j < k; ++j) off[j + 1] = off[j] + room(get(j).size());
     const size_t total = off[k];
     char* p = nullptr;
     if (total) {
       chunks_.emplace_back(new char[total]);
       p = chunks_.back().get();
-      bytes_ += total;
+      for (size_t j = 0; j < k; ++j) bytes_ += get(j).size();
     }
     while (nblocks_ * kBlock < base + k) slot(nblocks_ * kBlock);  // (blocks and directory for the whole range, in order)
-    std::string_view** dir = dir_.load(std::memory_order_relaxed);
+    uint64_t** dir = dir_.load(std::memory_order_relaxed);
     const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 16);
     std::vector<std::thread> th;
     for (size_t t = 0; t < nth; ++t)
@@ -201,9 +219,14 @@ class StrVec {
         for (size_t j = k * t / nth; j < k * (t + 1) / nth; ++j) {
           const std::string_view v = get(j);
           char* d = p + off[j];
+          if (room(v.size()) != v.size()) {
+            const uint64_t l = v.size();
+            memcpy(d, &l, 8);
+            d += 8;
+          }
           if (!v.empty()) memcpy(d, v.data(), v.size());
           const size_t i = base + j;
-          dir[i >> kShift][i & kMask] = std::string_view(v.empty() ? "" : d, v.size());
+          dir[i >> kShift][i & kMask] = pack(v.empty() ? "" : d, v.size());
         }
       });
     for (auto& x : th) x.join();
@@ -478,8 +501,8 @@ struct Dict {
       if (__atomic_compare_exchange_n(&slots_[i], &expect, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
     }
   }
-  void grow(size_t n) const {  // room for n strings at most half full
-    if (n * 2 <= slots_.size()) return;
+  void grow(size_t n) const {  // room for n strings: grows past 70% full, to at most half full
+    if (n * 10 <= slots_.size() * 7) return;
     size_t cap = std::max<size_t>(64, slots_.size());
     while (cap < n * 2) cap *= 2;
     std::vector<uint64_t> old(cap, 0);

@@ -79,4 +79,7 @@ c.eq("named window", q("SELECT x, ROW_NUMBER() OVER w, SUM(x) OVER w FROM (SELEC
 q("SELECT SQL_CALC_FOUND_ROWS x FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3) t LIMIT 1")
 c.eq("SQL_CALC_FOUND_ROWS / FOUND_ROWS()", q("SELECT FOUND_ROWS()"), [(3,)])
 c.eq("ROLLUP keeps the key type", q("SELECT x, COUNT(*) FROM (SELECT 1 x UNION ALL SELECT 2) t GROUP BY x WITH ROLLUP"), [(1, 1), (2, 1), (None, 2)])
+cur.execute("CREATE TABLE longs (id INT, s LONGTEXT)")
+cur.execute("INSERT INTO longs VALUES (1, %s), (2, %s), (3, %s)", ("x" * 70000 + "end", "y" * 65535, "z" * 65534))
+c.eq("strings of 64 KB and more", q("SELECT id, LENGTH(s), RIGHT(s, 3) FROM longs ORDER BY id"), [(1, 70003, "end"), (2, 65535, "yyy"), (3, 65534, "zzz")])
 c.done()
