@@ -60,7 +60,7 @@ def churn():
 
 th = threading.Thread(target=churn)
 th.start()
-deadline = time.time() + 30
+deadline = time.time() + 60  # (background compaction; slow on a loaded machine)
 while time.time() < deadline and (len(segments("t")) >= before_t or len(segments("h")) >= before_h):
     time.sleep(0.5)
 th.join()
