@@ -1152,10 +1152,16 @@ struct Table {
   // exclusive lock (false: the table changed shape meanwhile; try again later).
   std::vector<struct CompactJob> compactPlan() const;
   void compactBuild(struct CompactJob& j) const;
-  // Column-level UPDATE: in segment sis[s], column setCols[k] becomes data[s][k] (the whole raw
-  // column, moved from). Each segment is replaced by a new version (Segment::ov) sharing the rest;
-  // rows keep their places, so keys and indexes on other columns are unchanged.
-  void replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<std::vector<std::vector<uint8_t>>>& data);
+  // Column-level UPDATE: in segment sis[s], column setCols[k] becomes patches[s].cols[k] (the whole
+  // raw column, moved from), which is the old one with rows[i] set to vals[k][i]. Each segment is
+  // replaced by a new version (Segment::ov) sharing the rest; rows keep their places, so keys and
+  // indexes on other columns are unchanged.
+  struct ColPatch {
+    std::vector<std::vector<uint8_t>> cols;  // per SET column: the new column
+    std::vector<int32_t> rows;               // the rows changed
+    std::vector<std::vector<uint8_t>> vals;  // per SET column: their new raw values, in rows' order
+  };
+  void replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<ColPatch>& patches);
   bool compactInstall(struct CompactJob& j);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
   bool colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mn, double& mx) const;

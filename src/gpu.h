@@ -22,6 +22,9 @@ int64_t gpuVramUsed();
 double gpuVramFill();  // fraction of the VRAM budget (or of the device) in use
 void* placeColumn(void* host, size_t bytes, bool& mapped, bool hostOnly = false);  // hostOnly: VRAM = NEVER
 void releaseColumn(void* dev, void* host, size_t bytes, bool mapped);
+// A VRAM copy of a raw column (oldDev, bytes) with rows[i] set to the width-byte value vals[i]
+// (column-level UPDATE: only the changes cross PCIe). nullptr if it doesn't fit in VRAM.
+void* gpuPatchColumn(const void* oldDev, size_t bytes, int width, const int32_t* rows, const void* vals, int64_t m);
 // VRAM cache moves (Engine::vramBalance): a VRAM copy of host bytes (nullptr if it doesn't fit),
 // freeing one, mapping host bytes for zero-copy reads over PCIe, unmapping them.
 void* vramAcquire(const void* host, size_t bytes);

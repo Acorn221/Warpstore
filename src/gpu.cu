@@ -238,6 +238,38 @@ static uint8_t* pinnedStage(size_t bytes) {
   }
   return buf;
 }
+__global__ void patchColumnK(uint8_t* col, int w, const int32_t* rows, const uint8_t* vals, int64_t m) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < m; i += (int64_t)gridDim.x * blockDim.x) {
+    if (w == 8) ((uint64_t*)col)[rows[i]] = ((const uint64_t*)vals)[i];
+    else ((uint32_t*)col)[rows[i]] = ((const uint32_t*)vals)[i];
+  }
+}
+
+void* gpuPatchColumn(const void* oldDev, size_t bytes, int width, const int32_t* rows, const void* vals, int64_t m) {
+  if ((width != 4 && width != 8) || g_vramUsed + (int64_t)bytes > g_vramLimit) return nullptr;
+  void* p = nullptr;
+  if (cudaMalloc(&p, bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return nullptr;
+  }
+  g_vramUsed += (int64_t)bytes;
+  CK(cudaMemcpyAsync(p, oldDev, bytes, cudaMemcpyDeviceToDevice, 0));
+  if (m > 0) {
+    const size_t rb = ((size_t)m * 4 + 7) / 8 * 8, vb = (size_t)m * width;
+    uint8_t* stage = pinnedStage(rb + vb);
+    memcpy(stage, rows, (size_t)m * 4);
+    memcpy(stage + rb, vals, vb);
+    uint8_t* d = (uint8_t*)tmpAlloc(rb + vb);
+    CK(cudaMemcpyAsync(d, stage, rb + vb, cudaMemcpyHostToDevice, 0));
+    CK(cudaEventRecord(tStageEv, 0));
+    patchColumnK<<<(unsigned)gridFor(m), 256>>>((uint8_t*)p, width, (const int32_t*)d, d + rb, m);
+    CK(cudaGetLastError());
+    tmpFree(d);
+  }
+  CK(cudaStreamSynchronize(0));
+  return p;
+}
+
 static double hostIdentity(uint8_t op) { return op == AGG_MIN ? INFINITY : op == AGG_MAX ? -INFINITY : 0.0; }
 
 __global__ void initNoKeys(double* out, AggPlan plan) {

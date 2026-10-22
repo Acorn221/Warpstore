@@ -1073,7 +1073,7 @@ bool Table::colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mn
   return nul;
 }
 
-void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<std::vector<std::vector<uint8_t>>>& data) {
+void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<ColPatch>& patches) {
   const size_t nc = cols.size(), S = sis.size(), K = setCols.size();
   std::vector<std::shared_ptr<SegData>> nd(S);
   for (auto& D : nd) {
@@ -1089,26 +1089,42 @@ void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<in
     D->encHost.resize(nc);
   }
   std::vector<uint8_t> nul(S * K, 0);
-  ioParallel(S * K, [&](size_t i) {  // stats and encoding: a task per segment and column
+  std::vector<int64_t> placed(S * K, 0);
+  ioParallel(S * K, [&](size_t i) {  // stats, encoding and the device copy: a task per segment and column
     const size_t s = i / K, k = i % K;
     const int c = setCols[k];
     SegData& D = *nd[s];
-    D.host[c] = std::move(data[s][k]);
-    nul[i] = colStats(c, D.host[c], segs[sis[s]]->n, D.mn[c], D.mx[c]);
-    D.enc[c] = encodeColumn(c, D.host[c], segs[sis[s]]->n, D.encHost[c]);
+    const Segment& sg = *segs[sis[s]];
+    ColPatch& p = patches[s];
+    D.host[c] = std::move(p.cols[k]);
+    D.enc[c] = encodeColumn(c, D.host[c], sg.n, D.encHost[c]);
+    // The old version raw in VRAM: copied there with just the changed rows uploaded, and the segment
+    // elimination range widened by the new values (exact again when the segment is rebuilt).
+    const SegData& O = sg.cd(c);
+    if (!D.enc[c] && !O.enc[c] && !segCold(O, c) && O.dev[c] && !O.mapped[c] && vramHint(c) != 2) {
+      double mn, mx;
+      nul[i] = colStats(c, p.vals[k], (int64_t)p.rows.size(), mn, mx);
+      D.dev[c] = gpuPatchColumn(O.dev[c], D.host[c].size(), colBytes(c), p.rows.data(), p.vals[k].data(), (int64_t)p.rows.size());
+      if (D.dev[c]) {
+        D.mn[c] = std::min(mn, O.mn[c]);
+        D.mx[c] = std::max(mx, O.mx[c]);
+        placed[i] = (int64_t)D.host[c].size();
+        return;
+      }
+    }
+    nul[i] = colStats(c, D.host[c], sg.n, D.mn[c], D.mx[c]);
+    bool m = false;
+    std::vector<uint8_t>& pl = D.enc[c] ? D.encHost[c] : D.host[c];
+    D.dev[c] = placeColumn(pl.data(), pl.size(), m, vramHint(c) == 2);
+    D.mapped[c] = m;
+    placed[i] = (int64_t)pl.size();
   }, true);
   for (size_t i = 0; i < S * K; ++i)
     if (nul[i]) hasNull[setCols[i % K]] = 1;
   std::vector<std::pair<std::shared_ptr<SegData>, int>> olds;  // the versions replaced
   for (size_t s = 0; s < S; ++s) {
     SegData& D = *nd[s];
-    for (int c : setCols) {
-      bool m = false;
-      std::vector<uint8_t>& placed = D.enc[c] ? D.encHost[c] : D.host[c];
-      D.dev[c] = placeColumn(placed.data(), placed.size(), m, vramHint(c) == 2);
-      D.mapped[c] = m;
-      D.devBytes += (int64_t)placed.size();
-    }
+    for (size_t k = 0; k < K; ++k) D.devBytes += placed[s * K + k];
     segAccount(D);
     const std::shared_ptr<Segment>& old = segs[sis[s]];
     auto ns = std::make_shared<Segment>(*old);  // (shares the data, the other versions and the deleted-row bitmap)

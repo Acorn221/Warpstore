@@ -118,21 +118,46 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       for (int c : ix.cols) fixed.insert(c);
     for (int c : setCols) colMode = colMode && !fixed.count(c) && t.cols[c].pt != PType::VEC;
   }
-  auto inPlace = [&](const Loc& l) { return colMode && l.seg >= 0 && t.segs[l.seg]->full(); };
+  // Per segment: in place when enough of its rows match. A new column version costs the segment's
+  // rows x the SET columns' width (copied, uploaded); moving costs the matched rows x the row width,
+  // about 4 times over (the append, then compaction rewriting what is left).
+  std::vector<uint8_t> segIn(t.segs.size(), 0);  // segments whose rows are updated in place
+  std::vector<int64_t> cnt(t.segs.size(), 0);      // matched rows per segment
+  if (colMode) {
+    for (const Loc& l : matched)
+      if (l.seg >= 0) ++cnt[l.seg];
+    int64_t rowBytes = 0, setBytes = 0;
+    for (size_t c = 0; c < nc; ++c) rowBytes += t.colBytes((int)c);
+    for (int c : setCols) setBytes += t.colBytes(c);
+    for (size_t i = 0; i < t.segs.size(); ++i)
+      segIn[i] = cnt[i] > 0 && t.segs[i]->full() && cnt[i] * rowBytes * 4 >= t.segs[i]->n * setBytes;
+  }
+  auto inPlace = [&](const Loc& l) { return l.seg >= 0 && segIn[l.seg]; };
+  // The new versions of the SET columns of segments with matched rows: per segment (slotOf) and SET
+  // column, a copy of the column with the new values written in; installed at the end.
+  std::vector<int32_t> slotOf(t.segs.size(), -1), psegs;
+  std::vector<Table::ColPatch> pdata;
   if (colMode) {
     std::vector<Loc> moved;
-    for (const Loc& l : matched)
+    for (const Loc& l : matched) {
       if (!inPlace(l)) moved.push_back(l);
+      else if (slotOf[l.seg] < 0) slotOf[l.seg] = (int32_t)psegs.size(), psegs.push_back(l.seg);
+    }
     markDeleted(&t, moved);
+    pdata.resize(psegs.size());
+    for (auto& p : pdata) p.cols.resize(setCols.size()), p.vals.resize(setCols.size());
+    for (int32_t si : psegs)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
+      for (int c : setCols) t.colData(Loc{si, 0}, c);
+    ioParallel(psegs.size() * setCols.size(), [&](size_t i) {
+      const size_t s = i / setCols.size(), k = i % setCols.size();
+      pdata[s].cols[k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
+      pdata[s].vals[k].resize((size_t)cnt[psegs[s]] * t.colBytes(setCols[k]));
+      if (k == 0) pdata[s].rows.resize((size_t)cnt[psegs[s]]);
+    }, true);
   } else {
     markDeleted(&t, matched);
   }
-  if (tr) fprintf(stderr, "[trace] update: markDeleted %.1f ms\n", msSince(ph));
-  // The new versions of the SET columns of segments with matched rows: per segment (patchAt) and
-  // SET column, a copy of the column with the new values written in; installed at the end.
-  std::map<int32_t, size_t> patchAt;
-  std::vector<int32_t> psegs;
-  std::vector<std::vector<std::vector<uint8_t>>> pdata;
+  if (tr) fprintf(stderr, "[trace] update: markDeleted / column copies %.1f ms\n", msSince(ph));
   t.deferFlush = true;
   struct Flush {
     Table& t;
@@ -152,19 +177,18 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
   // In chunks: the matched rows' cells, a column per task; the SET values, row by row; then the new
   // rows appended a column at a time.
-  const size_t kChunk = 262144;
+  const size_t kChunk = colMode ? (1u << 20) : 262144;
+  std::vector<size_t> cursor(psegs.size(), 0);  // per segment: its rows / vals written so far
   std::vector<std::vector<int64_t>> iv(nc);
   std::vector<std::vector<double>> dv(nc);
   for (size_t from = 0; from < matched.size(); from += kChunk) {
     const size_t n = std::min(kChunk, matched.size() - from);
     const Loc* ls = matched.data() + from;
-    auto gather = [&](size_t c) {
+    auto gather = [&](size_t c, size_t from, size_t to) {  // (arrays sized already)
       const PType pt = t.cols[c].pt;
-      if (pt == PType::F64) dv[c].resize(n);
-      else iv[c].resize(n);
       const uint8_t* base = nullptr;
       int32_t baseSeg = INT32_MIN;
-      for (size_t i = 0; i < n; ++i) {
+      for (size_t i = from; i < to; ++i) {
         const Loc l = ls[i];
         if (l.seg != baseSeg) base = t.colData(l, (int)c).data(), baseSeg = l.seg;
         switch (pt) {
@@ -201,15 +225,25 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     std::vector<size_t> gcols;
     for (size_t c = 0; c < nc; ++c)
       if (need[c]) gcols.push_back(c);
+    for (size_t c : gcols) {
+      if (t.cols[c].pt == PType::F64) dv[c].resize(n);
+      else iv[c].resize(n);
+    }
     if (n < 4096) {  // (a few rows, e.g. by primary key: not worth a task per column)
-      for (size_t c : gcols) gather(c);
+      for (size_t c : gcols) gather(c, 0, n);
     } else {
       // cold columns (disk tier) loaded here first: a pool task must not wait for the I/O pool
-      std::set<int32_t> segsSeen;
+      std::vector<uint8_t> segsSeen(t.segs.size(), 0);
+      int32_t last = INT32_MIN;
       for (size_t i = 0; i < n; ++i)
-        if (ls[i].seg >= 0 && segsSeen.insert(ls[i].seg).second)
+        if (ls[i].seg != last && (last = ls[i].seg) >= 0 && !segsSeen[last]++)
           for (size_t c : gcols) t.colData(ls[i], (int)c);
-      ioParallel(gcols.size(), [&](size_t k) { gather(gcols[k]); }, true);
+      // a task per column and block of rows (few columns: several blocks each)
+      const size_t nb = gcols.empty() ? 1 : std::max<size_t>(1, 16 / gcols.size()), bs = (n + nb - 1) / nb;
+      ioParallel(gcols.size() * nb, [&](size_t k) {
+        const size_t b = k % nb;
+        gather(gcols[k / nb], b * bs, std::min(n, (b + 1) * bs));
+      }, true);
     }
     tg += msSince(ph), ph = Clock::now();
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
@@ -283,9 +317,10 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         const int s2 = colOf(e->args[0]);
         const double lv = e->args[1]->lit.num() * (e->op == "-" ? -1 : 1);
         if (f64) {
-          od = dv[s2];
-          for (auto& x : od)
-            if (x == x) x += lv;
+          od.resize(n);
+          parallelFor(n, [&](size_t b, size_t e) {
+            for (size_t i = b; i < e; ++i) od[i] = dv[s2][i] == dv[s2][i] ? dv[s2][i] + lv : dv[s2][i];
+          }, 65536);
           ok = true;
         } else {
           const double scaled = cm.lt == LType::DECIMAL ? lv * pow10i(cm.scale) : lv;
@@ -293,14 +328,20 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
           const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
           const int64_t lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
           if (std::fabs(scaled - (double)add) < 1e-9 && std::fabs(scaled) < 9e15) {
-            oi = iv[s2];
-            ok = true;
-            for (auto& x : oi) {
-              if (x == nul) continue;
-              int64_t y;
-              if (__builtin_add_overflow(x, add, &y) || y < lo || y > hi) { ok = false; break; }
-              x = y;
-            }
+            oi.resize(n);
+            std::atomic<bool> over{false};
+            parallelFor(n, [&](size_t b, size_t e) {
+              for (size_t i = b; i < e; ++i) {
+                const int64_t x = iv[s2][i];
+                int64_t y = x;
+                if (x != nul && (__builtin_add_overflow(x, add, &y) || y < lo || y > hi)) {
+                  over = true;
+                  return;
+                }
+                oi[i] = y;
+              }
+            }, 65536);
+            ok = !over;
           }
         }
       }
@@ -405,34 +446,41 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       t.appendColumns(iv, dv, (int64_t)n, partOf.empty() ? nullptr : partOf.data());
     };
     if (nMoved < n) {
-      // Rows in segments: their new values go into the segments' new column versions.
-      std::vector<size_t> fresh;
-      for (size_t i = 0; i < n; ++i)
-        if (inPlace(ls[i]) && patchAt.emplace(ls[i].seg, psegs.size()).second) {
-          psegs.push_back(ls[i].seg);
-          pdata.emplace_back(setCols.size());
-          fresh.push_back(psegs.size() - 1);
-        }
-      for (size_t s : fresh)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
-        for (int c : setCols) t.colData(Loc{psegs[s], 0}, c);
-      ioParallel(fresh.size() * setCols.size(), [&](size_t i) {
-        const size_t s = fresh[i / setCols.size()], k = i % setCols.size();
-        pdata[s][k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
-      }, true);
-      ioParallel(setCols.size(), [&](size_t k) {
+      // Rows in segments: their new values go into the segments' new column versions (and are kept,
+      // with their rows, for the device copies).
+      struct Run {  // chunk rows [b, e) are rows of segment slot s; they go at off in its rows / vals
+        uint32_t s, b, e;
+        size_t off;
+      };
+      std::vector<Run> runs;
+      for (size_t i = 0; i < n; ++i) {
+        if (!inPlace(ls[i])) continue;
+        const uint32_t sl = (uint32_t)slotOf[ls[i].seg];
+        if (!runs.empty() && runs.back().s == sl && runs.back().e == i && runs.back().e - runs.back().b < 16384) ++runs.back().e;
+        else runs.push_back({sl, (uint32_t)i, (uint32_t)i + 1, cursor[sl]});
+        ++cursor[sl];
+      }
+      const size_t K = setCols.size();
+      ioParallel(runs.size() * K, [&](size_t x) {  // (a task per run of at most 16K rows and SET column)
+        const Run& ru = runs[x / K];
+        const size_t k = x % K;
         const int c = setCols[k];
-        const PType pt = t.cols[c].pt;
-        size_t s = 0;
-        int32_t sseg = INT32_MIN;
-        for (size_t i = 0; i < n; ++i) {
-          const Loc l = ls[i];
-          if (!inPlace(l)) continue;
-          if (l.seg != sseg) s = patchAt[l.seg], sseg = l.seg;
-          uint8_t* col = pdata[s][k].data();
-          switch (pt) {
-            case PType::I32: ((int32_t*)col)[l.row] = (int32_t)iv[c][i]; break;
-            case PType::I64: ((int64_t*)col)[l.row] = iv[c][i]; break;
-            default: ((double*)col)[l.row] = dv[c][i]; break;
+        const int w = t.colBytes(c);
+        Table::ColPatch& p = pdata[ru.s];
+        uint8_t* col = p.cols[k].data();
+        uint8_t* vals = p.vals[k].data() + ru.off * w;
+        const bool f64 = t.cols[c].pt == PType::F64;
+        for (uint32_t i = ru.b; i < ru.e; ++i, vals += w) {
+          const int32_t r = ls[i].row;
+          if (k == 0) p.rows[ru.off + (i - ru.b)] = r;
+          if (w == 4) {
+            const int32_t v = (int32_t)iv[c][i];
+            memcpy(col + (size_t)r * 4, &v, 4);
+            memcpy(vals, &v, 4);
+          } else {
+            const void* v = f64 ? (const void*)&dv[c][i] : (const void*)&iv[c][i];
+            memcpy(col + (size_t)r * 8, v, 8);
+            memcpy(vals, v, 8);
           }
         }
       }, true);
@@ -554,6 +602,8 @@ ResultSet Engine::doModify(Stmt& s) {
     std::vector<int> parts = partsToScan(*t, 0, conj);
     std::vector<bool> inParts(t->nparts, false);
     for (int p : parts) inParts[p] = true;
+    std::vector<std::pair<int32_t, DevVec<int32_t>>> sel;  // per segment: matching rows (on the GPU), how many
+    std::vector<int64_t> nsel;
     for (size_t si = 0; si < t->segs.size(); ++si) {
       Segment& sg = *t->segs[si];
       if (!inParts[sg.part] || !segMayMatch(sg, conj)) continue;
@@ -565,8 +615,17 @@ ResultSet Engine::doModify(Stmt& s) {
       for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
       scanFlush();
       DevVec<int32_t> idx(sg.n);
-      int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
-      for (int32_t r : idx.download(m)) matched.push_back(Loc{(int32_t)si, r});
+      const int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
+      if (m) sel.push_back({(int32_t)si, std::move(idx)}), nsel.push_back(m);
+    }
+    int64_t total = 0;
+    for (int64_t m : nsel) total += m;
+    matched.reserve((size_t)total);
+    std::vector<int32_t> h;
+    for (size_t k = 0; k < sel.size(); ++k) {
+      h.resize((size_t)nsel[k]);
+      d2h(h.data(), sel[k].second.p, sizeof(int32_t) * h.size());
+      for (int32_t r : h) matched.push_back(Loc{sel[k].first, r});
     }
     for (int p : parts) {  // write-buffer rows: on the host, on all cores (chunks kept in row order)
       const WriteBuffer& b = *t->bufs[p];
