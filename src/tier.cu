@@ -68,10 +68,7 @@ bool pwriteAll(int fd, const void* buf, size_t len, uint64_t off) {
 std::atomic<int64_t> g_readBytes{0};
 
 thread_local bool tInPool = false;
-std::atomic<int> g_poolBusy{0};  // pool workers running a task
-}  // namespace
-bool ioPoolCrowded() { return tInPool && g_poolBusy.load(std::memory_order_relaxed) > 2; }
-namespace {
+
 // A small I/O thread pool: reads (several requests in flight on the SSD), decompression, compression.
 struct IoPool {
   std::mutex mu;
@@ -91,9 +88,7 @@ struct IoPool {
             f = std::move(q.front());
             q.pop_front();
           }
-          ++g_poolBusy;
           f();
-          --g_poolBusy;
         }
       });
     for (auto& t : th) t.detach();
