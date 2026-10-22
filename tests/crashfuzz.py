@@ -1,7 +1,8 @@
-# Randomized crash recovery: concurrent writers (inserts, point and range updates, deletes, bulk
-# inserts) with automatic snapshots every ~0.2 MB of WAL, killed with SIGKILL at random moments. After
-# each restart every writer's rows must equal its model of the acknowledged statements, with or
-# without the one statement it had in flight. WARPSTORE_CRASH_ROUNDS (default 6), WARPSTORE_CRASH_SEED.
+# Randomized crash recovery: concurrent writers (inserts, point, range and whole-writer updates,
+# deletes, bulk inserts, OPTIMIZE) with automatic snapshots every ~0.2 MB of WAL, killed with SIGKILL
+# at random moments. After each restart every writer's rows must equal its model of the acknowledged
+# statements, with or without the one statement it had in flight. WARPSTORE_CRASH_ROUNDS (default 6),
+# WARPSTORE_CRASH_SEED.
 import os, random, sys, threading, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pymysql
@@ -67,6 +68,16 @@ class Writer:
                     if lo <= i <= hi:
                         del m[i]
             return f"DELETE FROM cf.t WHERE id BETWEEN {lo} AND {hi} AND w = {w}", ap
+        if r < 0.85:  # every row of the writer (in segments: new column versions, see colupdate.py)
+            k = R.randint(1, 9)
+            s = f"c{R.randint(0, 9)}"
+
+            def ap(m, h):
+                for i in m:
+                    m[i] = (m[i][0] + k, s)
+            return f"UPDATE cf.t SET v = v + {k}, s = '{s}' WHERE w = {w}", ap
+        if r < 0.87:  # rows into segments (then UPDATEs replace columns instead of moving rows)
+            return "OPTIMIZE TABLE cf.t", lambda m, h: None
         k = R.randint(0, 999)
         n = R.choice([1, 20, 300])
 
@@ -85,6 +96,7 @@ class Writer:
             self.inflight = ap
             try:
                 cc.execute(sql)
+                cc.fetchall()
             except pymysql.err.IntegrityError:
                 self.inflight = None  # (rejected: nothing changed)
                 continue
