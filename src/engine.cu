@@ -8121,14 +8121,15 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     tg += msSince(ph), ph = Clock::now();
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
     // row order, as a replay of the statement codes them).
+    std::vector<std::pair<int, ExprP>> rs = sets;  // the SETs evaluated row by row
     auto setRows = [&](size_t b, size_t e, std::vector<Value>& cur, std::vector<Value>& vals, PostCtx& pc) {
       int64_t i0;
       double d0;
       for (size_t i = b; i < e; ++i) {
         for (int c : reads) cur[c] = cellValue(t, ls[i], c);
-        for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
-        for (size_t j = 0; j < sets.size(); ++j) {
-          const int c = sets[j].first;
+        for (size_t j = 0; j < rs.size(); ++j) vals[j] = evalPost(rs[j].second, pc);  // (all against the old row)
+        for (size_t j = 0; j < rs.size(); ++j) {
+          const int c = rs[j].first;
           Value& v = vals[j];
           if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
           t.rawOf(c, v, i0, d0);
@@ -8137,9 +8138,78 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         }
       }
     };
+    // Vectorized SET forms on the raw values (computed against the old row first): a constant,
+    // another column, column +/- constant. Others (or an overflow) go row by row.
+    std::vector<int> fastC;
+    std::vector<std::vector<int64_t>> fi;
+    std::vector<std::vector<double>> fd;
+    rs.clear();
+    for (auto& [c, e] : sets) {
+      const ColumnMeta& cm = t.cols[c];
+      std::vector<int64_t> oi;
+      std::vector<double> od;
+      bool ok = false;
+      const bool f64 = cm.pt == PType::F64;
+      auto colOf = [&](const ExprP& x) {
+        return x->kind == Expr::COL && x->bt == 0 && x->bc >= 0 && t.cols[x->bc].lt == cm.lt && t.cols[x->bc].pt == cm.pt &&
+                       t.cols[x->bc].scale == cm.scale && cm.lt != LType::VARCHAR ? x->bc : -1;
+      };
+      if (e->kind == Expr::LIT && !e->lit.isNull() && cm.lt != LType::VARCHAR) {
+        int64_t i0 = 0;
+        double d0 = 0;
+        t.rawOf(c, e->lit, i0, d0);
+        if (f64) od.assign(n, d0);
+        else oi.assign(n, i0);
+        ok = true;
+      } else if (const int s2 = colOf(e); s2 >= 0) {
+        if (f64) od = dv[s2];
+        else oi = iv[s2];
+        ok = true;
+      } else if (e->kind == Expr::BIN && (e->op == "+" || e->op == "-") && colOf(e->args[0]) >= 0 && e->args[1]->kind == Expr::LIT &&
+                 !e->args[1]->lit.isNull() && e->args[1]->lit.kind != Value::STR &&
+                 (cm.lt == LType::INT || cm.lt == LType::BIGINT || cm.lt == LType::DECIMAL || cm.lt == LType::DOUBLE)) {
+        const int s2 = colOf(e->args[0]);
+        const double lv = e->args[1]->lit.num() * (e->op == "-" ? -1 : 1);
+        if (f64) {
+          od = dv[s2];
+          for (auto& x : od)
+            if (x == x) x += lv;
+          ok = true;
+        } else {
+          const double scaled = cm.lt == LType::DECIMAL ? lv * pow10i(cm.scale) : lv;
+          const int64_t add = (int64_t)std::llround(scaled);
+          const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+          const int64_t lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
+          if (std::fabs(scaled - (double)add) < 1e-9 && std::fabs(scaled) < 9e15) {
+            oi = iv[s2];
+            ok = true;
+            for (auto& x : oi) {
+              if (x == nul) continue;
+              int64_t y;
+              if (__builtin_add_overflow(x, add, &y) || y < lo || y > hi) { ok = false; break; }
+              x = y;
+            }
+          }
+        }
+      }
+      if (ok && (cm.notNull || c == t.pk)) {  // a NULL into NOT NULL: the row path reports it
+        const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+        for (int64_t x : oi) ok = ok && x != nul;
+        for (double x : od) ok = ok && x == x;
+      }
+      if (ok) {
+        fastC.push_back(c);
+        fi.push_back(std::move(oi));
+        fd.push_back(std::move(od));
+      } else {
+        rs.push_back({c, e});
+      }
+    }
+    vals.resize(rs.size());
     bool strSet = false;
-    for (auto& [c, e] : sets) strSet = strSet || t.cols[c].lt == LType::VARCHAR;
-    if (strSet || n < 16384) {
+    for (auto& [c, e] : rs) strSet = strSet || t.cols[c].lt == LType::VARCHAR;
+    if (rs.empty()) {
+    } else if (strSet || n < 16384) {
       setRows(0, n, cur, vals, pc);
     } else {
       parallelFor(n, [&](size_t b, size_t e) {
@@ -8149,8 +8219,21 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         setRows(b, e, lcur, lvals, lpc);
       }, 4096);
     }
+    for (size_t j = 0; j < fastC.size(); ++j) {
+      if (t.cols[fastC[j]].pt == PType::F64) dv[fastC[j]].swap(fd[j]);
+      else iv[fastC[j]].swap(fi[j]);
+    }
+    // Rows stay in their partition when no shard-key column is set (no re-hashing).
+    bool keepPart = true;
+    for (auto& [c, e] : sets)
+      for (int k : t.shardKey) keepPart = keepPart && c != k;
+    std::vector<int32_t> partOf;
+    if (keepPart && t.nparts > 1 && !t.shardKey.empty()) {
+      partOf.resize(n);
+      for (size_t i = 0; i < n; ++i) partOf[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
+    }
     ts += msSince(ph), ph = Clock::now();
-    t.appendColumns(iv, dv, (int64_t)n);
+    t.appendColumns(iv, dv, (int64_t)n, partOf.empty() ? nullptr : partOf.data());
     ta += msSince(ph);
   }
   if (tr) fprintf(stderr, "[trace] update: gather %.1f ms, set %.1f ms, append %.1f ms\n", tg, ts, ta);

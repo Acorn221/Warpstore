@@ -697,7 +697,8 @@ void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
   }
 }
 
-void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n) {
+void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n,
+                          const int32_t* partOfRow) {
   const size_t nc = cols.size();
   for (size_t c = 0; c < nc; ++c) {
     if (cols[c].pt == PType::VEC) throw SqlError("internal: appendColumns with a VECTOR column", 1105);
@@ -731,6 +732,8 @@ void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std
       for (int64_t g = n * i / nparts; g < n * (i + 1) / nparts; ++g) rowsOf[p].push_back((uint32_t)g);
     }
     ++nextPart;
+  } else if (partOfRow) {
+    for (int64_t r = 0; r < n; ++r) rowsOf[partOfRow[r]].push_back((uint32_t)r);
   } else {
     for (int64_t r = 0; r < n; ++r) {
       for (int c : shardKey) cell(c, r);

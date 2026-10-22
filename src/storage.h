@@ -960,7 +960,9 @@ struct Table {
   void rawOf(int c, const Value& v, int64_t& i, double& d);  // a value as column c stores it
   // Appends n rows given as physical columns (iv[c] for I32 / I64 columns, dv[c] for F64; no VECTOR
   // columns): whole columns per partition for plain tables, row by row otherwise.
-  void appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n);
+  // partOfRow: each row's partition when known (an UPDATE that keeps the shard key): no re-hashing.
+  void appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n,
+                     const int32_t* partOfRow = nullptr);
   // Set while a statement holds row locations across appends: full write buffers are flushed after.
   bool deferFlush = false;
   void deleteAt(Loc l);
