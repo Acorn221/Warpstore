@@ -11155,8 +11155,44 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   for (auto& d : dist) gpuDistinct &= d->op == "COUNT" && d->args[0]->kind != Expr::STAR && d->args[0]->str() == dist[0]->args[0]->str();
   if (!dist.empty() && !gpuDistinct) {
     const std::string x = dist[0]->args[0]->str();
-    for (auto& d : dist)
-      if (d->args[0]->str() != x) return hostAggregate(s, q, explain, typed);  // mixed DISTINCT: host path
+    bool mixed = false;
+    for (auto& d : dist) mixed = mixed || d->args[0]->str() != x;
+    if (mixed && s.groupBy.empty() && !s.having && !s.unionNext) {
+      // Without GROUP BY, each DISTINCT aggregate is a scalar subquery over the same rows (each runs on
+      // the GPU); with no other aggregate left, the outer query needs no rows at all.
+      Stmt outer = cloneStmt(s);
+      std::function<void(ExprP&)> rw = [&](ExprP& e) {
+        if (!e) return;
+        if (e->kind == Expr::FUNC && isAggName(e->op) && !e->window && e->distinct) {
+          auto sub = std::make_shared<Stmt>();
+          sub->type = Stmt::SELECT;
+          sub->from = s.from;
+          sub->joinConds = s.joinConds;
+          sub->where = s.where ? cloneExpr(s.where) : nullptr;
+          sub->items.push_back({cloneExpr(e), "v"});
+          auto sq = std::make_shared<Expr>();
+          sq->kind = Expr::SUBQUERY;
+          sq->sub = sub;
+          e = sq;
+          return;
+        }
+        for (auto& a : e->args) rw(a);
+      };
+      for (auto& it : outer.items) {
+        if (it.alias.empty()) it.alias = it.e->str();
+        rw(it.e);
+      }
+      for (auto& o : outer.orderBy) rw(o.e);
+      bool agg = false;
+      for (auto& it : outer.items) agg = agg || hasAgg(it.e);
+      if (!agg) {
+        outer.from.clear();
+        outer.joinConds.clear();
+        outer.where.reset();
+      }
+      return queryImpl(outer, q, explain, typed);
+    }
+    if (mixed) return hostAggregate(s, q, explain, typed);  // mixed DISTINCT with GROUP BY: host path
     for (auto& d : dist)
       if (d->op == "MIN" || d->op == "MAX") d->distinct = false;  // MIN/MAX(DISTINCT x) = MIN/MAX(x)
     auto resolveGroup = [&](const ExprP& g) -> ExprP {
