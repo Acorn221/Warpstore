@@ -98,6 +98,7 @@ TESTS = [
     ("mvcc", "mvcc.py", None, True),
     ("observability", "observability.py", None, True),
     ("crash", "crash.py", None, True),
+    ("load", "load.py", None, True),
     ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),
     ("replication", "replication.py", None, True),

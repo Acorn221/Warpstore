@@ -4934,6 +4934,21 @@ static bool keyLookup(const Table& t, const ExprP& w) {
 
 thread_local std::string tLoadLogPath;  // doLoad loaded a copy of the file: the WAL names the copy
 static void copyFile(const std::string& from, const std::string& to);
+// The statement as logged: LOAD DATA INFILE of a copy (doLoad) names the copy's path.
+static std::string loggedSql(const std::string& sql, const Stmt& s) {
+  std::string logged = sql;
+  if (!tLoadLogPath.empty()) {
+    auto quote = [](const std::string& x) {
+      std::string q = "'";
+      for (char ch : x) q += ch == '\'' ? std::string("''") : std::string(1, ch);
+      return q + "'";
+    };
+    const size_t at = logged.find(quote(s.path));
+    if (at != std::string::npos) logged.replace(at, quote(s.path).size(), quote(tLoadLogPath));
+    tLoadLogPath.clear();
+  }
+  return logged;
+}
 static void mkdirs(const std::string& d);
 
 void Engine::logWrite(const std::string& sql, const std::string& db) {
@@ -5247,7 +5262,14 @@ ResultSet Engine::executeStmt(const std::string& sql) {
           (s.path.size() > 8 && lower(s.path.substr(s.path.size() - 8)) == ".parquet") ||
           (s.path.size() > 5 && lower(s.path.substr(s.path.size() - 5)) == ".avro"))
         return loadRemote(s);  // logs the staged LOAD DATA INFILE statements it runs, not this one
-      r = doLoad(s);
+      try {
+        r = doLoad(s);
+      } catch (SqlError&) {
+        if (!tLoadLogPath.empty()) {  // a load that failed after loading rows (doLoad): log it all the same
+          logWrite(loggedSql(sql, s), s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
+        }
+        throw;
+      }
       break;
     case Stmt::OPTIMIZE: r = doOptimize(s); break;
     case Stmt::SHOW_TABLES: return doShowTables(s);
@@ -5335,20 +5357,8 @@ ResultSet Engine::executeStmt(const std::string& sql) {
     case Stmt::DESCRIBE: return doDescribe(s);
     default: return okResult(0);
   }
-  if (s.type != Stmt::OPTIMIZE) {
-    std::string logged = sql;
-    if (!tLoadLogPath.empty()) {  // LOAD DATA INFILE of a copy (doLoad): log the copy's path
-      auto quote = [](const std::string& x) {
-        std::string q = "'";
-        for (char ch : x) q += ch == '\'' ? std::string("''") : std::string(1, ch);
-        return q + "'";
-      };
-      const size_t at = logged.find(quote(s.path));
-      if (at != std::string::npos) logged.replace(at, quote(s.path).size(), quote(tLoadLogPath));
-      tLoadLogPath.clear();
-    }
-    logWrite(logged, s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
-  }
+  if (s.type != Stmt::OPTIMIZE)
+    logWrite(loggedSql(sql, s), s.table.find('.') != std::string::npos ? s.table.substr(0, s.table.find('.')) : std::string());
   return r;
 }
 
@@ -6457,6 +6467,7 @@ ResultSet Engine::doLoad(Stmt& s) {
     const std::string alt = gWalArchive + path.substr(path.rfind("/loads/"));  // moved to the archive already
     if (access(alt.c_str(), F_OK) == 0) path = alt;
   }
+  std::string copyTo;
   if (!replaying_ && !dir_.empty() && s.path.rfind(dir_ + "/", 0) != 0) {
     // the WAL must not depend on a file outside the data directory: load (and log) a copy
     static std::atomic<uint64_t> seq{0};
@@ -6466,18 +6477,26 @@ ResultSet Engine::doLoad(Stmt& s) {
       gen = walGen_;
     }
     mkdirs(dir_ + "/loads");
-    path = dir_ + "/loads/g" + std::to_string(gen) + "-" + std::to_string(nowUs()) + "-" + std::to_string(++seq) + ".dat";
-    copyFile(s.path, path);
-    tLoadLogPath = path;
+    // (zstd-compressed while it is loaded: the file is read once)
+    copyTo = dir_ + "/loads/g" + std::to_string(gen) + "-" + std::to_string(nowUs()) + "-" + std::to_string(++seq) + ".zst";
   }
   // The exclusive lock is released briefly every 256K rows so queries are not stalled by a long load
   // (they see the rows loaded so far, like other uncommitted writes).
-  int64_t n = t->loadFile(path, s.delim, s.skipLines, srcOf, [&] {
-    checkKilled();
-    lk.unlock();
-    std::this_thread::yield();
-    lk.lock();
-  }, s.escape);
+  int64_t n = 0, loaded = 0;
+  try {
+    n = t->loadFile(path, s.delim, s.skipLines, srcOf, [&] {
+      checkKilled();
+      lk.unlock();
+      std::this_thread::yield();
+      lk.lock();
+    }, s.escape, copyTo, &loaded);
+  } catch (...) {
+    // Rows were loaded before the error: the statement is logged anyway (with the copy, it replays
+    // to the same rows and the same error), or a restart would lose them.
+    if (loaded > 0 && !copyTo.empty() && access(copyTo.c_str(), F_OK) == 0) tLoadLogPath = copyTo;
+    throw;
+  }
+  if (!copyTo.empty()) tLoadLogPath = copyTo;
   lk.unlock();
   warmDicts(t);
   char info[128];

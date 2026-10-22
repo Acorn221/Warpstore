@@ -339,6 +339,14 @@ readers wait behind a waiting writer, PK point lookups excepted), every query af
 the whole write buffer and rescanned it for key ranges (now incremental), and `std::regex_search` over
 every statement made multi-MB INSERTs parse at 10 MB/s (7x faster now).
 
+**Bulk load** (`LOAD DATA INFILE` of ClickBench's first 10M rows: a 7.85 GB TSV with 105 columns, 8
+partitions): 18-24 s (330-430 MB/s), down from 96 s. Lines are parsed in parallel pieces of 64 MB
+chunks while the next chunk is read; strings are coded per column (existing ones looked up in
+parallel, new ones added in row order, so the dictionaries match a serial load); rows are appended a
+column at a time, and segment flushes encode their columns in parallel. The copy of the file that the
+WAL replays is zstd-compressed in the same pass: 1.47 GB in the data dir instead of 7.9 GB. A restart
+of the snapshotted table takes 6.4 s (13.6 s before; dictionaries are open-addressing tables now).
+
 ### Against SingleStore's published "trillion rows per second" query
 
 SingleStore's headline benchmark ([blog](https://www.singlestore.com/blog/how-to-process-trillion-rows-per-second-ad-hoc-analytic-queries/))

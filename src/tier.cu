@@ -66,6 +66,7 @@ bool pwriteAll(int fd, const void* buf, size_t len, uint64_t off) {
 
 std::atomic<int64_t> g_readBytes{0};
 
+thread_local bool tInPool = false;
 // A small I/O thread pool: reads (several requests in flight on the SSD), decompression, compression.
 struct IoPool {
   std::mutex mu;
@@ -76,6 +77,7 @@ struct IoPool {
     const int n = std::clamp<int>((int)std::thread::hardware_concurrency(), 4, 16);
     for (int i = 0; i < n; ++i)
       th.emplace_back([this] {
+        tInPool = true;
         for (;;) {
           std::function<void()> f;
           {
@@ -89,10 +91,11 @@ struct IoPool {
       });
     for (auto& t : th) t.detach();
   }
-  void submit(std::function<void()> f) {
+  void submit(std::function<void()> f, bool urgent = false) {
     {
       std::lock_guard<std::mutex> g(mu);
-      q.push_back(std::move(f));
+      if (urgent) q.push_front(std::move(f));
+      else q.push_back(std::move(f));
     }
     cv.notify_one();
   }
@@ -103,9 +106,11 @@ IoPool& ioPool() {
 }
 
 
+}  // namespace
+
 // Runs fn(i) for i in [0, n) on the I/O threads and waits (fn must not throw).
-void ioParallel(size_t n, const std::function<void(size_t)>& fn) {
-  if (n <= 1) {
+void ioParallel(size_t n, const std::function<void(size_t)>& fn, bool urgent) {
+  if (n <= 1 || tInPool) {  // (inline on a pool thread: waiting there could deadlock the pool)
     for (size_t i = 0; i < n; ++i) fn(i);
     return;
   }
@@ -117,10 +122,12 @@ void ioParallel(size_t n, const std::function<void(size_t)>& fn) {
       fn(i);
       std::lock_guard<std::mutex> g(m);
       if (--left == 0) cv.notify_all();
-    });
+    }, urgent);
   std::unique_lock<std::mutex> g(m);
   cv.wait(g, [&] { return left == 0; });
 }
+
+namespace {
 
 constexpr uint32_t kBlockRows = 16384;
 uint64_t prefixOf(uint8_t enc) { return enc ? kEncHeader + (enc == 4 ? 256 * 8 : 0) : 0; }

@@ -137,22 +137,24 @@ class StrVec {
 
 struct Dict {
   StrVec strs;
-  // string -> code. Strings added with appendUnique() are indexed lazily, on the first lookup
-  // (derived dictionaries are often only ever read by code).
-  mutable std::unordered_map<std::string, int32_t, SvHash, std::equal_to<>> map;
+  // string -> code: an open-addressing table of (32-bit hash << 32 | code + 1) slots; the strings
+  // themselves are compared in strs. Strings added with appendUnique() are indexed lazily, on the
+  // first lookup (derived dictionaries are often only ever read by code).
   const uint64_t uid = nextUid();  // unique for the process (never reused, unlike the address)
   Dict() = default;
   Dict(const Dict& o) : strs(o.strs) {
     o.index();
     std::shared_lock<std::shared_mutex> lk(o.mapMu);
-    map = o.map;
+    slots_ = o.slots_;
+    indexed_ = o.indexed_;
   }
   Dict& operator=(const Dict& o) {
     if (this != &o) {
       o.index();
       strs = o.strs;
       std::shared_lock<std::shared_mutex> lk(o.mapMu);
-      map = o.map;
+      slots_ = o.slots_;
+      indexed_ = o.indexed_;
       lazy = false;
       std::lock_guard<std::mutex> g(cacheMu);
       derived.clear();
@@ -182,12 +184,25 @@ struct Dict {
   int32_t getOrAdd(std::string_view s) {
     index();
     std::unique_lock<std::shared_mutex> lk(mapMu);
-    auto it = map.find(s);
-    if (it != map.end()) return it->second;
-    int32_t c = (int32_t)strs.size();
-    strs.emplace_back(s);
-    map.emplace(strs.back(), c);
-    return c;
+    return add(s, hash32(s));
+  }
+  // getOrAdd for n strings under one lock; a view with no data (NULL) gets nullCode.
+  void getOrAddMany(const std::string_view* s, size_t n, int64_t* out, int64_t nullCode) {
+    index();
+    std::unique_lock<std::shared_mutex> lk(mapMu);
+    for (size_t i = 0; i < n; ++i) out[i] = s[i].data() ? add(s[i], hash32(s[i])) : nullCode;
+  }
+  // Codes of n strings that are in the dictionary (-1 for the others; nullCode for NULL views).
+  void findMany(const std::string_view* s, size_t n, int64_t* out, int64_t nullCode) const {
+    index();
+    std::shared_lock<std::shared_mutex> lk(mapMu);
+    for (size_t i = 0; i < n; ++i) out[i] = s[i].data() ? lookup(s[i], hash32(s[i])) : nullCode;
+  }
+  // After findMany: adds the strings coded -1, in order.
+  void addMissing(const std::string_view* s, size_t n, int64_t* out) {
+    std::unique_lock<std::shared_mutex> lk(mapMu);
+    for (size_t i = 0; i < n; ++i)
+      if (out[i] == -1) out[i] = add(s[i], hash32(s[i]));
   }
   // Appends a string known not to be in the dictionary yet; returns its code.
   int32_t appendUnique(std::string&& s) {
@@ -198,16 +213,21 @@ struct Dict {
   int32_t find(std::string_view s) const {
     index();
     std::shared_lock<std::shared_mutex> lk(mapMu);
-    auto it = map.find(s);
-    return it == map.end() ? -1 : it->second;
+    return lookup(s, hash32(s));
   }
   void index() const {
     if (!lazy.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> g(lazyMu);
     if (!lazy.load(std::memory_order_relaxed)) return;
     std::unique_lock<std::shared_mutex> lk(mapMu);
-    map.reserve(strs.size());
-    for (size_t i = map.size(); i < strs.size(); ++i) map.emplace(strs[i], (int32_t)i);
+    const size_t n = strs.size();
+    grow(n);
+    for (size_t i = indexed_; i < n; ++i) {  // (a repeated string keeps its first code)
+      const std::string& x = strs[i];
+      const uint32_t h = hash32(x);
+      if (lookup(x, h) < 0) place(h, (uint32_t)i);
+    }
+    indexed_ = n;
     lazy.store(false, std::memory_order_release);
   }
 
@@ -216,9 +236,52 @@ struct Dict {
     static std::atomic<uint64_t> n{0};
     return ++n;
   }
+  static uint32_t hash32(std::string_view s) {
+    const uint64_t h = std::hash<std::string_view>{}(s);
+    return (uint32_t)(h ^ (h >> 32));
+  }
+  int32_t lookup(std::string_view s, uint32_t h) const {  // (mapMu held)
+    if (slots_.empty()) return -1;
+    const size_t mask = slots_.size() - 1;
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
+      const uint64_t v = slots_[i];
+      if (!v) return -1;
+      if ((uint32_t)(v >> 32) == h) {
+        const uint32_t c = (uint32_t)v - 1;
+        if (strs[c] == s) return (int32_t)c;
+      }
+    }
+  }
+  void place(uint32_t h, uint32_t code) const {  // (mapMu held exclusively; room made by grow)
+    const size_t mask = slots_.size() - 1;
+    size_t i = h & mask;
+    while (slots_[i]) i = (i + 1) & mask;
+    slots_[i] = (uint64_t)h << 32 | (code + 1);
+  }
+  void grow(size_t n) const {  // room for n strings at most half full
+    if (n * 2 <= slots_.size()) return;
+    size_t cap = std::max<size_t>(64, slots_.size());
+    while (cap < n * 2) cap *= 2;
+    std::vector<uint64_t> old(cap, 0);
+    old.swap(slots_);
+    for (uint64_t v : old)
+      if (v) place((uint32_t)(v >> 32), (uint32_t)v - 1);
+  }
+  int32_t add(std::string_view s, uint32_t h) {  // (mapMu held exclusively; everything indexed)
+    const int32_t f = lookup(s, h);
+    if (f >= 0) return f;
+    const uint32_t c = (uint32_t)strs.size();
+    grow(c + 1);
+    strs.emplace_back(s);
+    place(h, c);
+    indexed_ = c + 1;
+    return (int32_t)c;
+  }
+  mutable std::vector<uint64_t> slots_;
+  mutable size_t indexed_ = 0;  // strs [0, indexed_) are in slots_
   mutable std::atomic<bool> lazy{false};
   mutable std::mutex lazyMu;
-  mutable std::shared_mutex mapMu;  // map: readers look strings up while a writer adds them
+  mutable std::shared_mutex mapMu;  // slots_: readers look strings up while a writer adds them
   mutable std::mutex cacheMu;
   mutable std::map<std::string, std::shared_ptr<void>> derived;
 };
@@ -448,6 +511,9 @@ struct WriteBuffer {
 uint64_t rcuEnter();
 void rcuExit(uint64_t ticket);
 void rcuDefer(std::function<void()> fn);
+// Runs fn(i) for i in [0, n) on the I/O thread pool and waits (fn must not throw). Urgent work goes
+// ahead of what is queued.
+void ioParallel(size_t n, const std::function<void(size_t)>& fn, bool urgent = false);
 
 
 // Partition hashing. Integer-like values (INT, BIGINT, DATE) hash by value and strings by content,
@@ -653,8 +719,11 @@ struct Table {
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
   // srcOf[c]: which field of each line feeds column c (-1: NULL / AUTO_INCREMENT); empty = in order.
   // yield: called every 256K rows with no row half-written (the caller may drop and retake its lock).
+  // copyTo: also writes the file there, zstd-compressed (for the WAL). A load that fails keeps the
+  // rows before the bad line (*loaded says how many) and, if there are any, a copy that replays to them.
   int64_t loadFile(const std::string& path, char delim, int64_t skip, std::vector<int> srcOf = {},
-                   const std::function<void()>& yield = {}, char escape = 0);
+                   const std::function<void()>& yield = {}, char escape = 0, const std::string& copyTo = "",
+                   int64_t* loaded = nullptr);
   int64_t pkValue(Loc l) const;
   std::vector<Value> rowValues(Loc l) const;  // a stored row as typed values (NULL-aware)
   // Secondary indexes: raw 64-bit key of a cell (false for NULL), maintenance, and (re)building.

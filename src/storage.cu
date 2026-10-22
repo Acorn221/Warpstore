@@ -7,6 +7,10 @@
 #include <cstring>
 #include "gpu.h"
 #include <climits>
+#include <deque>
+#include <future>
+#include <unistd.h>
+#include <zstd.h>
 
 namespace gdb {
 
@@ -911,7 +915,7 @@ void Table::flushPart(int part) {
     seg->mx.resize(cols.size());
     seg->enc.assign(cols.size(), 0);
     seg->encHost.resize(cols.size());
-    for (size_t c = 0; c < cols.size(); ++c) {
+    ioParallel(cols.size(), [&](size_t c) {  // gather, stats and encoding: one column per task
       int sz = colBytes((int)c);
       auto& h = seg->host[c];
       h.resize(n * sz);
@@ -927,10 +931,11 @@ void Table::flushPart(int part) {
       }
       seg->mn[c] = mn;
       seg->mx[c] = mx;
+      seg->enc[c] = encodeColumn((int)c, h, (int64_t)n, seg->encHost[c]);
+    }, true);
+    for (size_t c = 0; c < cols.size(); ++c) {
       bool m = false;
-      uint8_t e = encodeColumn((int)c, h, (int64_t)n, seg->encHost[c]);
-      seg->enc[c] = e;
-      std::vector<uint8_t>& placed = e ? seg->encHost[c] : h;
+      std::vector<uint8_t>& placed = seg->enc[c] ? seg->encHost[c] : seg->host[c];
       seg->dev[c] = placeColumn(placed.data(), placed.size(), m, vramHint((int)c) == 2);
       seg->mapped[c] = m;
       seg->devBytes += (int64_t)placed.size();
@@ -1094,163 +1099,490 @@ static inline int64_t parseI(const char* b, const char* e) {
   return neg ? -v : v;
 }
 
+namespace {
+// The bytes of a file to load: plain, or zstd frames (the WAL's compressed copies of loaded files).
+struct LoadSource {
+  FILE* f = nullptr;
+  ZSTD_DCtx* z = nullptr;
+  std::vector<char> in;
+  ZSTD_inBuffer ib{nullptr, 0, 0};
+  bool inEof = false;
+  size_t lastRc = 0;
+  explicit LoadSource(const std::string& path) {
+    f = fopen(path.c_str(), "rb");
+    if (!f) return;
+    unsigned char m[4];
+    if (fread(m, 1, 4, f) == 4 && m[0] == 0x28 && m[1] == 0xB5 && m[2] == 0x2F && m[3] == 0xFD) {
+      z = ZSTD_createDCtx();
+      in.resize(4 << 20);
+    }
+    rewind(f);
+  }
+  ~LoadSource() {
+    if (f) fclose(f);
+    if (z) ZSTD_freeDCtx(z);
+  }
+  size_t read(char* dst, size_t n) {
+    if (!z) return fread(dst, 1, n, f);
+    ZSTD_outBuffer ob{dst, n, 0};
+    while (ob.pos < ob.size) {
+      if (ib.pos == ib.size && !inEof) {
+        ib.size = fread(in.data(), 1, in.size(), f);
+        ib.src = in.data();
+        ib.pos = 0;
+        inEof = ib.size == 0;
+      }
+      const size_t before = ob.pos, inBefore = ib.pos;
+      const size_t rc = ZSTD_decompressStream(z, &ob, &ib);
+      if (ZSTD_isError(rc)) throw SqlError(std::string("corrupt compressed load file: ") + ZSTD_getErrorName(rc), 1105);
+      if (ob.pos != before || ib.pos != inBefore) lastRc = rc;  // (0: the last frame is complete)
+      else if (inEof) {
+        if (lastRc != 0) throw SqlError("truncated compressed load file", 1105);
+        break;
+      }
+    }
+    return ob.pos;
+  }
+};
+
+// One worker's share of a chunk: whole lines [b, e), parsed into columns. VARCHAR fields stay text
+// (sv) until the dictionary pass codes them (in row order, one thread per column).
+struct LoadPiece {
+  const char *b = nullptr, *e = nullptr, *zb = nullptr;  // zb: the compressed copy covers [zb, e)
+  int64_t rows = 0, lines = 0;
+  std::vector<std::vector<int64_t>> iv;
+  std::vector<std::vector<double>> dv;
+  std::vector<std::vector<std::string_view>> sv;
+  std::vector<std::vector<float>> vv;
+  std::deque<std::string> own;  // unquoted / unescaped text the views point at
+  std::vector<uint8_t> nulls;
+  bool failed = false;
+  std::string msg;  // "\x01" stands for the line number
+  int code = 0;
+  std::string z;
+};
+
+inline bool digits(const char* p, int n) {
+  for (int i = 0; i < n; ++i)
+    if ((unsigned)(p[i] - '0') > 9) return false;
+  return true;
+}
+inline int num(const char* p, int n) {
+  int v = 0;
+  for (int i = 0; i < n; ++i) v = v * 10 + (p[i] - '0');
+  return v;
+}
+}  // namespace
+
+// Lines are parsed in parallel pieces of 64 MB chunks (the next chunk is read meanwhile); VARCHAR
+// values are coded per column in row order, so dictionaries come out exactly as a serial load makes
+// them. Plain tables (no primary key, index or open transaction) append whole columns at a time.
 int64_t Table::loadFile(const std::string& path, char delim, int64_t skip, std::vector<int> srcOf,
-                        const std::function<void()>& yield, char escape) {
-  std::string unesc;
+                        const std::function<void()>& yield, char escape, const std::string& copyTo, int64_t* loaded) {
+  const size_t nc = cols.size();
   if (srcOf.empty())
-    for (size_t c = 0; c < cols.size(); ++c) srcOf.push_back((int)c);
+    for (size_t c = 0; c < nc; ++c) srcOf.push_back((int)c);
   int needFields = 0;
   for (int x : srcOf) needFields = std::max(needFields, x + 1);
-  std::string unq;
-  FILE* f = fopen(path.c_str(), "rb");
-  if (!f) throw SqlError("File '" + path + "' not found", 29);
+  for (size_t c = 0; c < nc; ++c)
+    if (srcOf[c] < 0 && (int)c != autoIncCol && (cols[c].notNull || (int)c == pk))
+      throw SqlError("Column '" + cols[c].name + "' cannot be null", 1048);
+  LoadSource src(path);
+  if (!src.f) throw SqlError("File '" + path + "' not found", 29);
+  FILE* out = nullptr;
+  const std::string tmp = copyTo + ".tmp";
+  if (!copyTo.empty() && !(out = fopen(tmp.c_str(), "wb"))) throw SqlError("cannot write " + copyTo, 1105);
+  struct Cleanup {
+    FILE*& f;
+    const std::string& t;
+    ~Cleanup() {
+      if (f) fclose(f), unlink(t.c_str());
+    }
+  } cleanup{out, tmp};
+
+  const int nth = std::clamp<int>((int)std::thread::hardware_concurrency(), 1, 16);
+  struct Chunk {  // whole lines of the file, parsed in pieces
+    std::vector<char> data;
+    size_t end = 0;       // bytes [0, end) are whole lines
+    int64_t skipped = 0;  // header lines skipped in it
+    int np = 0;
+    std::vector<LoadPiece> pieces;
+  };
   const size_t CH = 64 << 20;
-  std::vector<char> data(CH + 1);
-  size_t have = 0;
-  int64_t rows = 0, lineNo = 0;
-  std::vector<int64_t> ints(cols.size());
-  std::vector<double> dbls(cols.size());
-  std::vector<std::pair<const char*, const char*>> fields(std::max<size_t>(cols.size(), needFields) + 1);
+  Chunk chunks[2];
+  for (auto& ch : chunks) {
+    ch.data.resize(CH + 1);
+    ch.pieces.resize(nth * 4);
+    for (auto& pc : ch.pieces) pc.iv.resize(nc), pc.dv.resize(nc), pc.sv.resize(nc), pc.vv.resize(nc);
+  }
   for (auto& b : bufs)
     if (b->data.use_count() == 1)  // (never under a snapshot)
       for (auto& c : b->cols) c.reserve(std::min<int64_t>(kSegRows, (kSegRows * 4) / nparts) * 8);
-  bool eof = false;
-  while (!eof) {
-    size_t got = fread(data.data() + have, 1, CH - have, f);
-    if (got == 0) eof = true;
-    have += got;
-    if (have == 0) break;
-    size_t end = have;
-    if (!eof) {
-      while (end > 0 && data[end - 1] != '\n') --end;
-      if (end == 0) { fclose(f); throw SqlError("line too long in " + path, 1105); }
-    } else if (data[have - 1] != '\n') {
-      data[have++] = '\n';
-      end = have;
-    }
-    const char* p = data.data();
-    const char* stop = data.data() + end;
-    while (p < stop) {
-      const char* le = (const char*)memchr(p, '\n', stop - p);
-      const char* lineEnd = le && le > p && le[-1] == '\r' ? le - 1 : le;
-      if (lineNo++ < skip || lineEnd == p) { p = le + 1; continue; }
-      size_t nf = 0;
-      const char* fs = p;
-      bool inQ = false;  // delimiters inside "quoted" fields don't split (CSV)
-      for (const char* q = p;; ++q) {
-        if (q != lineEnd && *q == '"' && (q == fs || inQ)) { inQ = !inQ; continue; }
-        if (q == lineEnd || (*q == delim && !inQ)) {
-          if (nf < fields.size()) fields[nf] = {fs, q};
-          ++nf;
-          fs = q + 1;
-          if (q == lineEnd) break;
+  const bool bulk = pk < 0 && indexes.empty() && !(txnKey() && db != "__tmp");
+  const bool autoFromFile = autoIncCol >= 0 && srcOf[autoIncCol] >= 0;
+  int64_t rows = 0, lineNo = 0, skipLeft = skip, yieldAt = 0x40000;
+  std::vector<int64_t> ints(nc);
+  std::vector<double> dbls(nc);
+  std::vector<std::vector<uint32_t>> rowsOf(nparts);
+  std::vector<int64_t> off;
+
+  auto parse = [&](LoadPiece& pc) {
+    pc.rows = pc.lines = 0;
+    pc.failed = false;
+    pc.own.clear();
+    pc.nulls.assign(nc, 0);
+    for (size_t c = 0; c < nc; ++c) pc.iv[c].clear(), pc.dv[c].clear(), pc.sv[c].clear(), pc.vv[c].clear();
+    std::vector<std::pair<const char*, const char*>> fields(std::max<size_t>(nc, needFields) + 1);
+    std::vector<float> vec;
+    auto fail = [&](std::string m, int code) {
+      pc.failed = true;
+      pc.msg = std::move(m);
+      pc.code = code;
+    };
+    try {
+      for (const char* p = pc.b; p < pc.e;) {
+        const char* le = (const char*)memchr(p, '\n', pc.e - p);
+        const char* lineEnd = le > p && le[-1] == '\r' ? le - 1 : le;
+        ++pc.lines;
+        if (lineEnd == p) {
+          p = le + 1;
+          continue;
         }
-      }
-      if ((int)nf < needFields) {
-        fclose(f);
-        throw SqlError("Row " + std::to_string(lineNo) + " doesn't contain data for all columns", 1261);
-      }
-      for (size_t c = 0; c < cols.size(); ++c) {
-        if (srcOf[c] < 0) {  // column not in the file: AUTO_INCREMENT or NULL
-          if ((int)c == autoIncCol) {
-            ints[c] = autoNext;
+        size_t nf = 0;
+        const char* fs = p;
+        if (!memchr(p, '"', lineEnd - p)) {  // no quotes: split with memchr
+          for (;;) {
+            const char* q = (const char*)memchr(fs, delim, lineEnd - fs);
+            if (!q) q = lineEnd;
+            if (nf < fields.size()) fields[nf] = {fs, q};
+            ++nf;
+            if (q == lineEnd) break;
+            fs = q + 1;
+          }
+        } else {
+          bool inQ = false;  // delimiters inside "quoted" fields don't split (CSV)
+          for (const char* q = p;; ++q) {
+            if (q != lineEnd && *q == '"' && (q == fs || inQ)) {
+              inQ = !inQ;
+              continue;
+            }
+            if (q == lineEnd || (*q == delim && !inQ)) {
+              if (nf < fields.size()) fields[nf] = {fs, q};
+              ++nf;
+              fs = q + 1;
+              if (q == lineEnd) break;
+            }
+          }
+        }
+        if ((int)nf < needFields) return fail("Row \x01 doesn't contain data for all columns", 1261);
+        for (size_t c = 0; c < nc; ++c) {
+          const ColumnMeta& cm = cols[c];
+          auto null = [&] {
+            if (cm.lt == LType::VARCHAR) pc.sv[c].push_back({});
+            else if (cm.pt == PType::F64) pc.dv[c].push_back(nullv());
+            else if (cm.pt == PType::VEC) pc.vv[c].insert(pc.vv[c].end(), cm.vecDim, nullv());
+            else pc.iv[c].push_back(cm.pt == PType::I64 ? kNullI64 : kNullI32);
+            pc.nulls[c] = 1;
+          };
+          if (srcOf[c] < 0) {  // not in the file: AUTO_INCREMENT (numbered when applied) or NULL
+            if ((int)c == autoIncCol) pc.iv[c].push_back(0);
+            else null();
             continue;
           }
-          if (cols[c].notNull || (int)c == pk) {
-            fclose(f);
-            throw SqlError("Column '" + cols[c].name + "' cannot be null", 1048);
+          auto [b, e] = fields[srcOf[c]];
+          if (e - b >= 2 && *b == '"' && e[-1] == '"') {
+            ++b, --e;
+            if (std::string_view(b, e - b).find("\"\"") != std::string_view::npos) {  // "" inside quotes = "
+              std::string& u = pc.own.emplace_back();
+              for (const char* x = b; x < e; ++x) {
+                u += *x;
+                if (*x == '"' && x + 1 < e && x[1] == '"') ++x;
+              }
+              b = u.data();
+              e = u.data() + u.size();
+            }
           }
-          hasNull[c] = 1;
-          ints[c] = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
-          dbls[c] = nullv();
-          continue;
-        }
-        auto [b, e] = fields[srcOf[c]];
-        if (e - b >= 2 && *b == '"' && e[-1] == '"') {
-          ++b, --e;
-          if (std::string_view(b, e - b).find("\"\"") != std::string_view::npos) {  // "" inside quotes = "
-            unq.clear();
+          if (e - b == 2 && b[0] == '\\' && b[1] == 'N') {  // \N = NULL (MySQL LOAD DATA convention)
+            if (cm.notNull || (int)c == pk) return fail("Column '" + cm.name + "' cannot be null (row \x01)", 1048);
+            null();
+            continue;
+          }
+          if (escape && std::memchr(b, escape, e - b)) {  // ESCAPED BY: \t \n \r \0 \Z, and the escape itself
+            std::string& u = pc.own.emplace_back();
             for (const char* x = b; x < e; ++x) {
-              unq += *x;
-              if (*x == '"' && x + 1 < e && x[1] == '"') ++x;
+              if (*x != escape || x + 1 >= e) {
+                u += *x;
+                continue;
+              }
+              const char n = *++x;
+              u += n == 't' ? '\t' : n == 'n' ? '\n' : n == 'r' ? '\r' : n == '0' ? '\0' : n == 'Z' ? '\x1a' : n;
             }
-            b = unq.data();
-            e = unq.data() + unq.size();
+            b = u.data();
+            e = u.data() + u.size();
+          }
+          switch (cm.lt) {
+            case LType::INT:
+            case LType::BIGINT: pc.iv[c].push_back(parseI(b, e)); break;
+            case LType::DECIMAL: {
+              int64_t v;
+              if (!parseDecimal(b, e, cm.scale, v)) return fail("Incorrect decimal value: '" + std::string(b, e) + "' on row \x01", 1366);
+              pc.iv[c].push_back(v);
+              break;
+            }
+            case LType::DOUBLE: {
+              double v = 0;
+              std::from_chars(b, e, v);
+              pc.dv[c].push_back(v);
+              break;
+            }
+            case LType::DATE: {
+              int32_t d = 0;
+              if (e - b == 10 && b[4] == '-' && b[7] == '-')
+                d = (int32_t)daysFromCivil(parseI(b, b + 4), (unsigned)parseI(b + 5, b + 7), (unsigned)parseI(b + 8, b + 10));
+              else if (!parseDate(std::string(b, e), d)) return fail("Incorrect date value: '" + std::string(b, e) + "'", 1292);
+              pc.iv[c].push_back(d);
+              break;
+            }
+            case LType::VARCHAR: pc.sv[c].push_back(std::string_view(b, e - b)); break;
+            case LType::VECTOR:
+              if (!parseVector(std::string(b, e), vec) || (int)vec.size() != cm.vecDim)
+                return fail("Invalid VECTOR value on row \x01", 1105);
+              pc.vv[c].insert(pc.vv[c].end(), vec.begin(), vec.end());
+              break;
+            case LType::DATETIME: {
+              int64_t us = 0;
+              if (e - b == 19 && b[4] == '-' && b[7] == '-' && b[10] == ' ' && b[13] == ':' && b[16] == ':' && digits(b, 4) &&
+                  digits(b + 5, 2) && digits(b + 8, 2) && digits(b + 11, 2) && digits(b + 14, 2) && digits(b + 17, 2) &&
+                  num(b + 5, 2) >= 1 && num(b + 5, 2) <= 12 && num(b + 8, 2) >= 1 && num(b + 8, 2) <= 31)
+                us = daysFromCivil(num(b, 4), (unsigned)num(b + 5, 2), (unsigned)num(b + 8, 2)) * kUsPerDay +
+                     ((int64_t)num(b + 11, 2) * 3600 + num(b + 14, 2) * 60 + num(b + 17, 2)) * 1000000ll;
+              else if (!parseDateTime(std::string(b, e), us)) return fail("Incorrect datetime value: '" + std::string(b, e) + "'", 1292);
+              pc.iv[c].push_back(us);
+              break;
+            }
           }
         }
-        if (e - b == 2 && b[0] == '\\' && b[1] == 'N') {  // \N = NULL (MySQL LOAD DATA convention)
-          if (cols[c].notNull || (int)c == pk) {
-            fclose(f);
-            throw SqlError("Column '" + cols[c].name + "' cannot be null (row " + std::to_string(lineNo) + ")", 1048);
-          }
-          hasNull[c] = 1;
-          ints[c] = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
-          dbls[c] = nullv();
-          continue;
+        ++pc.rows;
+        p = le + 1;
+      }
+    } catch (std::exception& ex) {
+      fail(ex.what(), 1105);
+    }
+  };
+
+  std::string carry;  // the partial last line of the previous chunk
+  bool eof = false;
+  auto readChunk = [&](Chunk& ch) {
+    if (eof && carry.empty()) return false;
+    memcpy(ch.data.data(), carry.data(), carry.size());
+    size_t have = carry.size();
+    if (!eof) {
+      have += src.read(ch.data.data() + have, CH - have);
+      eof = have < CH;
+    }
+    if (have == 0) return false;
+    if (eof && ch.data[have - 1] != '\n') ch.data[have++] = '\n';
+    size_t end = have;
+    while (end > 0 && ch.data[end - 1] != '\n') --end;
+    if (end == 0) throw SqlError("line too long in " + path, 1105);
+    carry.assign(ch.data.data() + end, have - end);
+    ch.end = end;
+    return true;
+  };
+  auto readAndParse = [&](Chunk& ch) {
+    if (!readChunk(ch)) return false;
+    const char* p = ch.data.data();
+    const char* stop = p + ch.end;
+    ch.skipped = 0;
+    for (; skipLeft > 0 && p < stop; --skipLeft, ++ch.skipped) p = (const char*)memchr(p, '\n', stop - p) + 1;
+    // Pieces: about equal, cut after a newline (at least one: it carries the copy of skipped lines).
+    const size_t per = std::max<size_t>((size_t)(stop - p) / (nth * 4) + 1, 1 << 16);  // (short tasks: urgent work gets a thread soon)
+    ch.np = 0;
+    for (const char* b = p;;) {
+      const char* e = std::min(stop, b + per);
+      if (e < stop) e = (const char*)memchr(e - 1, '\n', stop - (e - 1)) + 1;
+      LoadPiece& pc = ch.pieces[ch.np++];
+      pc.b = b;
+      pc.e = e;
+      pc.zb = ch.np == 1 ? ch.data.data() : b;
+      if ((b = e) >= stop) break;
+    }
+    ioParallel(ch.np, [&](size_t i) {
+      LoadPiece& pc = ch.pieces[i];
+      parse(pc);
+      if (out) {
+        thread_local ZSTD_CCtx* cc = ZSTD_createCCtx();
+        pc.z.resize(ZSTD_compressBound(pc.e - pc.zb));
+        const size_t k = ZSTD_compressCCtx(cc, pc.z.data(), pc.z.size(), pc.zb, pc.e - pc.zb, 1);
+        pc.z.resize(ZSTD_isError(k) ? 0 : k);
+        if (ZSTD_isError(k)) pc.failed = true, pc.msg = "cannot compress the load copy", pc.code = 1105;
+      }
+    });
+    return true;
+  };
+
+  // Codes the strings, then appends the rows of pieces [0, use) (the last one may have failed: its
+  // rows before the bad line are kept, as a serial load would).
+  int written = 0;  // pieces of the current chunk in the copy
+  auto finish = [&](Chunk& ch) {
+    written = 0;
+    int bad = -1;
+    for (int i = 0; i < ch.np && bad < 0; ++i)
+      if (ch.pieces[i].failed) bad = i;
+    const int use = bad < 0 ? ch.np : bad + 1;
+    std::vector<size_t> strCols;
+    for (size_t c = 0; c < nc; ++c)
+      if (cols[c].lt == LType::VARCHAR) strCols.push_back(c);
+    // Existing strings are looked up in parallel (per piece and column); new ones are then added
+    // per column in row order.
+    ioParallel(strCols.size() * use, [&](size_t i) {
+      const size_t c = strCols[i / use];
+      LoadPiece& pc = ch.pieces[i % use];
+      pc.iv[c].resize(pc.rows);
+      dicts[c]->findMany(pc.sv[c].data(), (size_t)pc.rows, pc.iv[c].data(), kNullI32);
+    }, true);
+    ioParallel(strCols.size(), [&](size_t i) {
+      const size_t c = strCols[i];
+      for (int k = 0; k < use; ++k) {
+        LoadPiece& pc = ch.pieces[k];
+        dicts[c]->addMissing(pc.sv[c].data(), (size_t)pc.rows, pc.iv[c].data());
+      }
+    }, true);
+    off.assign(1, 0);
+    for (int k = 0; k < use; ++k) {
+      LoadPiece& pc = ch.pieces[k];
+      if (autoIncCol >= 0)
+        for (int64_t r = 0; r < pc.rows; ++r) {
+          int64_t& v = pc.iv[autoIncCol][r];
+          if (!autoFromFile) v = autoNext++;
+          else autoNext = std::max<int64_t>(autoNext, v + 1);
         }
-        if (escape && std::memchr(b, escape, e - b)) {  // ESCAPED BY: \t \n \r \0 \Z, and the escape itself
-          unesc.clear();
-          for (const char* x = b; x < e; ++x) {
-            if (*x != escape || x + 1 >= e) { unesc += *x; continue; }
-            const char n = *++x;
-            unesc += n == 't' ? '\t' : n == 'n' ? '\n' : n == 'r' ? '\r' : n == '0' ? '\0' : n == 'Z' ? '\x1a' : n;
-          }
-          b = unesc.data();
-          e = unesc.data() + unesc.size();
+      for (size_t c = 0; c < nc; ++c)
+        if (pc.nulls[c]) hasNull[c] = 1;
+      off.push_back(off.back() + pc.rows);
+    }
+    auto cell = [&](LoadPiece& pc, size_t c, int64_t r) {  // -> ints / dbls / curVec
+      const ColumnMeta& cm = cols[c];
+      if (cm.pt == PType::F64) dbls[c] = pc.dv[c][r];
+      else if (cm.pt == PType::VEC) curVec[c].assign(pc.vv[c].begin() + r * cm.vecDim, pc.vv[c].begin() + (r + 1) * cm.vecDim);
+      else ints[c] = pc.iv[c][r];
+    };
+    if (!bulk) {
+      for (int k = 0; k < use; ++k)
+        for (int64_t r = 0; r < ch.pieces[k].rows; ++r) {
+          for (size_t c = 0; c < nc; ++c) cell(ch.pieces[k], c, r);
+          appendRaw(ints, dbls);
+          ++rows;
         }
-        switch (cols[c].lt) {
-          case LType::INT:
-          case LType::BIGINT: ints[c] = parseI(b, e); break;
-          case LType::DECIMAL:
-            if (!parseDecimal(b, e, cols[c].scale, ints[c])) {
-              fclose(f);
-              throw SqlError("Incorrect decimal value: '" + std::string(b, e) + "' on row " + std::to_string(lineNo), 1366);
-            }
-            break;
-          case LType::DOUBLE: {
-            double v = 0;
-            std::from_chars(b, e, v);
-            dbls[c] = v;
-            break;
+    } else {
+      for (auto& v : rowsOf) v.clear();
+      if (nparts == 1 || shardKey.empty()) {  // no shard key: a contiguous slice per partition
+        const int64_t R = off.back();
+        for (int i = 0; i < nparts; ++i) {
+          const int p = (int)((nextPart + i) % nparts);
+          for (int64_t g = R * i / nparts; g < R * (i + 1) / nparts; ++g) rowsOf[p].push_back((uint32_t)g);
+        }
+        ++nextPart;
+      } else {
+        for (int k = 0; k < use; ++k)
+          for (int64_t r = 0; r < ch.pieces[k].rows; ++r) {
+            for (int c : shardKey) cell(ch.pieces[k], c, r);
+            rowsOf[partOf(ints, dbls)].push_back((uint32_t)(off[k] + r));
           }
-          case LType::DATE: {
-            int32_t d = 0;
-            if (e - b == 10 && b[4] == '-' && b[7] == '-')
-              d = (int32_t)daysFromCivil(parseI(b, b + 4), (unsigned)parseI(b + 5, b + 7), (unsigned)parseI(b + 8, b + 10));
-            else if (!parseDate(std::string(b, e), d)) {
-              fclose(f);
-              throw SqlError("Incorrect date value: '" + std::string(b, e) + "'", 1292);
+      }
+      for (int p = 0; p < nparts; ++p) {
+        const std::vector<uint32_t>& list = rowsOf[p];
+        for (size_t done = 0; done < list.size();) {
+          WriteBuffer& buf = *bufs[p];
+          const size_t room = buf.n < kSegRows ? (size_t)(kSegRows - buf.n) : list.size() - done;
+          const size_t k = std::min(list.size() - done, room);
+          buf.reserveForAppend((int64_t)k);
+          const uint32_t* idx = list.data() + done;
+          ioParallel(nc, [&](size_t c) {  // one column per task; rows are in order, so pieces are walked
+            std::vector<uint8_t>& dst = buf.cols[c];
+            const ColumnMeta& cm = cols[c];
+            const size_t o = dst.size(), w = cm.pt == PType::VEC ? 4 * (size_t)cm.vecDim : (size_t)psize(cm.pt);
+            dst.resize(o + k * w);
+            uint8_t* d = dst.data() + o;
+            int pi = 0;
+            for (size_t j = 0; j < k; ++j) {
+              const int64_t g = idx[j];
+              while (g >= off[pi + 1]) ++pi;
+              const LoadPiece& pc = ch.pieces[pi];
+              const int64_t r = g - off[pi];
+              switch (cm.pt) {
+                case PType::I32: ((int32_t*)d)[j] = (int32_t)pc.iv[c][r]; break;
+                case PType::I64: ((int64_t*)d)[j] = pc.iv[c][r]; break;
+                case PType::F64: ((double*)d)[j] = pc.dv[c][r]; break;
+                case PType::VEC: memcpy(d + j * w, pc.vv[c].data() + (size_t)r * cm.vecDim, w); break;
+              }
             }
-            ints[c] = d;
-            break;
-          }
-          case LType::VARCHAR: ints[c] = dicts[c]->getOrAdd(std::string_view(b, e - b)); break;
-          case LType::VECTOR:
-            if (!parseVector(std::string(b, e), curVec[c]) || (int)curVec[c].size() != cols[c].vecDim) {
-              fclose(f);
-              throw SqlError("Invalid VECTOR value on row " + std::to_string(lineNo), 1105);
-            }
-            break;
-          case LType::DATETIME: {
-            int64_t us = 0;
-            if (!parseDateTime(std::string(b, e), us)) {
-              fclose(f);
-              throw SqlError("Incorrect datetime value: '" + std::string(b, e) + "'", 1292);
-            }
-            ints[c] = us;
-            break;
-          }
+          }, true);
+          buf.del->host.resize((size_t)(buf.n + (int64_t)k + 31) / 32, 0);
+          buf.n += (int64_t)k;
+          ++buf.version;
+          rows += (int64_t)k;
+          done += k;
+          if (buf.n >= kSegRows) flushPart(p);
         }
       }
-      if (autoIncCol >= 0) autoNext = std::max<int64_t>(autoNext, ints[autoIncCol] + 1);
-      appendRaw(ints, dbls);
-      if ((++rows & 0x3ffff) == 0 && yield) yield();  // let readers in between chunks of a long load
-      p = le + 1;
     }
-    memmove(data.data(), data.data() + end, have - end);
-    have -= end;
+    lineNo += ch.skipped;
+    for (int k = 0; k < use; ++k) {
+      LoadPiece& pc = ch.pieces[k];
+      if (k == bad) {
+        std::string m = pc.msg;
+        const size_t at = m.find('\x01');
+        if (at != std::string::npos) m.replace(at, 1, std::to_string(lineNo + pc.lines));
+        throw SqlError(m, pc.code);
+      }
+      lineNo += pc.lines;
+      if (out && !pc.z.empty() && fwrite(pc.z.data(), 1, pc.z.size(), out) != pc.z.size()) throw SqlError("cannot write " + copyTo, 1105);
+      written = k + 1;
+    }
+    if (rows >= yieldAt && yield) {  // let readers in between chunks of a long load
+      yield();
+      yieldAt = rows + 0x40000;
+    }
+  };
+
+  // Pipelined: the next chunk is read and parsed while this one is coded and appended.
+  auto closeCopy = [&] {
+    const bool ok = fflush(out) == 0 && fdatasync(fileno(out)) == 0;
+    fclose(out);
+    out = nullptr;
+    if (!ok || rename(tmp.c_str(), copyTo.c_str()) != 0) {
+      unlink(tmp.c_str());
+      throw SqlError("cannot write " + copyTo, 1105);
+    }
+  };
+  Chunk* cur = &chunks[0];
+  Chunk* nxt = &chunks[1];
+  bool started = false;
+  try {
+    for (bool more = readAndParse(*cur); more; std::swap(cur, nxt)) {
+      std::future<bool> ahead = std::async(std::launch::async, [&, nxt] { return readAndParse(*nxt); });
+      started = true;
+      finish(*cur);
+      more = ahead.get();
+    }
+  } catch (...) {
+    // Rows loaded before the error stay; the copy then holds every line up to the failing chunk's
+    // end, so the logged statement replays to the same rows and the same error.
+    if (loaded) *loaded = rows;
+    if (out && rows > 0) {
+      if (started)
+        for (int k = written; k < cur->np; ++k)
+          if (!cur->pieces[k].z.empty()) fwrite(cur->pieces[k].z.data(), 1, cur->pieces[k].z.size(), out);
+      try {
+        closeCopy();
+      } catch (...) {
+      }
+    }
+    throw;
   }
-  fclose(f);
+  if (out) closeCopy();
+  if (loaded) *loaded = rows;
   return rows;
 }
 
