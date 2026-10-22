@@ -210,10 +210,12 @@ void checkPageCrc(const TVal& ph, const uint8_t* body, size_t csize) {
 
 // RLE / bit-packed hybrid of `count` values of `bw` bits.
 void rleHybrid(const uint8_t* p, const uint8_t* e, int bw, size_t count, std::vector<uint32_t>& out) {
-  out.clear();
-  out.reserve(count);
+  out.resize(count);  // (written in place: runs filled, bit-packed groups unpacked; the rest 0)
+  uint32_t* o = out.data();
+  size_t k0 = 0;
   const int bytes = (bw + 7) / 8;
-  while (out.size() < count && p < e) {
+  const uint64_t mask = bw ? (bw >= 32 ? 0xFFFFFFFFull : (1ull << bw) - 1) : 0;
+  while (k0 < count && p < e) {
     uint64_t h = 0;
     for (int s = 0; p < e; s += 7) {
       const uint8_t b = *p++;
@@ -230,17 +232,19 @@ void rleHybrid(const uint8_t* p, const uint8_t* e, int bw, size_t count, std::ve
           ++p;
           have += 8;
         }
-        if (out.size() < count) out.push_back(bw ? (uint32_t)(acc & ((1ull << bw) - 1)) : 0);
+        if (k0 < count) o[k0++] = (uint32_t)(acc & mask);
         acc >>= bw;
         have -= bw;
       }
     } else {  // run: (h >> 1) copies of one value
       uint32_t v = 0;
       for (int k = 0; k < bytes && p < e; ++k) v |= (uint32_t)*p++ << (8 * k);
-      out.insert(out.end(), std::min<size_t>((size_t)(h >> 1), count - out.size()), v);
+      const size_t n = std::min<size_t>((size_t)(h >> 1), count - k0);
+      std::fill(o + k0, o + k0 + n, v);
+      k0 += n;
     }
   }
-  out.resize(count, 0);
+  std::fill(o + k0, o + count, 0u);
 }
 
 // DELTA_BINARY_PACKED integers.
