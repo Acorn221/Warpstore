@@ -131,6 +131,25 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   for (auto& t : lockOrder) locks.emplace_back(t->mu);
   FairSharedMutex::barge = false;
   if (envSetting("TRACE") && msSince(tLock) > 20) fprintf(stderr, "[trace] waited %.1f ms for table locks\n", msSince(tLock));
+  // SELECT COUNT(*) FROM t: the snapshot's live row count (no scan), when no transaction has changes
+  // pending on t (rows other sessions may not see yet).
+  if (!explain && ctx.tabs.size() == 1 && s.from.size() == 1 && !s.from[0].sub && s.items.size() == 1 && !s.where && s.groupBy.empty() &&
+      !s.having && !s.distinct && !s.unionNext && s.orderBy.empty() && s.offset == 0 && s.limit != 0 && !tRawNumber && !tColumnar &&
+      !tInsertCols && ctx.tabs[0]->txnPending.empty()) {
+    const ExprP& e = s.items[0].e;
+    if (e->kind == Expr::FUNC && e->op == "COUNT" && !e->distinct &&
+        (e->args.empty() || e->args[0]->kind == Expr::STAR || (e->args[0]->kind == Expr::LIT && !e->args[0]->lit.isNull()))) {
+      ResultSet r;
+      r.isResult = true;
+      r.names = {s.items[0].alias.empty() ? e->str() : s.items[0].alias};
+      r.types = {LType::BIGINT};
+      const int64_t n = ctx.tabs[0]->liveRows();
+      r.rows = {{std::to_string(n)}};
+      r.vals = {{Value::I(n)}};  // (callers inside the engine read the typed row)
+      r.info = "row count";
+      return r;
+    }
+  }
 
   // Expand * and bind the select list.
   std::vector<SelectItem> items;
