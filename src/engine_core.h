@@ -1687,9 +1687,34 @@ struct Compiler {
         if (!ctx->dict(*e->args[0])) throw SqlError("IN on this string expression can't run on the GPU", 1235);
         Dict& d = *ctx->dict(*e->args[0]);
         std::set<std::string> vals;
-        const bool ci = ciColl();
+        bool letters = false;
+        for (size_t i = 1; i < e->args.size(); ++i)
+          for (char ch : e->args[i]->lit.s) letters = letters || isalpha((unsigned char)ch);
+        const bool ci = ciColl() && letters;
         for (size_t i = 1; i < e->args.size(); ++i) vals.insert(ci ? foldCase(e->args[i]->lit.s) : e->args[i]->lit.s);
-        int s = dictSet(d, [&](std::string_view v) { return vals.count(ci ? foldCase(v) : std::string(v)) > 0; });
+        int s;
+        if (!ci) {  // each value looked up: no pass over the dictionary
+          const size_t n = d.strs.size();
+          std::vector<uint32_t> bits((n + 31) / 32 + 1, 0);
+          for (auto& v : vals)
+            if (const int32_t c = d.find(v); c >= 0) bits[(size_t)c >> 5] |= 1u << (c & 31);
+          s = addSet(std::move(bits), (int)n);
+        } else {  // every case variant: a pass over the dictionary, cached per dictionary version
+          std::string key = "CIIN";
+          for (auto& v : vals) key += "|" + v;
+          std::vector<uint8_t> lens;  // (most strings have none of the values' lengths: no fold needed)
+          for (auto& v : vals) {
+            if (lens.size() <= v.size()) lens.resize(v.size() + 1, 0);
+            lens[v.size()] = 1;
+          }
+          s = dictSet(d, [&](std::string_view v) {
+            if (v.size() >= lens.size() || !lens[v.size()]) return false;
+            thread_local std::string buf;
+            buf.assign(v);
+            for (auto& ch : buf) ch = (char)tolower((unsigned char)ch);
+            return vals.count(buf) > 0;
+          }, key);
+        }
         gen(e->args[0]);
         emit(OP_INSET, s, 0);
         if (e->neg) emit(OP_NOT, 0, 0);

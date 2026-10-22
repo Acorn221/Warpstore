@@ -169,7 +169,7 @@ constexpr int kMaxStack = 16;
 constexpr int kMaxCols = 128;
 constexpr int kMaxCode = 320;
 constexpr int kMaxConsts = 96;
-constexpr int kMaxSets = 8;
+constexpr int kMaxSets = 16;  // (string predicate bitmaps and dictionary maps per compiled expression set)
 constexpr int kMaxKeys = 8;
 constexpr int kMaxAggs = 64;
 // The interpreter (ahead-of-time kernels) handles plans up to these sizes; bigger plans are compiled.

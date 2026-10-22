@@ -87,4 +87,8 @@ cur.execute("INSERT INTO upd VALUES (1, 1, 10, 'bob'), (2, 2, 20, NULL), (3, 3, 
 cur.execute("UPDATE upd SET a = a + 1, b = a WHERE id <= 2")  # MySQL: left to right, b gets the new a
 cur.execute("UPDATE upd SET b = 0 WHERE s LIKE 'b__'")         # NULL s: not a match
 c.eq("UPDATE: SETs left to right, NULL predicates don't match", q("SELECT id, a, b FROM upd ORDER BY id"), [(1, 2, 0), (2, 3, 3), (3, 3, 30)])
+cur.execute("CREATE TABLE ci (s VARCHAR(10))")
+cur.execute("INSERT INTO ci VALUES ('Ant'), ('ANT'), ('ant'), ('bee'), (''), ('12'), (NULL)")
+c.eq("case-insensitive IN / = / <> (default collation)",
+     q("SELECT SUM(s IN ('aNt')), SUM(s = 'ANT'), SUM(s <> 'ant'), SUM(s IN ('', '12')), SUM(s NOT IN ('bee', 'x')) FROM ci"), [(3, 3, 3, 2, 5)])
 c.done()
