@@ -366,7 +366,8 @@ def gen():
         if where:
             my += f" WHERE {where.my}"
             dk += f" WHERE {where.dk}"
-    ncols = my.split(" FROM ")[0].count(" AS c")
+    import re
+    ncols = max((int(x) + 1 for x in re.findall(r" AS c(\d+)\b", my)), default=0)  # (a subquery in the select list has its own FROM)
     cols = ", ".join(f"c{i}" for i in range(ncols)) if ncols else None
     w = R.random()
     if cols and w < 0.12:  # derived table
@@ -510,6 +511,33 @@ for i in range(150):
             a, b = norm_rows(g.fetchall(), places=4), norm_rows(d.execute(sql).fetchall(), places=4)
             c.check(f"dml contents {name} after {i + 1} statements", a == b,
                     f"{len(a)} vs {len(b)} rows; first difference: {[(x, y) for x, y in zip(a, b) if x != y][:2]}")
+# Random window functions: partitions and orders over t1 (id last in every ORDER BY: no ties).
+for i in range(max(N // 8, 10)):
+    part = R.choice(["", "PARTITION BY a % 3", "PARTITION BY s", "PARTITION BY d", "PARTITION BY a % 2, b % 2"])
+    order = R.choice(["id", "a, id", "b DESC, id", "c, id", "s DESC, id", "m, id"])
+    fr = R.choice(["", "", "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW", "ROWS BETWEEN 1 PRECEDING AND 3 FOLLOWING",
+                   "ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING", "ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING"])
+    wc = R.choice(["a", "b", "c", "m"])
+    fn = R.choice(["ROW_NUMBER()", "RANK()", "DENSE_RANK()", "NTILE(3)", f"SUM({wc})", f"AVG({wc})", f"MIN({wc})",
+                   f"MAX({wc})", f"COUNT({wc})", "COUNT(*)", f"LAG({wc}, 2)", f"LEAD({wc})", f"FIRST_VALUE({wc})", f"LAST_VALUE({wc})"])
+    framed = fn.split("(")[0] in ("SUM", "AVG", "MIN", "MAX", "COUNT", "FIRST_VALUE", "LAST_VALUE")
+    over = f"OVER ({part} ORDER BY {order}{' ' + fr if fr and framed else ''})"
+    w = pred([("t1", "t1")])
+    my = f"SELECT id, {fn} {over} FROM t1 WHERE {w.my.replace('t1.', '')} ORDER BY id"
+    dk = f"SELECT id, {fn} {over} FROM t1 WHERE {w.dk.replace('t1.', '')} ORDER BY id"
+    try:
+        want = d.execute(dk).fetchall()
+    except duckdb.Error:
+        continue
+    try:
+        g.execute(my)
+        got = g.fetchall()
+    except pymysql.MySQLError as e:
+        c.check(f"window {i}", False, f"ERROR {e.args}\n  {my}")
+        continue
+    a, b = norm_rows(got, places=4), norm_rows(want, places=4)
+    c.check(f"window {i}", a == b or rows_close(a, b, 1e-6, 1.5e-4),
+            f"\n  {my}\n  warpstore {len(a)} rows {[(x, y) for x, y in zip(a, b) if x != y][:2]}")
 errors = {}
 t0 = time.time()
 for i in range(N):

@@ -1214,6 +1214,18 @@ void bind(ExprP& e, BindCtx& c) {
           const ExprP& y = e->args[1 - i];
           if (x->ty == LType::VARCHAR && !isNullLit(x) && numeric(y->ty) && !(y->kind == Expr::LIT && y->lit.kind == Value::STR)) x = strToNum(x, c);
         }
+        // DECIMAL arithmetic runs in doubles: (b - m) + (m + 11) can come out as 14.999999999 where
+        // MySQL's exact arithmetic gives 15. Compared, it is rounded to its scale first.
+        for (int i = 0; i < 2; ++i) {
+          ExprP& x = e->args[i];
+          if (x->ty == LType::DECIMAL && x->kind == Expr::BIN && (x->op == "+" || x->op == "-" || x->op == "*") && x->scale >= 0 && x->scale <= 9) {
+            const double p = pow10i(x->scale);
+            ExprP r = mkCall(FN_ROUND, {boundNode(Expr::BIN, "*", {x, boundLit(Value::D(p))}, LType::DOUBLE)}, LType::DOUBLE);
+            const int sc = x->scale;
+            x = boundNode(Expr::BIN, "/", {r, boundLit(Value::D(p))}, LType::DECIMAL);
+            x->scale = sc;
+          }
+        }
         e->ty = LType::INT;
       } else if (e->op == "AND" || e->op == "OR") {
         e->ty = LType::INT;
@@ -14128,9 +14140,16 @@ ResultSet Engine::multiDistinct(Stmt& s, QueryCtx& q, bool typed) {
     for (size_t j = 0; j < aggs.size(); ++j) p.items.push_back({cloneExpr(aggs[j]), prefix + std::to_string(j)});
     return p;
   };
-  auto keyOf = [&](const std::vector<Value>& row) {
+  auto keyOf = [&](const std::vector<Value>& row) {  // (numbers by value: the parts may type a key differently, 19 / 19.0)
     std::string k;
-    for (size_t i = 0; i < keys.size(); ++i) k += (row[i].isNull() ? std::string("\x02") : row[i].toString()) + '\x1f';
+    char b[40];
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const Value& v = row[i];
+      if (v.isNull()) k += "\x02";
+      else if (v.kind == Value::STR) k += v.s;
+      else snprintf(b, sizeof b, "%.17g", v.num()), k += b;
+      k += '\x1f';
+    }
     return k;
   };
   Stmt base = part(plain, "__a");
