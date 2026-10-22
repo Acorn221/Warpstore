@@ -17,6 +17,8 @@ ap.add_argument("--sf", type=float, default=1)
 ap.add_argument("--runs", type=int, default=3)
 ap.add_argument("--keep", help="directory for the Parquet files (reused when present)")
 ap.add_argument("--only", help="comma-separated query numbers")
+ap.add_argument("--ws-data", help="warpstore data directory to keep (reused when present: no reload)")
+ap.add_argument("--ws-args", default="", help="extra warpstore server arguments")
 args = ap.parse_args()
 
 work = args.keep or tempfile.mkdtemp(prefix="tpch-")
@@ -61,7 +63,7 @@ if os.environ.get("WARPSTORE_PORT"):
     srv = Server(data_dir=None, http=False)
     srv.port = int(os.environ["WARPSTORE_PORT"])
 else:
-    srv = Server(name="tpch", http=False).start()
+    srv = Server(*args.ws_args.split(), data_dir=args.ws_data or "auto", name="tpch", http=False).start()
 cur = srv.cursor()
 cur.execute("CREATE DATABASE IF NOT EXISTS tpch")
 cur.execute("USE tpch")
@@ -113,7 +115,7 @@ for n in sorted(queries):
         dt_w, got = timed(lambda: ws(q))
         first_w = timed.first
     except Exception as e:
-        rows.append((n, None, dt_d, None, None, f"ERROR {str(e)[:150]}"))
+        rows.append((n, None, dt_d, None, first_d, f"ERROR {str(e)[:150]}"))
         fails += 1
         continue
     a, b = norm_rows(got, ordered=ordered, places=2), norm_rows(want, ordered=ordered, places=2)
@@ -129,7 +131,8 @@ k = 0
 import math
 for n, w, dd, fw, fd, res in rows:
     sp = f"{dd / w:.1f}x" if w else "-"
-    print(f"{n:>3} {w if w is None else round(w, 4):>10} {dd:>8.4f} {sp:>8} {fw if fw is None else round(fw, 4):>9} {fd if fd is None else round(fd, 4):>9}  {res}")
+    fmt = lambda x, w: f"{'-' if x is None else round(x, 4):>{w}}"
+    print(f"{n:>3} {fmt(w, 10)} {dd:>8.4f} {sp:>8} {fmt(fw, 9)} {fmt(fd, 9)}  {res}")
     if w:
         for i, v in enumerate((w, dd, fw, fd)):
             geo[i] += math.log(v)

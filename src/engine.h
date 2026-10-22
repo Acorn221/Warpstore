@@ -125,7 +125,8 @@ class Engine {
  private:
   Catalog cat_;
   // VRAM cache: a background thread moves segment columns between VRAM and the host tier by heat.
-  void vramBalance();
+  void vramBalance(int64_t shed = 0);  // shed > 0: move that many bytes of the coldest columns out of VRAM
+  std::atomic<int64_t> vramHoldUntilUs_{0};  // no promotions before (after a shed for a big query)
   void tierBalance();  // host memory vs the segment files (--memory-limit)
   void compactTables();  // merges segments full of deleted rows, and small ones
   std::atomic<bool> vramStop_{false};

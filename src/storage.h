@@ -476,7 +476,8 @@ struct SegFile {
 struct SegData;
 void tierInit(const std::string& dataDir, int64_t memLimit);  // memLimit < 0: no limit
 bool tierEnabled();                                           // segment files can be written (a data dir)
-int64_t tierMemLimit();                                       // INT64_MAX: none
+int64_t tierMemLimit();
+void tierSetMemCap(int64_t cap);                             // a cgroup memory cap: tierMemLimit leaves room for the rest                                       // INT64_MAX: none
 int64_t tierHostBytes();                                      // segment column bytes in host memory
 int64_t tierPendingBytes();                                   // evicted, freed once older queries finish
 // The segment's file (written and opened if it has none yet; null without a data dir).

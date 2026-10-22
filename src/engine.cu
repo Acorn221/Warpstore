@@ -4950,7 +4950,7 @@ void Engine::tierBalance() {
 // budget are wanted in VRAM, resident columns outside that set are moved out first to make room.
 // Copies and mappings are made outside the table lock; only the pointer swap takes it exclusively
 // (running queries hold it shared, so none still reads an old pointer when it is freed).
-void Engine::vramBalance() {
+void Engine::vramBalance(int64_t shed) {
   struct Ent {
     std::shared_ptr<Table> t;
     Segment* seg;
@@ -4962,6 +4962,7 @@ void Engine::vramBalance() {
   };
   static const bool off = envSetting("NO_VRAM_CACHE") != nullptr;  // static placement (A/B comparisons)
   if (off) return;
+  if (shed <= 0 && nowUs() < vramHoldUntilUs_.load()) return;
   std::vector<std::shared_ptr<Table>> tabs;
   {
     std::lock_guard<std::mutex> g(cat_.mu);
@@ -4991,7 +4992,7 @@ void Engine::vramBalance() {
       }
     }
   }
-  if (!anyMapped && !neverResident) return;
+  if (shed <= 0 && !anyMapped && !neverResident) return;
   const int64_t limit = gpuVramLimit();
   const int64_t budget = limit != INT64_MAX ? limit : resident + std::max<int64_t>(0, gpuVramFree() - (1ll << 30));
   // Hottest first; at equal heat resident columns stay (no churn).
@@ -5009,11 +5010,17 @@ void Engine::vramBalance() {
     // NEVER: always).
     if (!want && e.resident) demote.push_back(&e);
   }
-  if (promote.empty() && !neverResident) return;
+  if (shed > 0) {  // a query needs the room: every resident column is a candidate (coldest first, below)
+    promote.clear();
+    demote.clear();
+    for (auto& e : ents)
+      if (e.resident && e.hint != 1) demote.push_back(&e);
+  }
+  if (promote.empty() && !neverResident && shed <= 0) return;
   int64_t need = 0;
   for (auto* e : promote) need += (int64_t)e->bytes;
-  need = std::min<int64_t>(need, 256ll << 20);  // bounded work per round
-  const int64_t room = budget - resident;
+  need = shed > 0 ? shed : std::min<int64_t>(need, 256ll << 20);  // bounded work per round
+  const int64_t room = shed > 0 ? 0 : budget - resident;
   // Coldest first among the demotion candidates; a column is only moved out for one at least 1.5x
   // hotter (no ping-pong when the working set is larger than the budget).
   std::reverse(demote.begin(), demote.end());
@@ -5025,7 +5032,8 @@ void Engine::vramBalance() {
       coldestIn = std::min(coldestIn, e->heat);
       acc += (int64_t)e->bytes;
     }
-    demote.erase(std::remove_if(demote.begin(), demote.end(), [&](const Ent* e) { return e->hint != 2 && e->heat * 1.5f >= coldestIn; }), demote.end());
+    if (shed <= 0)
+      demote.erase(std::remove_if(demote.begin(), demote.end(), [&](const Ent* e) { return e->hint != 2 && e->heat * 1.5f >= coldestIn; }), demote.end());
     std::stable_partition(demote.begin(), demote.end(), [](const Ent* e) { return e->hint == 2; });  // NEVER first
   }
   struct Move {
@@ -5889,8 +5897,24 @@ ResultSet Engine::execute(const std::string& sql) {
     // Out of GPU memory: once every other query is done, alone (this attempt's buffers are freed).
     std::unique_lock<FairSharedMutex> alone(gGpuGate);
     gpuTrimPool();
+    // Still out of memory alone: table columns cached in VRAM make room (read over PCIe from host
+    // memory meanwhile; the VRAM cache brings the hot ones back later), more each time.
+    for (int round = 0;; ++round) {
+      try {
+        return executeStmt(sql);
+      } catch (SqlError& e) {
+        if (e.code != 1041 || round >= 3 || gpuVramUsed() < (256ll << 20)) {
+          if (e.code == 1041) goto oom;
+          throw;
+        }
+      }
+      vramHoldUntilUs_ = nowUs() + 30000000;  // (no promotions for a while)
+      vramBalance(std::max<int64_t>(1ll << 30, gpuVramUsed() / 2 * (round + 1)));
+      gpuTrimPool();
+    }
+  oom:
     try {
-      return executeStmt(sql);
+      throw SqlError("GPU out of memory", 1041);
     } catch (SqlError& e) {
       if (e.code == 1041) {
         size_t mapDev = 0;
@@ -7787,6 +7811,7 @@ ResultSet Engine::doLoad(Stmt& s) {
     n = t->loadFile(path, s.delim, s.skipLines, srcOf, [&] {
       checkKilled();
       lk.unlock();
+      if (tierEnabled() && tierHostBytes() - tierPendingBytes() > tierMemLimit() / 10 * 9) tierBalance();  // (as for Parquet)
       std::this_thread::yield();
       lk.lock();
     }, s.escape, copyTo, &loaded);

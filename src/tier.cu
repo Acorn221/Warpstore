@@ -346,7 +346,26 @@ void tierInit(const std::string& dataDir, int64_t memLimit) {
   g_nextId = mx + 1;
 }
 bool tierEnabled() { return !g_segDir.empty(); }
-int64_t tierMemLimit() { return g_segDir.empty() ? INT64_MAX : g_memLimit; }
+static int64_t g_memCap = -1;  // the process's memory cap (cgroup), when known
+void tierSetMemCap(int64_t cap) { g_memCap = cap; }
+// --memory-limit, lowered under a memory cap so that everything else the process holds (dictionaries,
+// write buffers, query memory: resident anonymous memory that is not segment data) still fits in 85%.
+int64_t tierMemLimit() {
+  if (g_segDir.empty()) return INT64_MAX;
+  int64_t lim = g_memLimit;
+  if (g_memCap > 0) {
+    FILE* f = fopen("/proc/self/statm", "r");
+    long long size = 0, rss = 0, shared = 0;
+    if (f) {
+      if (fscanf(f, "%lld %lld %lld", &size, &rss, &shared) != 3) rss = shared = 0;
+      fclose(f);
+    }
+    const int64_t anon = (int64_t)(rss - shared) * sysconf(_SC_PAGESIZE);
+    const int64_t other = std::max<int64_t>(0, anon - g_hostBytes);
+    lim = std::min<int64_t>(lim, std::max<int64_t>(g_memCap / 10, g_memCap / 20 * 17 - other));
+  }
+  return lim;
+}
 int64_t tierHostBytes() { return g_hostBytes; }
 int64_t tierPendingBytes() { return g_pending; }
 

@@ -1500,6 +1500,7 @@ int main(int argc, char** argv) {
       // (dictionaries, write buffers and queries need the rest).
       lim = (int64_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 2;
       const int64_t cap = cgroupMemoryMax();
+      tierSetMemCap(cap);
       if (cap > 0 && cap / 5 * 2 < lim) {
         lim = cap / 5 * 2;
         fprintf(stderr, "[warpstore] memory cap of %.1f GB (cgroup): table data in host memory up to 40%% of it\n", cap / 1073741824.0);
