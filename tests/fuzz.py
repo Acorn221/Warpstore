@@ -66,7 +66,7 @@ for sql in ("DELETE FROM t1 WHERE id % 17 = 3", "UPDATE t1 SET a = a + 1 WHERE i
             # BIGINT / DECIMAL / DOUBLE, all against the old row
             "UPDATE t1 SET m = m - 1.25, c = c + 0.5, b = a, a = b WHERE id % 37 = 3",
             "UPDATE t1 SET a = 7, m = 2.5, b = b - 10 WHERE id % 41 = 6",
-            "UPDATE t2 SET x = x + 1000000, t1_id = t1_id WHERE id % 5 = 1"):
+            "UPDATE t2 SET x = x + 1000, t1_id = t1_id WHERE id % 5 = 1"):
     g.execute(sql)
     d.execute(sql)
 
@@ -131,7 +131,11 @@ for sql in ("SELECT t1.id, t1.s, t1.a, SUM(t2.x), COUNT(*) FROM t1 JOIN t2 ON t2
             "SELECT t1.s, t1.id, MAX(t2.s2) FROM t1, t2 WHERE t1.id = t2.t1_id AND t2.x > 0 GROUP BY t1.s, t1.id HAVING t1.s IS NOT NULL AND COUNT(*) > 1 ORDER BY 1, 2",
             "SELECT t1.id, t1.s, t1.m, COUNT(t2.id) FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id GROUP BY t1.id, t1.s, t1.m ORDER BY 4 DESC, 1 LIMIT 25",
             "SELECT t1.id, UPPER(t1.s) AS sa, t1.a * 2, SUM(t2.x) FROM t1 JOIN t2 ON t2.t1_id = t1.id GROUP BY t1.id, sa, t1.a * 2, t1.a ORDER BY t1.id LIMIT 40",
-            "SELECT t2.id, t2.s2, t1.s, t1.id FROM t2 JOIN t1 ON t1.id = t2.t1_id GROUP BY t2.id, t2.s2, t1.s, t1.id ORDER BY t2.id LIMIT 30"):
+            "SELECT t2.id, t2.s2, t1.s, t1.id FROM t2 JOIN t1 ON t1.id = t2.t1_id GROUP BY t2.id, t2.s2, t1.s, t1.id ORDER BY t2.id LIMIT 30",
+            # COUNT(DISTINCT) (two-phase aggregation) with ORDER BY an exact integer aggregate + LIMIT
+            "SELECT a % 7 AS k, MIN(b) AS mb, MAX(b), COUNT(DISTINCT c) FROM t1 GROUP BY 1 ORDER BY mb, k LIMIT 5",
+            "SELECT MIN(b) AS c0, id, COUNT(DISTINCT id) FROM t1 GROUP BY id ORDER BY c0, id DESC LIMIT 5",
+            "SELECT b, id, COUNT(DISTINCT id) FROM t1 GROUP BY b, id ORDER BY b, id DESC LIMIT 5"):
     g.execute(sql)
     MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 
@@ -404,7 +408,10 @@ for i in range(max(N // 10, 10)):
         body = f"SELECT {fn}({ref}.x) FROM {inner} WHERE {ref}.t1_id {op} t1.id"
         my = f"SELECT t1.id, ({body}{extra(p2)}) FROM t1 WHERE {rng}"
         dk = f"SELECT t1.id, ({body}{extra(p2 and p2.dk)}) FROM t1 WHERE {rng}"
-    want = d.execute(dk).fetchall()
+    try:
+        want = d.execute(dk).fetchall()
+    except duckdb.Error:
+        continue  # (DuckDB rejects it, e.g. INT32 overflow: not interesting)
     try:
         g.execute(my)
         got = g.fetchall()

@@ -1093,6 +1093,10 @@ struct Table {
   // partOfRow: each row's partition when known (an UPDATE that keeps the shard key): no re-hashing.
   void appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n,
                      const int32_t* partOfRow = nullptr, bool nullsKnown = false);  // nullsKnown: hasNull already set
+  // UPDATE's new rows: rows ls[0..n) copied as they are, except the columns with given[c] (values in
+  // iv / dv), each into partition part[i]. Tables without keys, indexes or open transactions only.
+  void appendCopy(const Loc* ls, size_t n, const int32_t* part, const std::vector<uint8_t>& given,
+                  const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv);
   // Set while a statement holds row locations across appends: full write buffers are flushed after.
   bool deferFlush = false;
   void deleteAt(Loc l);

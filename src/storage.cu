@@ -787,6 +787,75 @@ void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std
   }
 }
 
+void Table::appendCopy(const Loc* ls, size_t n, const int32_t* part, const std::vector<uint8_t>& given,
+                       const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv) {
+  const size_t nc = cols.size();
+  ioParallel(nc, [&](size_t c) {  // (copied columns: their NULLs are in hasNull already)
+    if (!given[c] || hasNull[c]) return;
+    if (cols[c].pt == PType::F64) {
+      for (double x : dv[c])
+        if (x != x) { hasNull[c] = 1; return; }
+    } else {
+      const int64_t nul = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
+      for (int64_t x : iv[c])
+        if (x == nul) { hasNull[c] = 1; return; }
+    }
+  }, true);
+  std::vector<std::vector<uint32_t>> rowsOf(nparts);
+  for (size_t i = 0; i < n; ++i) rowsOf[part[i]].push_back((uint32_t)i);
+  for (int p = 0; p < nparts; ++p) {
+    const std::vector<uint32_t>& list = rowsOf[p];
+    for (size_t done = 0; done < list.size();) {
+      WriteBuffer& buf = *bufs[p];
+      const size_t room = buf.n < kSegRows ? (size_t)(kSegRows - buf.n) : list.size() - done;
+      const size_t k = std::min(list.size() - done, room);
+      buf.reserveForAppend((int64_t)k);
+      const uint32_t* idx = list.data() + done;
+      ioParallel(nc, [&](size_t c) {
+        std::vector<uint8_t>& dst = buf.cols[c];
+        const size_t w = (size_t)psize(cols[c].pt), o = dst.size();
+        if (k >= 4096 && dst.capacity() < o + k * w) dst.reserve(std::max<size_t>(o + k * w, (size_t)kSegRows * w));
+        dst.resize(o + k * w);  // (first: a source row may be in this very buffer)
+        uint8_t* d = dst.data() + o;
+        if (given[c]) {
+          switch (cols[c].pt) {
+            case PType::I32: for (size_t j = 0; j < k; ++j) ((int32_t*)d)[j] = (int32_t)iv[c][idx[j]]; break;
+            case PType::I64: for (size_t j = 0; j < k; ++j) ((int64_t*)d)[j] = iv[c][idx[j]]; break;
+            default: for (size_t j = 0; j < k; ++j) ((double*)d)[j] = dv[c][idx[j]]; break;
+          }
+          return;
+        }
+        auto copy = [&](auto* out) {  // (typed by width: a load and a store per cell)
+          using T = std::remove_pointer_t<decltype(out)>;
+          const T* base = nullptr;
+          int32_t baseSeg = INT32_MIN;
+          for (size_t j = 0; j < k; ++j) {
+            const Loc l = ls[idx[j]];
+            if (l.seg != baseSeg) base = (const T*)colData(l, (int)c).data(), baseSeg = l.seg;
+            out[j] = base[l.row];
+          }
+        };
+        if (w == 4) copy((int32_t*)d);
+        else if (w == 8) copy((int64_t*)d);
+        else {  // (other widths: VECTOR columns don't come here; kept general)
+          const uint8_t* base = nullptr;
+          int32_t baseSeg = INT32_MIN;
+          for (size_t j = 0; j < k; ++j) {
+            const Loc l = ls[idx[j]];
+            if (l.seg != baseSeg) base = colData(l, (int)c).data(), baseSeg = l.seg;
+            memcpy(d + j * w, base + (size_t)l.row * w, w);
+          }
+        }
+      }, true);
+      buf.del->host.resize((size_t)(buf.n + (int64_t)k + 31) / 32, 0);
+      buf.n += (int64_t)k;
+      ++buf.version;
+      done += k;
+      if (buf.n >= kSegRows && !deferFlush) flushPart(p);
+    }
+  }
+}
+
 void Table::appendRow(const std::vector<Value>& rowIn) {
   std::vector<int64_t> ints(cols.size());
   std::vector<double> dbls(cols.size());

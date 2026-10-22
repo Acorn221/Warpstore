@@ -8282,10 +8282,30 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       }
     };
     ph = Clock::now();
+    // Tables without keys / indexes / open transactions: the new rows are copied from the old ones
+    // straight into the write buffers (appendCopy), so only the columns the SETs read are gathered.
+    bool shardSet = false;
+    for (auto& [c, e] : sets)
+      for (int k : t.shardKey) shardSet = shardSet || c == k;
+    const bool copyRows = t.pk < 0 && t.indexes.empty() && !txnKey() && !shardSet;
+    std::vector<uint8_t> need(nc, copyRows ? 0 : 1);
+    if (copyRows) {
+      std::set<std::pair<int, int>> used;
+      for (auto& [c, e] : sets) colsOf(e, used);
+      for (auto& [bt, bc] : used)
+        if (bt == 0 && bc >= 0 && bc < (int)nc) need[bc] = 1;
+      for (auto& [c, e] : sets) {  // (the SET columns' value arrays)
+        if (t.cols[c].pt == PType::F64) dv[c].resize(n);
+        else iv[c].resize(n);
+      }
+    }
+    std::vector<size_t> gcols;
+    for (size_t c = 0; c < nc; ++c)
+      if (need[c]) gcols.push_back(c);
     if (n < 4096)  // (a few rows, e.g. by primary key: not worth a task per column)
-      for (size_t c = 0; c < nc; ++c) gather(c);
+      for (size_t c : gcols) gather(c);
     else
-      ioParallel(nc, gather, true);
+      ioParallel(gcols.size(), [&](size_t k) { gather(gcols[k]); }, true);
     tg += msSince(ph), ph = Clock::now();
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
     // row order, as a replay of the statement codes them).
@@ -8377,8 +8397,54 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     bool strSet = false;
     for (auto& [c, e] : rs) strSet = strSet || t.cols[c].lt == LType::VARCHAR;
     if (rs.empty()) {
-    } else if (strSet || n < 16384) {
+    } else if (n < 16384) {
       setRows(0, n, cur, vals, pc);
+    } else if (strSet) {
+      // Values on all cores; strings then coded in one batch in row order (first appearance), as the
+      // row-by-row path and a replay code them.
+      const size_t R = rs.size();
+      std::vector<Value> vb(n * R);
+      parallelFor(n, [&](size_t b, size_t e) {
+        std::vector<Value> lcur(nc);
+        PostCtx lpc = pc;
+        lpc.row = &lcur;
+        for (size_t i = b; i < e; ++i) {
+          for (int c : reads) lcur[c] = cellValue(t, ls[i], c);
+          for (size_t j = 0; j < R; ++j) {
+            Value v = evalPost(rs[j].second, lpc);
+            if (!v.isNull() && t.cols[rs[j].first].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+            vb[i * R + j] = std::move(v);
+          }
+        }
+      }, 4096);
+      for (size_t j = 0; j < R; ++j) {
+        const int c = rs[j].first;
+        if (t.cols[c].lt == LType::VARCHAR) {
+          std::vector<std::string_view> sv(n);
+          bool anyNull = false;
+          for (size_t i = 0; i < n; ++i) {
+            const Value& v = vb[i * R + j];
+            if (v.isNull()) anyNull = true;
+            else sv[i] = std::string_view(v.s.data() ? v.s.data() : "", v.s.size());
+          }
+          int64_t nullCode = kNullI32;
+          if (anyNull) {  // (the NOT NULL check and the NULL code, as row by row)
+            double d0;
+            t.rawOf(c, Value::Null(), nullCode, d0);
+          }
+          t.dicts[c]->getOrAddMany(sv.data(), n, iv[c].data(), nullCode);
+        } else {
+          parallelFor(n, [&](size_t b, size_t e) {
+            int64_t i0;
+            double d0;
+            for (size_t i = b; i < e; ++i) {
+              t.rawOf(c, vb[i * R + j], i0, d0);
+              if (t.cols[c].pt == PType::F64) dv[c][i] = d0;
+              else iv[c][i] = i0;
+            }
+          }, 4096);
+        }
+      }
     } else {
       parallelFor(n, [&](size_t b, size_t e) {
         std::vector<Value> lcur(nc), lvals(sets.size());
@@ -8401,7 +8467,15 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       for (size_t i = 0; i < n; ++i) partOf[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
     }
     ts += msSince(ph), ph = Clock::now();
-    t.appendColumns(iv, dv, (int64_t)n, partOf.empty() ? nullptr : partOf.data());
+    if (copyRows) {
+      std::vector<int32_t> part(n);
+      for (size_t i = 0; i < n; ++i) part[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
+      std::vector<uint8_t> given(nc, 0);
+      for (auto& [c, e] : sets) given[c] = 1;
+      t.appendCopy(ls, n, part.data(), given, iv, dv);
+    } else {
+      t.appendColumns(iv, dv, (int64_t)n, partOf.empty() ? nullptr : partOf.data());
+    }
     ta += msSince(ph);
   }
   if (tr) fprintf(stderr, "[trace] update: gather %.1f ms, set %.1f ms, append %.1f ms\n", tg, ts, ta);
@@ -9897,7 +9971,20 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           pc.env.cols[k] = viewOf(dk.p + (int64_t)k * g, PType::F64);
         }
       }
-      for (int a = 0; a < plan.naggs; ++a) pc.env.cols[nk + a] = viewOf(da.p + (int64_t)a * g, PType::F64);
+      // Exact int64 slots (AggPlan::aggBits: SUM / MIN / MAX of integers) hold int64 bit patterns:
+      // as doubles for the evaluation, like the integer keys.
+      const auto bitsSlots = agg.sumBitsSlots();
+      std::vector<DevVec<double>> accConv;
+      accConv.reserve(plan.naggs);
+      for (int a = 0; a < plan.naggs; ++a) {
+        if (a < (int)bitsSlots.size() && bitsSlots[a]) {
+          accConv.emplace_back(std::max<int64_t>(g, 1));
+          gpuBitsToDouble(da.p + (int64_t)a * g, g, accConv.back().p);
+          pc.env.cols[nk + a] = viewOf(accConv.back().p, PType::F64);
+        } else {
+          pc.env.cols[nk + a] = viewOf(da.p + (int64_t)a * g, PType::F64);
+        }
+      }
       pc.uploadSets();
       DevVec<int32_t> sel;
       int64_t m = g;
