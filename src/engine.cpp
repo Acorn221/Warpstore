@@ -2849,6 +2849,8 @@ static int64_t insertColumns(Table& t, const std::vector<int>& map, const Result
   return n;
 }
 
+static thread_local std::vector<std::vector<Value>>* tStmtDeleted = nullptr;  // rows the running INSERT deleted (doInsert)
+
 ResultSet Engine::doInsert(Stmt& s) {
   std::vector<std::vector<Value>> rows;
   ResultSet cols;  // INSERT .. SELECT whose projection came back as columns
@@ -2894,21 +2896,28 @@ ResultSet Engine::doInsert(Stmt& s) {
   if (hasUniqueKey(*t)) waitTxnFree(*t, lk);  // another open transaction may hold a row with the same key
   // A failed INSERT outside a transaction (a duplicate key, a NULL into NOT NULL, ...) leaves nothing
   // behind, as in MySQL: the rows it appended to the write buffers (not flushed meanwhile) go again.
+  // (Rows REPLACE / ON DUPLICATE KEY UPDATE deleted are put back.)
   struct StmtUndo {
     Table& t;
     bool on, prevDefer;
     int ex = std::uncaught_exceptions();
     std::vector<int64_t> mark;
+    std::vector<std::vector<Value>> deleted;
     StmtUndo(Table& tt, bool o) : t(tt), on(o), prevDefer(tt.deferFlush) {
       if (!on) return;
       t.deferFlush = true;
       for (auto& b : t.bufs) mark.push_back(b->n);
+      tStmtDeleted = &deleted;
     }
     ~StmtUndo() {
       if (!on) return;
+      tStmtDeleted = nullptr;
       t.deferFlush = prevDefer;
       try {
-        if (std::uncaught_exceptions() > ex) t.undoAppendsSince(mark);
+        if (std::uncaught_exceptions() > ex) {
+          t.undoAppendsSince(mark);
+          for (auto& row : deleted) t.appendRow(row);
+        }
         if (!prevDefer)
           for (int p = 0; p < t.nparts; ++p)
             if (t.bufs[p]->n >= kSegRows) t.flushPart(p);
@@ -2986,6 +2995,7 @@ int64_t Engine::insertRows(Table& t, const std::vector<int>& map, std::vector<st
     auto onConflict = [&](Loc old, const std::string& err) -> bool {
       if (s.insertIgnore) return true;
       if (s.replaceInto) {
+        if (tStmtDeleted) tStmtDeleted->push_back(t.rowValues(old));  // (put back if the statement fails)
         t.deleteAt(old);
         affected += 1;
         return false;
@@ -3016,6 +3026,7 @@ int64_t Engine::insertRows(Table& t, const std::vector<int>& map, std::vector<st
       bool same = true;
       for (size_t c = 0; c < upd.size(); ++c) same = same && cmpVal(upd[c], cur[c]) == 0 && upd[c].isNull() == cur[c].isNull();
       if (same) return true;  // MySQL: 0 rows affected when nothing changes
+      if (tStmtDeleted) tStmtDeleted->push_back(std::move(cur));  // (put back if the statement fails)
       t.deleteAt(old);
       t.appendRow(upd);
       affected += 2;

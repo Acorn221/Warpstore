@@ -218,6 +218,15 @@ c.raises("VECTOR table: duplicate key refused", lambda: cur.execute("UPDATE vx S
 c.raises("VECTOR table: NULL into NOT NULL refused", lambda: cur.execute("UPDATE vx SET v = NULL WHERE id > 1"), 1048)
 c.eq("VECTOR table: nothing changed", q("SELECT COUNT(*), SUM(id), SUM(v) FROM vx"), [(3, Decimal(6), Decimal(6))])
 
+# REPLACE / ON DUPLICATE KEY UPDATE that fail part way put back the rows they deleted
+cur.execute("CREATE TABLE rp (id INT PRIMARY KEY, v INT NOT NULL, w INT, UNIQUE KEY (w))")
+cur.execute("INSERT INTO rp VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)")
+for sql in ["REPLACE INTO rp VALUES (1, 10, 1), (4, NULL, 4)", "INSERT INTO rp VALUES (2, 0, 0), (5, NULL, 5) ON DUPLICATE KEY UPDATE v = 20"]:
+    c.raises(f"refused: {sql}", lambda: cur.execute(sql), 1048)
+    c.eq(f"nothing changed: {sql}", q("SELECT COUNT(*), SUM(id), SUM(v), SUM(w) FROM rp"), [(3, Decimal(6), Decimal(6), Decimal(6))])
+cur.execute("REPLACE INTO rp VALUES (1, 10, 1), (4, 4, 4)")
+c.eq("REPLACE that succeeds", q("SELECT COUNT(*), SUM(id), SUM(v), SUM(w) FROM rp"), [(4, Decimal(10), Decimal(19), Decimal(10))])
+
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
 out = {}
