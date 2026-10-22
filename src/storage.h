@@ -107,30 +107,49 @@ struct SvHash {
 };
 
 // Append-only string array that readers may index while a writer appends (MVCC: queries read a
-// table's dictionaries without its lock). Strings live in fixed blocks that never move; the block
-// directory is replaced (old ones kept until destruction) when it fills; size() is published last.
+// table's dictionaries without its lock). The bytes live in arena chunks and the views in fixed
+// blocks; neither ever moves (the block directory is replaced, old ones kept until destruction, when
+// it fills); size() is published last. ~16 bytes + the string per entry (no allocation per string).
 class StrVec {
   static constexpr int kShift = 12;
   static constexpr size_t kBlock = size_t(1) << kShift, kMask = kBlock - 1;
-  std::atomic<std::string**> dir_{nullptr};
+  static constexpr size_t kChunk = size_t(1) << 20;
+  std::atomic<std::string_view**> dir_{nullptr};
   size_t dirCap_ = 0, nblocks_ = 0;
   std::atomic<size_t> n_{0};
-  std::vector<std::unique_ptr<std::string*[]>> dirs_;    // every directory ever used (the last is current)
-  std::vector<std::unique_ptr<std::string[]>> blocks_;
-  std::string& slot(size_t i) {
+  std::vector<std::unique_ptr<std::string_view*[]>> dirs_;  // every directory ever used (the last is current)
+  std::vector<std::unique_ptr<std::string_view[]>> blocks_;
+  std::vector<std::unique_ptr<char[]>> chunks_;
+  char* cur_ = nullptr;
+  size_t left_ = 0;
+  uint64_t bytes_ = 0;
+  std::string_view& slot(size_t i) {
     if (i >= nblocks_ * kBlock) {
       if (nblocks_ == dirCap_) {
         const size_t cap = std::max<size_t>(16, dirCap_ * 2);
-        std::unique_ptr<std::string*[]> d(new std::string*[cap]());
+        std::unique_ptr<std::string_view*[]> d(new std::string_view*[cap]());
         for (size_t b = 0; b < nblocks_; ++b) d[b] = blocks_[b].get();
         dir_.store(d.get(), std::memory_order_release);
         dirs_.push_back(std::move(d));
         dirCap_ = cap;
       }
-      blocks_.emplace_back(new std::string[kBlock]);
+      blocks_.emplace_back(new std::string_view[kBlock]);
       dirs_.back()[nblocks_++] = blocks_.back().get();
     }
     return dir_.load(std::memory_order_relaxed)[i >> kShift][i & kMask];
+  }
+  const char* store(std::string_view s) {
+    if (s.empty()) return "";
+    if (s.size() > left_) {
+      const size_t sz = std::max(kChunk, s.size());
+      chunks_.emplace_back(new char[sz]);
+      cur_ = chunks_.back().get();
+      left_ = sz;
+    }
+    char* p = cur_;
+    memcpy(p, s.data(), s.size());
+    cur_ += s.size(), left_ -= s.size(), bytes_ += s.size();
+    return p;
   }
 
  public:
@@ -145,24 +164,25 @@ class StrVec {
   }
   size_t size() const { return n_.load(std::memory_order_acquire); }
   bool empty() const { return size() == 0; }
-  const std::string& operator[](size_t i) const { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
-  std::string& operator[](size_t i) { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
-  const std::string& back() const { return (*this)[size() - 1]; }
-  void push_back(std::string s) {
+  uint64_t bytes() const { return bytes_; }  // string bytes stored
+  std::string_view operator[](size_t i) const { return dir_.load(std::memory_order_acquire)[i >> kShift][i & kMask]; }
+  std::string_view back() const { return (*this)[size() - 1]; }
+  void push_back(std::string_view s) {
     const size_t i = n_.load(std::memory_order_relaxed);
-    slot(i) = std::move(s);
+    const char* p = store(s);
+    slot(i) = std::string_view(p, s.size());
     n_.store(i + 1, std::memory_order_release);
   }
-  template <class... A>
-  std::string& emplace_back(A&&... a) {
-    push_back(std::string(std::forward<A>(a)...));
-    return (*this)[size() - 1];
-  }
+  void emplace_back(std::string_view s) { push_back(s); }
   void reserve(size_t) {}
   void clear() {  // (only on dictionaries nobody else reads)
     dir_.store(nullptr);
     dirs_.clear();
     blocks_.clear();
+    chunks_.clear();
+    cur_ = nullptr;
+    left_ = 0;
+    bytes_ = 0;
     dirCap_ = nblocks_ = 0;
     n_.store(0);
   }
@@ -170,12 +190,11 @@ class StrVec {
     const StrVec* v;
     size_t i;
     using iterator_category = std::random_access_iterator_tag;
-    using value_type = std::string;
+    using value_type = std::string_view;
     using difference_type = std::ptrdiff_t;
-    using pointer = const std::string*;
-    using reference = const std::string&;
+    using pointer = const std::string_view*;
+    using reference = std::string_view;
     reference operator*() const { return (*v)[i]; }
-    pointer operator->() const { return &(*v)[i]; }
     const_iterator& operator++() { ++i; return *this; }
     const_iterator operator+(difference_type d) const { return {v, i + d}; }
     difference_type operator-(const const_iterator& o) const { return (difference_type)i - (difference_type)o.i; }
@@ -276,10 +295,6 @@ struct Dict {
     for (size_t i = 0; i < n; ++i)
       if (out[i] == -1) miss.push_back(i);
     if (miss.empty()) return;
-    std::vector<std::string> made(miss.size());
-    par(miss.size(), [&](size_t b, size_t e) {
-      for (size_t j = b; j < e; ++j) made[j].assign(s[miss[j]].data(), s[miss[j]].size());
-    });
     std::unique_lock<std::shared_mutex> lk(mapMu);
     grow(strs.size() + miss.size());
     const size_t mask = slots_.size() - 1;
@@ -289,7 +304,7 @@ struct Dict {
       int32_t f = lookup(s[i], hs[i]);  // (an earlier repeat in this batch, or another writer)
       if (f < 0) {
         f = (int32_t)strs.size();
-        strs.push_back(std::move(made[j]));
+        strs.push_back(s[i]);
         place(hs[i], (uint32_t)f);
       }
       out[i] = f;
@@ -309,8 +324,8 @@ struct Dict {
       if (out[i] == -1) out[i] = add(s[i], hash32(s[i]));
   }
   // Appends a string known not to be in the dictionary yet; returns its code.
-  int32_t appendUnique(std::string&& s) {
-    strs.push_back(std::move(s));
+  int32_t appendUnique(std::string_view s) {
+    strs.push_back(s);
     lazy = true;
     return (int32_t)strs.size() - 1;
   }

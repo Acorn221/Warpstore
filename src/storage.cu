@@ -47,7 +47,7 @@ std::vector<Value> Table::rowValues(Loc l) const {
       case PType::I32: {
         int32_t v = ((const int32_t*)col.data())[l.row];
         if (v == kNullI32) r.push_back(Value::Null());
-        else if (m.lt == LType::VARCHAR) r.push_back(Value::S(dicts[c]->strs[v]));
+        else if (m.lt == LType::VARCHAR) r.push_back(Value::S(std::string(dicts[c]->strs[v])));
         else if (m.lt == LType::DATE) r.push_back(Value::Dt(v));
         else r.push_back(Value::I(v));
         break;

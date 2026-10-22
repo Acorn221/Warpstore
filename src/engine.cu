@@ -68,8 +68,8 @@ ExprP cloneExpr(const ExprP& e);  // defined with the query layer
 std::atomic<bool> gCiDefault{true};
 thread_local int tCi = -1;
 bool ciColl() { return tCi >= 0 ? tCi != 0 : gCiDefault.load(); }
-std::string foldCase(const std::string& x) {
-  std::string r = x;
+std::string foldCase(std::string_view x) {
+  std::string r(x);
   for (auto& ch : r) ch = (char)tolower((unsigned char)ch);
   return r;
 }
@@ -149,7 +149,7 @@ std::function<bool(std::string_view)> likeMatcher(const std::string& pat) {
   return [pat](std::string_view s) { return likeMatch(s, pat); };
 }
 
-int collCmp(const std::string& a, const std::string& b);
+int collCmp(std::string_view a, std::string_view b);
 void derivShareMap(const std::shared_ptr<std::vector<double>>& m);
 // Sorted order of a dictionary (collation-aware): (rank -> code, code -> rank). Dictionaries only
 // grow, so (dictionary, size, collation) identifies a version: cached, built with a parallel sort.
@@ -258,7 +258,7 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
   const bool fold = ci;
   std::vector<uint64_t> key(n);
   auto chunk = [&](int32_t i, size_t off) {
-    const std::string& s = d.strs[i];
+    const std::string_view s = d.strs[i];
     uint64_t p = 0;
     for (size_t k = off; k < off + 8; ++k) {
       unsigned char ch = k < s.size() ? (unsigned char)s[k] : 0;
@@ -458,11 +458,14 @@ void derivShareMap(const std::shared_ptr<std::vector<double>>& m) {
   }
 }
 
-int collCmp(const std::string& a, const std::string& b) {
-  if (ciColl()) {
-    int c = strcasecmp(a.c_str(), b.c_str());
-    if (c) return c < 0 ? -1 : 1;
-    return 0;
+int collCmp(std::string_view a, std::string_view b) {
+  if (ciColl()) {  // (strcasecmp's order, without needing terminated strings)
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+      const int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+      if (x != y) return x < y ? -1 : 1;
+    }
+    return a.size() < b.size() ? -1 : a.size() > b.size() ? 1 : 0;
   }
   int c = a.compare(b);
   return c < 0 ? -1 : c > 0 ? 1 : 0;
@@ -494,15 +497,15 @@ std::pair<std::shared_ptr<std::vector<double>>, std::shared_ptr<std::vector<doub
   // cached on a, keyed by b's identity and both sizes
   const std::string key = "cross/" + std::to_string(b.uid) + "/" + std::to_string(a.strs.size()) + "/" + std::to_string(b.strs.size()) + (ciColl() ? "/ci" : "");
   if (auto c = a.getDerived<Maps>(key)) return *c;
-  std::vector<std::pair<const std::string*, int64_t>> all;  // (string, code; b's codes offset by |a|)
+  std::vector<std::pair<std::string_view, int64_t>> all;  // (string, code; b's codes offset by |a|)
   all.reserve(a.strs.size() + b.strs.size());
-  for (size_t i = 0; i < a.strs.size(); ++i) all.push_back({&a.strs[i], (int64_t)i});
-  for (size_t i = 0; i < b.strs.size(); ++i) all.push_back({&b.strs[i], (int64_t)(a.strs.size() + i)});
-  std::sort(all.begin(), all.end(), [](auto& x, auto& y) { return collCmp(*x.first, *y.first) < 0; });
+  for (size_t i = 0; i < a.strs.size(); ++i) all.push_back({a.strs[i], (int64_t)i});
+  for (size_t i = 0; i < b.strs.size(); ++i) all.push_back({b.strs[i], (int64_t)(a.strs.size() + i)});
+  std::sort(all.begin(), all.end(), [](auto& x, auto& y) { return collCmp(x.first, y.first) < 0; });
   auto ma = std::make_shared<std::vector<double>>(a.strs.size()), mb = std::make_shared<std::vector<double>>(b.strs.size());
   double rk = 0;
   for (size_t j = 0; j < all.size(); ++j) {
-    if (j && collCmp(*all[j - 1].first, *all[j].first) != 0) ++rk;
+    if (j && collCmp(all[j - 1].first, all[j].first) != 0) ++rk;
     const int64_t c = all[j].second;
     if (c < (int64_t)a.strs.size()) (*ma)[c] = rk;
     else (*mb)[c - a.strs.size()] = rk;
@@ -1522,7 +1525,7 @@ struct Compiler {
     return i;
   }
   // Bitmap of the dictionary entries satisfying pred (evaluated once per entry, on all cores).
-  int dictSet(const Dict& d, const std::function<bool(const std::string&)>& pred, const std::string& cacheKey = "") {
+  int dictSet(const Dict& d, const std::function<bool(std::string_view)>& pred, const std::string& cacheKey = "") {
     if (!cacheKey.empty()) {  // cached bitmap (and its device copy) for this dictionary version
       const std::string key = derivKey(d, cacheKey);
       DictDerived e;
@@ -1570,7 +1573,7 @@ struct Compiler {
     Dict& d = *ctx->dict(*col);
     if ((op == "=" || op == "<>") && ciColl()) {  // every case variant of the literal
       const std::string f = foldCase(lit);
-      int s = dictSet(d, [&](const std::string& v) { return foldCase(v) == f; });
+      int s = dictSet(d, [&](std::string_view v) { return foldCase(v) == f; });
       gen(col);
       emit(OP_INSET, s, 0);
       if (op == "<>") emit(OP_NOT, 0, 0);
@@ -1582,7 +1585,7 @@ struct Compiler {
       emit(op == "=" ? OP_EQ : OP_NE, 0, -1);
       return;
     }
-    int s = dictSet(d, [&](const std::string& v) {
+    int s = dictSet(d, [&](std::string_view v) {
       int c = collCmp(v, lit);
       return op == "<" ? c < 0 : op == "<=" ? c <= 0 : op == ">" ? c > 0 : c >= 0;
     });
@@ -1654,7 +1657,7 @@ struct Compiler {
         std::set<std::string> vals;
         const bool ci = ciColl();
         for (size_t i = 1; i < e->args.size(); ++i) vals.insert(ci ? foldCase(e->args[i]->lit.s) : e->args[i]->lit.s);
-        int s = dictSet(d, [&](const std::string& v) { return vals.count(ci ? foldCase(v) : v) > 0; });
+        int s = dictSet(d, [&](std::string_view v) { return vals.count(ci ? foldCase(v) : std::string(v)) > 0; });
         gen(e->args[0]);
         emit(OP_INSET, s, 0);
         if (e->neg) emit(OP_NOT, 0, 0);
@@ -1669,7 +1672,7 @@ struct Compiler {
         const bool ci = ciColl() && letters;  // (no letters in the pattern: case can't matter)
         const std::string fp = ci ? foldCase(pat) : pat;
         const auto m = likeMatcher(fp);
-        int s = dictSet(*ctx->dict(*e->args[0]), [&](const std::string& v) {
+        int s = dictSet(*ctx->dict(*e->args[0]), [&](std::string_view v) {
           if (!ci) return m(v);
           thread_local std::string buf;  // (folded without an allocation per string)
           buf.assign(v);
@@ -1794,7 +1797,7 @@ Value typedVal(double v, LType t, const Dict* d, int scale = -1) {
     case LType::DATETIME: return Value::Ts((int64_t)std::llround(v));
     case LType::VARCHAR: {
       int64_t c = (int64_t)v;
-      return Value::S(d && c >= 0 && c < (int64_t)d->strs.size() ? d->strs[c] : "");
+      return Value::S(d && c >= 0 && c < (int64_t)d->strs.size() ? std::string(d->strs[c]) : std::string());
     }
   }
   return Value::D(v);
@@ -2409,7 +2412,7 @@ bool isJsonExpr(const ExprP& x, const BindCtx* c) {
 }
 
 // Full-text tokens: lower-cased runs of letters / digits (bytes >= 0x80 count as letters).
-std::vector<std::string> ftsWords(const std::string& x) {
+std::vector<std::string> ftsWords(std::string_view x) {
   std::vector<std::string> w;
   std::string cur;
   for (char ch : x) {
@@ -3557,7 +3560,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
           tpc.row = &trow;
           tpc.colSlot = pc.colSlot;
           for (size_t i = b; i < en; ++i) {
-            trow[0] = Value::S(src.strs[i + from]);
+            trow[0] = Value::S(std::string(src.strs[i + from]));
             Value v = evalPost(e->args[0], tpc);
             if (v.isNull()) argNull[i] = 1;
             else texts[i] = v.toString();
@@ -3574,7 +3577,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
     if (!directEmbed) parallelFor(N - from, [&, from](size_t b, size_t en) {
       b += from, en += from;
       if (directRegex) {
-        for (size_t i = b; i < en; ++i) res[i] = regexReplace(src.strs[i], e->args[1]->lit.s, e->args[2]->lit.s);
+        for (size_t i = b; i < en; ++i) res[i] = regexReplace(std::string(src.strs[i]), e->args[1]->lit.s, e->args[2]->lit.s);
         return;
       }
       PostCtx tpc;
@@ -3582,7 +3585,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
       tpc.row = &trow;
       tpc.colSlot = pc.colSlot;
       for (size_t i = b; i < en; ++i) {
-        trow[0] = Value::S(src.strs[i]);
+        trow[0] = Value::S(std::string(src.strs[i]));
         Value v = evalPost(e, tpc);
         if (v.isNull()) nul[i] = 1;
         else res[i] = v.toString();
@@ -3646,7 +3649,7 @@ void encodeStrings(ExprP& e, BindCtx& c) {
       tpc.row = &trow;
       tpc.colSlot = pc.colSlot;
       for (size_t i = b; i < en; ++i) {
-        trow[0] = Value::S(src.strs[i]);
+        trow[0] = Value::S(std::string(src.strs[i]));
         Value v = evalPost(e, tpc);
         map[i] = v.isNull() ? nullv() : numOf(v);
       }
@@ -13946,7 +13949,7 @@ ResultSet Engine::runStatementQuery(Stmt& s, bool explain) {
 // file; the WAL then only holds what happened after it.
 namespace {
 void putU64(FILE* f, uint64_t v) { fwrite(&v, 8, 1, f); }
-void putStr(FILE* f, const std::string& s) { putU64(f, s.size()); fwrite(s.data(), 1, s.size(), f); }
+void putStr(FILE* f, std::string_view s) { putU64(f, s.size()); fwrite(s.data(), 1, s.size(), f); }
 bool getU64(FILE* f, uint64_t& v) { return fread_unlocked(&v, 8, 1, f) == 1; }
 bool getStr(FILE* f, std::string& s) {
   uint64_t n;
@@ -14049,7 +14052,7 @@ static void dictPersist(Dict& d, size_t upto, const std::string& dir) {
   ioParallel(ranges.size(), [&](size_t k) {
     std::string raw;
     for (size_t i = ranges[k].first; i < ranges[k].second; ++i) {
-      const std::string& x = d.strs[i];
+      const std::string_view x = d.strs[i];
       const uint32_t len = (uint32_t)x.size();
       raw.append((const char*)&len, 4).append(x);
     }
@@ -14116,7 +14119,13 @@ static bool readFile(const std::string& path, std::string& out) {
   bool ok = fstat(fd, &st) == 0;
   if (ok) {
     out.resize((size_t)st.st_size);
-    ok = pread(fd, out.data(), out.size(), 0) == (ssize_t)out.size();
+    size_t got = 0;  // (one read returns at most ~2 GB)
+    while (ok && got < out.size()) {
+      const ssize_t r = pread(fd, out.data() + got, out.size() - got, (off_t)got);
+      if (r < 0 && errno == EINTR) continue;
+      ok = r > 0;
+      if (ok) got += (size_t)r;
+    }
   }
   ::close(fd);
   return ok;
@@ -14132,7 +14141,10 @@ static void dictLoad(Dict& d, const std::string& dir, const std::string& name, u
     ~Close() { ::close(fd); }
   } closer{fd};
   std::string buf(bytes, '\0');
-  if (bytes < 8 || pread(fd, buf.data(), bytes, 0) != (ssize_t)bytes || memcmp(buf.data(), "WDICT001", 8) != 0)
+  size_t have = 0;  // (one read returns at most ~2 GB)
+  for (ssize_t r; have < bytes && ((r = pread(fd, buf.data() + have, bytes - have, (off_t)have)) > 0 || (r < 0 && errno == EINTR));)
+    if (r > 0) have += (size_t)r;
+  if (bytes < 8 || have != bytes || memcmp(buf.data(), "WDICT001", 8) != 0)
     throw SqlError("snapshot: dictionary file " + path + " is truncated", 1105);
   struct Fr {
     size_t off, count, raw, z;
