@@ -1,3 +1,4 @@
+#include <cuda_runtime.h>
 #include "engine.h"
 
 #include <future>

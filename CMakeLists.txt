@@ -26,7 +26,7 @@ add_custom_command(
 add_executable(warpstore
   src/server.cpp
   src/sql.cpp
-  src/engine.cu
+  src/engine.cpp
   src/storage.cu
   src/tier.cu
   src/gpuio.cu src/crc32c.cpp
