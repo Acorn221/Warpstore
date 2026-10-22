@@ -168,6 +168,28 @@ for j in model:
         setm(j, f=None)
 c.eq("NULLs written into a column without them", q("SELECT COUNT(*) FROM t WHERE f IS NULL"), [(sum(1 for r in model.values() if r[4] is None),)])
 
+# the fused path's way out: an overflow and a NULL into NOT NULL are reported, nothing changes
+before = dump()
+c.raises("v + k out of range: refused", lambda: cur.execute("UPDATE t SET v = v + 9223372036854775000"), 1690)
+cur.execute("CREATE TABLE nn (a BIGINT NOT NULL, b BIGINT, SORT KEY (a))")
+cur.execute("INSERT INTO nn VALUES " + ",".join(f"({i}, {'NULL' if i % 3 == 0 else i})" for i in range(60000)))
+cur.execute("OPTIMIZE TABLE nn")
+cur.fetchall()
+c.raises("NULL copied into NOT NULL: refused", lambda: cur.execute("UPDATE nn SET a = b"), 1048)
+c.eq("nothing changed by the refused UPDATEs", (dump(), q("SELECT COUNT(*), SUM(a), COUNT(b) FROM nn")), (before, [(60000, Decimal(sum(range(60000))), 40000)]))
+cur.execute("UPDATE nn SET b = a, a = a + 1")
+c.eq("fused copy + add", q("SELECT COUNT(*), SUM(a), SUM(b) FROM nn"), [(60000, Decimal(sum(range(60000)) + 60000), Decimal(sum(range(60000))))])
+
+# a refused UPDATE (duplicate key) changes nothing: checked before any row is deleted
+cur.execute("CREATE TABLE uk (id INT PRIMARY KEY, v INT, UNIQUE KEY (v))")
+cur.execute("INSERT INTO uk VALUES " + ",".join(f"({i}, {i})" for i in range(10)))
+for sql in ["UPDATE uk SET id = 5 WHERE id IN (1, 2)", "UPDATE uk SET v = 3 WHERE id = 4", "UPDATE uk SET v = v + 1 WHERE id < 5"]:
+    c.raises(f"duplicate key refused: {sql}", lambda: cur.execute(sql), 1062)
+    c.eq(f"nothing changed: {sql}", q("SELECT COUNT(*), SUM(id), SUM(v) FROM uk"), [(10, Decimal(45), Decimal(45))])
+cur.execute("UPDATE uk SET id = id + 100")
+cur.execute("UPDATE uk SET v = NULL WHERE id < 103")
+c.eq("key shift and NULLs in a UNIQUE column", q("SELECT COUNT(*), SUM(id), SUM(v), COUNT(v) FROM uk"), [(10, Decimal(1045), Decimal(42), 7)])
+
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
 out = {}

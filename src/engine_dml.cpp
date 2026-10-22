@@ -93,6 +93,72 @@ ResultSet Engine::modifyViaSelect(Stmt& s) {
 
 static void markDeleted(Table* t, const std::vector<Loc>& matched);
 
+// Before an UPDATE deletes anything: the new values break no PRIMARY / UNIQUE key (checked on the
+// statement's end state; MySQL checks row by row, so `SET id = id + 1` it may refuse is accepted).
+// Only keys with a SET column: the others keep their values. setI / setD: per SET column, the new
+// raw values of the matched rows, in order.
+static void checkUniqueAfterUpdate(Table& t, const std::vector<Loc>& matched, const std::vector<int>& setCols,
+                                   const std::vector<std::vector<int64_t>>& setI, const std::vector<std::vector<double>>& setD) {
+  std::vector<std::pair<std::vector<int>, const IndexMeta*>> keys;  // (columns, index; null: the primary key)
+  auto touches = [&](const std::vector<int>& cs) {
+    for (int c : cs)
+      if (std::find(setCols.begin(), setCols.end(), c) != setCols.end()) return true;
+    return false;
+  };
+  if (t.pk >= 0 && touches({t.pk})) keys.push_back({{t.pk}, nullptr});
+  for (auto& ix : t.indexes)
+    if (ix.unique && !ix.vec && touches(ix.cols)) keys.push_back({ix.cols, &ix});
+  if (keys.empty() || matched.empty()) return;
+  std::unordered_set<uint64_t> mine;  // the matched rows: their old keys are free
+  for (const Loc& l : matched) mine.insert(TxnPending::key(l));
+  auto raw = [&](size_t i, int c, int64_t& k) {  // new value of column c of matched row i (false: NULL)
+    const size_t j = std::find(setCols.begin(), setCols.end(), c) - setCols.begin();
+    if (j == setCols.size()) return t.rawKey(matched[i], c, k);
+    if (t.cols[c].pt == PType::F64) {
+      double d = setD[j][i];
+      if (d != d) return false;
+      if (d == 0) d = 0;
+      memcpy(&k, &d, 8);
+      return true;
+    }
+    k = setI[j][i];
+    return k != (t.cols[c].pt == PType::I32 ? (int64_t)kNullI32 : kNullI64);
+  };
+  for (auto& [cs, ix] : keys) {
+    std::set<std::vector<int64_t>> seen;
+    std::vector<int64_t> tup(cs.size());
+    for (size_t i = 0; i < matched.size(); ++i) {
+      bool null = false;
+      for (size_t q = 0; q < cs.size() && !null; ++q) null = !raw(i, cs[q], tup[q]);
+      if (null) continue;  // (NULLs never collide; a NULL primary key is refused when it is written)
+      const std::string what = ix ? "Duplicate entry for key '" + ix->name + "'" : "Duplicate entry '" + std::to_string(tup[0]) + "' for key 'PRIMARY'";
+      if (!seen.insert(tup).second) throw SqlError(what, 1062);
+      if (!ix) {
+        int64_t key = tup[0];
+        if (t.cols[t.pk].pt == PType::F64) {  // (the primary-key index holds a DOUBLE key as an integer)
+          double d;
+          memcpy(&d, &tup[0], 8);
+          key = (int64_t)d;
+        }
+        auto it = t.pkIndex.find(key);
+        if (it != t.pkIndex.end() && !mine.count(TxnPending::key(it->second))) throw SqlError(what, 1062);
+        continue;
+      }
+      auto it = ix->map.find(tup[0]);
+      if (it == ix->map.end()) continue;
+      for (const Loc& l : it->second) {
+        if (mine.count(TxnPending::key(l))) continue;
+        bool same = true;
+        for (size_t q = 0; q < cs.size() && same; ++q) {
+          int64_t a;
+          same = t.rawKey(l, cs[q], a) && a == tup[q];
+        }
+        if (same) throw SqlError(what, 1062);
+      }
+    }
+  }
+}
+
 // UPDATE outside a transaction, without VECTOR columns: each new row starts as the old row's stored
 // cells (strings stay codes); Values are made only for the columns the SET expressions read, and
 // only the SET columns are converted back. Matched locations stay valid while the new rows are
@@ -137,13 +203,14 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   // column, a copy of the column with the new values written in; installed at the end.
   std::vector<int32_t> slotOf(t.segs.size(), -1), psegs;
   std::vector<Table::ColPatch> pdata;
+  std::vector<Loc> movedRows;  // deleted and re-inserted (after all the new values are known)
+  const std::vector<Loc>* moved = &matched;
   if (colMode) {
-    std::vector<Loc> moved;
+    moved = &movedRows;
     for (const Loc& l : matched) {
-      if (!inPlace(l)) moved.push_back(l);
+      if (!inPlace(l)) movedRows.push_back(l);
       else if (slotOf[l.seg] < 0) slotOf[l.seg] = (int32_t)psegs.size(), psegs.push_back(l.seg);
     }
-    markDeleted(&t, moved);
     pdata.resize(psegs.size());
     for (auto& p : pdata) p.cols.resize(setCols.size()), p.vals.resize(setCols.size());
     for (int32_t si : psegs)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
@@ -154,10 +221,8 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       pdata[s].vals[k].resize((size_t)cnt[psegs[s]] * t.colBytes(setCols[k]));
       if (k == 0) pdata[s].rows.resize((size_t)cnt[psegs[s]]);
     }, true);
-  } else {
-    markDeleted(&t, matched);
   }
-  if (tr) fprintf(stderr, "[trace] update: markDeleted / column copies %.1f ms\n", msSince(ph));
+  if (tr) fprintf(stderr, "[trace] update: column copies %.1f ms\n", msSince(ph));
   t.deferFlush = true;
   struct Flush {
     Table& t;
@@ -181,6 +246,135 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   std::vector<size_t> cursor(psegs.size(), 0);  // per segment: its rows / vals written so far
   std::vector<std::vector<int64_t>> iv(nc);
   std::vector<std::vector<double>> dv(nc);
+  // Fused: every matched row is updated in place and every SET is a constant, a copy of another
+  // column, or a column +/- a constant: the new values are computed while the segments' column copies
+  // are patched, from the old values (no gather, no value arrays). Anything else (an overflow, a
+  // NULL into NOT NULL) goes the general way below.
+  bool fused = false;
+  if (colMode && !psegs.empty() && sets.size() == setCols.size()) {
+    struct Form {
+      int kind = -1;  // 0 constant, 1 copy of src, 2 src + add (ints) / addD (doubles)
+      int src = -1;
+      int64_t i0 = 0, add = 0;
+      double d0 = 0, addD = 0;
+    };
+    std::vector<Form> forms(sets.size());
+    bool ok = true;
+    for (const Loc& l : matched) ok = ok && inPlace(l);
+    std::set<int> assigned;
+    for (size_t j = 0; j < sets.size() && ok; ++j) {
+      const auto& [c, e] = sets[j];
+      const ColumnMeta& cm = t.cols[c];
+      auto colOf = [&](const ExprP& x) {
+        return x->kind == Expr::COL && x->bt == 0 && x->bc >= 0 && t.cols[x->bc].lt == cm.lt && t.cols[x->bc].pt == cm.pt &&
+                       t.cols[x->bc].scale == cm.scale && cm.lt != LType::VARCHAR ? x->bc : -1;
+      };
+      Form& f = forms[j];
+      if (e->kind == Expr::LIT && !e->lit.isNull() && (cm.lt != LType::VARCHAR || e->lit.kind == Value::STR)) {
+        f.kind = 0;
+        t.rawOf(c, e->lit, f.i0, f.d0);
+      } else if (const int s2 = colOf(e); s2 >= 0) {
+        f.kind = 1, f.src = s2;
+      } else if (e->kind == Expr::BIN && (e->op == "+" || e->op == "-") && colOf(e->args[0]) >= 0 && e->args[1]->kind == Expr::LIT &&
+                 !e->args[1]->lit.isNull() && e->args[1]->lit.kind != Value::STR &&
+                 (cm.lt == LType::INT || cm.lt == LType::BIGINT || cm.lt == LType::DECIMAL || cm.lt == LType::DOUBLE)) {
+        f.kind = 2, f.src = colOf(e->args[0]);
+        const double lv = e->args[1]->lit.num() * (e->op == "-" ? -1 : 1);
+        if (cm.pt == PType::F64) {
+          f.addD = lv;
+        } else {
+          const double scaled = cm.lt == LType::DECIMAL ? lv * pow10i(cm.scale) : lv;
+          f.add = (int64_t)std::llround(scaled);
+          ok = std::fabs(scaled - (double)f.add) < 1e-9 && std::fabs(scaled) < 9e15;
+        }
+      } else {
+        ok = false;
+      }
+      if (f.src >= 0 && assigned.count(f.src)) ok = false;  // (reads a column an earlier SET assigned)
+      assigned.insert(c);
+    }
+    if (ok) {
+      struct Run {
+        uint32_t s;
+        size_t b, e, off;
+      };
+      std::vector<Run> runs;
+      for (size_t i = 0; i < matched.size(); ++i) {
+        const uint32_t sl = (uint32_t)slotOf[matched[i].seg];
+        if (!runs.empty() && runs.back().s == sl && runs.back().e == i && runs.back().e - runs.back().b < 16384) ++runs.back().e;
+        else runs.push_back({sl, i, i + 1, cursor[sl]});
+        ++cursor[sl];
+      }
+      std::atomic<bool> fail{false};
+      const size_t K = setCols.size();
+      for (int32_t si : psegs)  // (source columns loaded here: a pool task must not wait for the I/O pool)
+        for (const Form& f : forms)
+          if (f.src >= 0) t.colData(Loc{si, 0}, f.src);
+      ioParallel(runs.size() * K, [&](size_t x) {
+        const Run& ru = runs[x / K];
+        const size_t k = x % K;
+        const int c = setCols[k];
+        const ColumnMeta& cm = t.cols[c];
+        const Form& f = forms[k];
+        Table::ColPatch& p = pdata[ru.s];
+        const int32_t seg = psegs[ru.s];
+        uint8_t* col = p.cols[k].data();
+        const uint8_t* src = f.src >= 0 ? t.colData(Loc{seg, 0}, f.src).data() : nullptr;  // (old values: present, loaded above)
+        const bool notNull = cm.notNull || c == t.pk;
+        const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+        const int64_t lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
+        uint8_t* vals = p.vals[k].data() + ru.off * (size_t)t.colBytes(c);
+        for (size_t i = ru.b; i < ru.e; ++i) {
+          const int32_t r = matched[i].row;
+          if (k == 0) p.rows[ru.off + (i - ru.b)] = r;
+          if (cm.pt == PType::F64) {
+            double v = f.d0;
+            if (f.kind) {
+              memcpy(&v, src + (size_t)r * 8, 8);
+              if (v != v) {
+                if (notNull) return (void)(fail = true);
+              } else {
+                v += f.addD;
+              }
+            }
+            memcpy(col + (size_t)r * 8, &v, 8), memcpy(vals, &v, 8), vals += 8;
+            continue;
+          }
+          int64_t v = f.i0;
+          if (f.kind) {
+            if (cm.pt == PType::I64) memcpy(&v, src + (size_t)r * 8, 8);
+            else { int32_t x32; memcpy(&x32, src + (size_t)r * 4, 4); v = x32; }
+            if (v == nul) {
+              if (notNull) return (void)(fail = true);
+            } else if (f.kind == 2 && (__builtin_add_overflow(v, f.add, &v) || v < lo || v > hi)) {
+              return (void)(fail = true);  // (out of range: the general path reports it)
+            }
+          }
+          if (cm.pt == PType::I64) memcpy(col + (size_t)r * 8, &v, 8), memcpy(vals, &v, 8), vals += 8;
+          else { const int32_t x32 = (int32_t)v; memcpy(col + (size_t)r * 4, &x32, 4), memcpy(vals, &x32, 4), vals += 4; }
+        }
+      }, true);
+      if (!fail) {
+        fused = true;
+      } else {  // (back to the old columns, then the general path)
+        std::fill(cursor.begin(), cursor.end(), 0);
+        ioParallel(psegs.size() * K, [&](size_t i) {
+          const size_t s = i / K, k = i % K;
+          pdata[s].cols[k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
+        }, true);
+      }
+    }
+    if (tr && fused) fprintf(stderr, "[trace] update: fused in place, %.1f ms\n", msSince(ph));
+  }
+  // Two passes: all the new values first (an error, e.g. a NULL into NOT NULL, leaves the table as
+  // it was), then the rows deleted and the new ones written.
+  std::vector<std::vector<int64_t>> setI(setCols.size());
+  std::vector<std::vector<double>> setD(setCols.size());
+  for (int pass = fused ? 2 : 0; pass < 2; ++pass) {
+  if (pass == 1) {
+    checkUniqueAfterUpdate(t, matched, setCols, setI, setD);
+    markDeleted(&t, *moved);
+  }
   for (size_t from = 0; from < matched.size(); from += kChunk) {
     const size_t n = std::min(kChunk, matched.size() - from);
     const Loc* ls = matched.data() + from;
@@ -210,13 +404,15 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       nMoved = 0;
       for (size_t i = 0; i < n; ++i) nMoved += !inPlace(ls[i]);
     }
-    const bool sparse = copyRows || nMoved == 0;  // only the columns the SETs read are gathered
+    // first pass: the columns the SETs read; second: the rest of the moved rows (copied straight from
+    // the old rows without keys / indexes)
+    const bool sparse = pass == 0 || copyRows || nMoved == 0;
     std::vector<uint8_t> need(nc, sparse ? 0 : 1);
     if (sparse) {
       std::set<std::pair<int, int>> used;
       for (auto& [c, e] : sets) colsOf(e, used);
       for (auto& [bt, bc] : used)
-        if (bt == 0 && bc >= 0 && bc < (int)nc) need[bc] = 1;
+        if (pass == 0 && bt == 0 && bc >= 0 && bc < (int)nc) need[bc] = 1;
       for (auto& [c, e] : sets) {  // (the SET columns' value arrays)
         if (t.cols[c].pt == PType::F64) dv[c].resize(n);
         else iv[c].resize(n);
@@ -246,6 +442,13 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       }, true);
     }
     tg += msSince(ph), ph = Clock::now();
+    if (pass == 1) {  // (the values from the first pass)
+      for (size_t k = 0; k < setCols.size(); ++k) {
+        const int c = setCols[k];
+        if (t.cols[c].pt == PType::F64) dv[c].assign(setD[k].begin() + from, setD[k].begin() + from + n);
+        else iv[c].assign(setI[k].begin() + from, setI[k].begin() + from + n);
+      }
+    } else {
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
     // row order, as a replay of the statement codes them).
     // MySQL evaluates single-table SETs left to right: a SET that reads a column an earlier one assigns
@@ -423,6 +626,14 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       if (t.cols[fastC[j]].pt == PType::F64) dv[fastC[j]].swap(fd[j]);
       else iv[fastC[j]].swap(fi[j]);
     }
+    for (size_t k = 0; k < setCols.size(); ++k) {
+      const int c = setCols[k];
+      if (t.cols[c].pt == PType::F64) setD[k].insert(setD[k].end(), dv[c].begin(), dv[c].begin() + n);
+      else setI[k].insert(setI[k].end(), iv[c].begin(), iv[c].begin() + n);
+    }
+    ts += msSince(ph);
+    continue;
+    }
     ts += msSince(ph), ph = Clock::now();
     // The rows deleted above, re-inserted with their new values (iv / dv: theirs, in order).
     auto moveRest = [&](const Loc* ls, size_t n) {
@@ -511,6 +722,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     }
     moveRest(ls, n);
     ta += msSince(ph);
+  }
   }
   if (!psegs.empty()) {
     ph = Clock::now();
