@@ -253,6 +253,7 @@ void Engine::tierBalance() {
           D.heat[c] = D.heat[c] * 0.9f + (float)u;
         }
         if (evict == cold || (evict && pinned[c])) continue;
+        if (!cold && (c < D.lazy.size() && D.lazy[c])) continue;  // (GPU-only: nothing on the host yet)
         const auto& fc = cold ? D.file->cols[c] : SegFile::Col{};
         const int64_t b = cold ? (int64_t)fc.len + (fc.enc ? sg.n * (int64_t)fc.width : 0)
                                : (int64_t)D.host[c].size() + (D.enc[c] ? (int64_t)D.encHost[c].size() : 0);

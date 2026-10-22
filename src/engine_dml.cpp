@@ -203,6 +203,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   // column, a copy of the column with the new values written in; installed at the end.
   std::vector<int32_t> slotOf(t.segs.size(), -1), psegs;
   std::vector<Table::ColPatch> pdata;
+  std::vector<uint8_t> gpuOnly;  // per segment slot x SET column: the new version made on the GPU alone
   std::vector<Loc> movedRows;  // deleted and re-inserted (after all the new values are known)
   const std::vector<Loc>* moved = &matched;
   if (colMode) {
@@ -212,12 +213,18 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       else if (slotOf[l.seg] < 0) slotOf[l.seg] = (int32_t)psegs.size(), psegs.push_back(l.seg);
     }
     pdata.resize(psegs.size());
-    for (auto& p : pdata) p.cols.resize(setCols.size()), p.vals.resize(setCols.size());
-    for (int32_t si : psegs)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
-      for (int c : setCols) t.colData(Loc{si, 0}, c);
+    for (auto& p : pdata) {
+      p.cols.resize(setCols.size()), p.vals.resize(setCols.size());
+      p.dev.assign(setCols.size(), nullptr), p.dmn.assign(setCols.size(), 0), p.dmx.assign(setCols.size(), 0), p.dnul.assign(setCols.size(), 0);
+    }
+    // (GPU-only versions: no host copy at all, see Table::gpuOnlyVersion)
+    gpuOnly.assign(psegs.size() * setCols.size(), 0);
+    for (size_t i = 0; i < gpuOnly.size(); ++i) gpuOnly[i] = t.gpuOnlyVersion(psegs[i / setCols.size()], setCols[i % setCols.size()]);
+    for (size_t i = 0; i < gpuOnly.size(); ++i)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
+      if (!gpuOnly[i]) t.colData(Loc{psegs[i / setCols.size()], 0}, setCols[i % setCols.size()]);
     ioParallel(psegs.size() * setCols.size(), [&](size_t i) {
       const size_t s = i / setCols.size(), k = i % setCols.size();
-      pdata[s].cols[k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
+      if (!gpuOnly[i]) pdata[s].cols[k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
       pdata[s].vals[k].resize((size_t)cnt[psegs[s]] * t.colBytes(setCols[k]));
       if (k == 0) pdata[s].rows.resize((size_t)cnt[psegs[s]]);
     }, true);
@@ -293,6 +300,47 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       if (f.src >= 0 && assigned.count(f.src)) ok = false;  // (reads a column an earlier SET assigned)
       assigned.insert(c);
     }
+    // All on the GPU: every new version GPU-only and the columns the SETs read raw in VRAM too.
+    bool onGpu = ok;
+    for (size_t i = 0; i < gpuOnly.size() && onGpu; ++i) onGpu = gpuOnly[i];
+    for (int32_t si : psegs)
+      for (const Form& f : forms) onGpu = onGpu && (f.src < 0 || t.gpuOnlyVersion(si, f.src));
+    if (onGpu) {
+      std::vector<std::vector<int32_t>> rowsOf(psegs.size());
+      for (size_t s = 0; s < psegs.size(); ++s) rowsOf[s].reserve((size_t)cnt[psegs[s]]);
+      for (const Loc& l : matched) rowsOf[slotOf[l.seg]].push_back(l.row);
+      bool done = true;
+      for (size_t s = 0; s < psegs.size() && done; ++s)
+        for (size_t k = 0; k < setCols.size() && done; ++k) {
+          const int c = setCols[k];
+          const ColumnMeta& cm = t.cols[c];
+          const Form& f = forms[k];
+          const Segment& sg = *t.segs[psegs[s]];
+          GpuUpdate u;
+          u.kind = f.kind, u.i0 = f.i0, u.add = f.add, u.d0 = f.d0, u.addD = f.addD;
+          u.nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+          u.lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, u.hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
+          if (tStrictTypes && cm.ranged) u.lo = std::max(u.lo, cm.imin), u.hi = std::min(u.hi, cm.imax);
+          if (tStrictTypes && cm.lt == LType::DECIMAL && cm.precision > 0 && cm.precision < 19)
+            u.lo = std::max(u.lo, 1 - (int64_t)pow10i(cm.precision)), u.hi = std::min(u.hi, (int64_t)pow10i(cm.precision) - 1);
+          u.notNull = cm.notNull || c == t.pk;
+          const void* src = f.src >= 0 ? sg.cd(f.src).dev[f.src] : nullptr;
+          void* p = gpuUpdateColumn(sg.cd(c).dev[c], src, sg.n, t.colBytes(c), cm.pt == PType::F64, rowsOf[s].data(), (int64_t)rowsOf[s].size(), u);
+          if (!p) {
+            done = false;
+            break;
+          }
+          pdata[s].dev[k] = p, pdata[s].dmn[k] = u.mn, pdata[s].dmx[k] = u.mx, pdata[s].dnul[k] = u.sawNull;
+        }
+      if (done) {
+        fused = true;
+        ok = false;  // (nothing for the host path below)
+      } else {  // (a value that doesn't fit, or no VRAM: the host path, which reports it)
+        for (auto& p : pdata)
+          for (size_t k = 0; k < p.dev.size(); ++k)
+            if (p.dev[k]) vramRelease(p.dev[k], (size_t)t.segs[psegs[&p - pdata.data()]]->n * t.colBytes(setCols[k])), p.dev[k] = nullptr;
+      }
+    }
     if (ok) {
       struct Run {
         uint32_t s;
@@ -318,7 +366,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         const Form& f = forms[k];
         Table::ColPatch& p = pdata[ru.s];
         const int32_t seg = psegs[ru.s];
-        uint8_t* col = p.cols[k].data();
+        uint8_t* col = p.cols[k].empty() ? nullptr : p.cols[k].data();  // (null: a GPU-only version)
         const uint8_t* src = f.src >= 0 ? t.colData(Loc{seg, 0}, f.src).data() : nullptr;  // (old values: present, loaded above)
         const bool notNull = cm.notNull || c == t.pk;
         const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
@@ -340,7 +388,8 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
                 v += f.addD;
               }
             }
-            memcpy(col + (size_t)r * 8, &v, 8), memcpy(vals, &v, 8), vals += 8;
+            if (col) memcpy(col + (size_t)r * 8, &v, 8);
+            memcpy(vals, &v, 8), vals += 8;
             continue;
           }
           int64_t v = f.i0;
@@ -354,8 +403,14 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
             }
           }
           if (v != nul && (v < lo || v > hi)) return (void)(fail = true);
-          if (cm.pt == PType::I64) memcpy(col + (size_t)r * 8, &v, 8), memcpy(vals, &v, 8), vals += 8;
-          else { const int32_t x32 = (int32_t)v; memcpy(col + (size_t)r * 4, &x32, 4), memcpy(vals, &x32, 4), vals += 4; }
+          if (cm.pt == PType::I64) {
+            if (col) memcpy(col + (size_t)r * 8, &v, 8);
+            memcpy(vals, &v, 8), vals += 8;
+          } else {
+            const int32_t x32 = (int32_t)v;
+            if (col) memcpy(col + (size_t)r * 4, &x32, 4);
+            memcpy(vals, &x32, 4), vals += 4;
+          }
         }
       }, true);
       if (!fail) {
@@ -685,7 +740,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         const int c = setCols[k];
         const int w = t.colBytes(c);
         Table::ColPatch& p = pdata[ru.s];
-        uint8_t* col = p.cols[k].data();
+        uint8_t* col = p.cols[k].empty() ? nullptr : p.cols[k].data();  // (null: a GPU-only version)
         uint8_t* vals = p.vals[k].data() + ru.off * w;
         const bool f64 = t.cols[c].pt == PType::F64;
         for (uint32_t i = ru.b; i < ru.e; ++i, vals += w) {
@@ -693,11 +748,11 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
           if (k == 0) p.rows[ru.off + (i - ru.b)] = r;
           if (w == 4) {
             const int32_t v = (int32_t)iv[c][i];
-            memcpy(col + (size_t)r * 4, &v, 4);
+            if (col) memcpy(col + (size_t)r * 4, &v, 4);
             memcpy(vals, &v, 4);
           } else {
             const void* v = f64 ? (const void*)&dv[c][i] : (const void*)&iv[c][i];
-            memcpy(col + (size_t)r * 8, v, 8);
+            if (col) memcpy(col + (size_t)r * 8, v, 8);
             memcpy(vals, v, 8);
           }
         }

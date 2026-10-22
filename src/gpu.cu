@@ -270,6 +270,104 @@ void* gpuPatchColumn(const void* oldDev, size_t bytes, int width, const int32_t*
   return p;
 }
 
+struct UpdOut {
+  unsigned long long mnBits, mxBits;  // order-preserving keys of the min / max (see okey)
+  int bad, sawNull;
+};
+__device__ __forceinline__ unsigned long long okey(double v) {  // double -> unsigned key with the same order
+  unsigned long long b = __double_as_longlong(v);
+  return (b >> 63) ? ~b : (b | 0x8000000000000000ull);
+}
+static double unkeyHost(unsigned long long k) {
+  const unsigned long long b = (k >> 63) ? (k & 0x7fffffffffffffffull) : ~k;
+  double v;
+  memcpy(&v, &b, 8);
+  return v;
+}
+__global__ void updateColumnK(uint8_t* dst, const uint8_t* src, int w, bool f64, const int32_t* rows, int64_t m, GpuUpdate u, UpdOut* out) {
+  double lmn = INFINITY, lmx = -INFINITY;
+  bool bad = false, sawNull = false;
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < m; i += (int64_t)gridDim.x * blockDim.x) {
+    const int32_t r = rows[i];
+    if (f64) {
+      double v = u.d0;
+      if (u.kind) {
+        v = ((const double*)src)[r];
+        if (v != v) {
+          if (u.notNull) bad = true;
+          sawNull = true;
+        } else {
+          v += u.addD;
+        }
+      }
+      ((double*)dst)[r] = v;
+      if (v == v) lmn = fmin(lmn, v), lmx = fmax(lmx, v);
+      continue;
+    }
+    long long v = u.i0;
+    if (u.kind) {
+      v = w == 8 ? ((const long long*)src)[r] : (long long)((const int*)src)[r];
+      if (v == u.nul) {
+        if (u.notNull) bad = true;
+        sawNull = true;
+      } else if (u.kind == 2) {
+        const long long y = (long long)((unsigned long long)v + (unsigned long long)u.add);
+        if (((v ^ y) & ((long long)u.add ^ y)) < 0) bad = true;  // (signed overflow)
+        v = y;
+      }
+    }
+    if (v != u.nul && (v < u.lo || v > u.hi)) bad = true;
+    if (w == 8) ((long long*)dst)[r] = v;
+    else ((int*)dst)[r] = (int)v;
+    if (v != u.nul) lmn = fmin(lmn, (double)v), lmx = fmax(lmx, (double)v);
+  }
+  if (bad) atomicOr(&out->bad, 1);
+  if (sawNull) atomicOr(&out->sawNull, 1);
+  if (lmn <= lmx) {
+    atomicMin(&out->mnBits, okey(lmn));
+    atomicMax(&out->mxBits, okey(lmx));
+  }
+}
+
+void* gpuUpdateColumn(const void* old, const void* src, int64_t n, int w, bool f64, const int32_t* rows, int64_t m, GpuUpdate& u) {
+  const size_t bytes = (size_t)n * w;
+  u.bad = false;
+  if ((w != 4 && w != 8) || g_vramUsed + (int64_t)bytes > g_vramLimit) return nullptr;
+  void* p = nullptr;
+  if (cudaMalloc(&p, bytes) != cudaSuccess) {
+    cudaGetLastError();
+    return nullptr;
+  }
+  g_vramUsed += (int64_t)bytes;
+  CK(cudaMemcpyAsync(p, old, bytes, cudaMemcpyDeviceToDevice, 0));
+  UpdOut init{~0ull, 0ull, 0, 0}, res = init;
+  if (m > 0) {
+    const size_t rb = ((size_t)m * 4 + 15) / 16 * 16;  // (the result struct after the rows, aligned for its atomics)
+    uint8_t* stage = pinnedStage(rb + sizeof(UpdOut));
+    memcpy(stage, rows, (size_t)m * 4);
+    memcpy(stage + rb, &init, sizeof init);
+    uint8_t* d = (uint8_t*)tmpAlloc(rb + sizeof(UpdOut));
+    CK(cudaMemcpyAsync(d, stage, rb + sizeof(UpdOut), cudaMemcpyHostToDevice, 0));
+    CK(cudaEventRecord(tStageEv, 0));
+    UpdOut* out = (UpdOut*)(d + rb);
+    updateColumnK<<<(unsigned)gridFor(m), 256>>>((uint8_t*)p, (const uint8_t*)src, w, f64, (const int32_t*)d, m, u, out);
+    CK(cudaGetLastError());
+    CK(cudaMemcpy(&res, out, sizeof res, cudaMemcpyDeviceToHost));
+    tmpFree(d);
+  }
+  CK(cudaStreamSynchronize(0));
+  u.bad = res.bad != 0;
+  u.sawNull = res.sawNull != 0;
+  u.mn = res.mnBits == ~0ull ? INFINITY : unkeyHost(res.mnBits);
+  u.mx = res.mxBits == 0ull ? -INFINITY : unkeyHost(res.mxBits);
+  if (u.bad) {
+    cudaFree(p);
+    g_vramUsed -= (int64_t)bytes;
+    return nullptr;
+  }
+  return p;
+}
+
 static double hostIdentity(uint8_t op) { return op == AGG_MIN ? INFINITY : op == AGG_MAX ? -INFINITY : 0.0; }
 
 __global__ void initNoKeys(double* out, AggPlan plan) {

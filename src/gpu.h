@@ -25,6 +25,20 @@ void releaseColumn(void* dev, void* host, size_t bytes, bool mapped);
 // A VRAM copy of a raw column (oldDev, bytes) with rows[i] set to the width-byte value vals[i]
 // (column-level UPDATE: only the changes cross PCIe). nullptr if it doesn't fit in VRAM.
 void* gpuPatchColumn(const void* oldDev, size_t bytes, int width, const int32_t* rows, const void* vals, int64_t m);
+// Column-level UPDATE computed on the GPU: a VRAM copy of the raw column `old` (n values of width w:
+// 4 = int32, 8 = int64 or double) with rows[i] (host array, m of them) set to kind 0: the constant
+// i0 / d0; 1: src[rows[i]]; 2: src[rows[i]] + add (ints) / + addD (doubles). Integers must stay in
+// [lo, hi] and NULLs (nul / NaN) stay NULL unless notNull. Returns nullptr when a value doesn't
+// fit (*bad) or there is no VRAM; min / max of the new non-NULL values (raw units), any NULL written.
+struct GpuUpdate {
+  int kind = 0;
+  int64_t i0 = 0, add = 0, nul = 0, lo = 0, hi = 0;
+  double d0 = 0, addD = 0;
+  bool notNull = false;
+  bool bad = false, sawNull = false;
+  double mn = 0, mx = 0;
+};
+void* gpuUpdateColumn(const void* old, const void* src, int64_t n, int w, bool f64, const int32_t* rows, int64_t m, GpuUpdate& u);
 // VRAM cache moves (Engine::vramBalance): a VRAM copy of host bytes (nullptr if it doesn't fit),
 // freeing one, mapping host bytes for zero-copy reads over PCIe, unmapping them.
 void* vramAcquire(const void* host, size_t bytes);

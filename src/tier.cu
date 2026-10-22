@@ -295,6 +295,25 @@ int64_t colHostBytes(const SegData& d, int c) {
   return (int64_t)d.host[c].size() + (d.enc[c] ? (int64_t)d.encHost[c].size() : 0);
 }
 
+// Under d.loadMu: the host mirror of a GPU-only column version (or `bytes` of a GPU-built one).
+void ensureHostLocked(SegData& d, int c, uint64_t bytes) {
+  if ((size_t)c < d.lazy.size() && d.lazy[c]) bytes = d.lazy[c];
+  if (!bytes || !d.host[c].empty() || !d.dev[c] || ((size_t)c < d.enc.size() && d.enc[c]) || segCold(d, c)) return;
+  std::vector<uint8_t> h(bytes);
+  d2h(h.data(), d.dev[c], bytes);
+  d.host[c] = std::move(h);
+  if ((size_t)c < d.lazy.size()) d.lazy[c] = 0;
+  d.hostBytes += (int64_t)bytes;
+  g_hostBytes += (int64_t)bytes;
+}
+
+// The bytes a column's device copy holds (its host mirror, or the GPU-only version's size).
+size_t placedBytes(const SegData& d, size_t c) {
+  const bool e = c < d.enc.size() && d.enc[c];
+  const size_t h = e ? d.encHost[c].size() : c < d.host.size() ? d.host[c].size() : 0;
+  return h ? h : c < d.lazy.size() ? (size_t)d.lazy[c] : 0;
+}
+
 // Under d.loadMu, column cold: brings back an eviction whose frees are still deferred.
 bool revive(SegData& d, int c) {
   if (!d.evicted[c].first) return false;
@@ -390,7 +409,7 @@ SegData::~SegData() {
   for (size_t c = 0; c < dev.size(); ++c) {
     const bool e = c < enc.size() && enc[c];
     const std::vector<uint8_t>* src = e ? &encHost[c] : c < host.size() ? &host[c] : nullptr;
-    releaseColumn(dev[c], src ? (void*)src->data() : nullptr, src ? src->size() : 0, c < mapped.size() && mapped[c]);
+    releaseColumn(dev[c], src ? (void*)src->data() : nullptr, placedBytes(*this, c), c < mapped.size() && mapped[c]);
   }
   g_hostBytes -= hostBytes;
 }
@@ -417,6 +436,7 @@ std::shared_ptr<SegFile> segFileEnsure(SegData& d, int64_t n, int rawCol) {
   std::lock_guard<std::mutex> g(d.loadMu);
   if (d.file) return d.file;
   const size_t nc = d.dev.size();
+  for (size_t c = 0; c < nc; ++c) ensureHostLocked(d, (int)c, 0);  // (GPU-only versions: their bytes first)
   auto f = std::make_shared<SegFile>();
   f->id = g_nextId++;
   f->rows = n;
@@ -1072,7 +1092,10 @@ bool scanWindowFull() {
 }
 
 const uint8_t* segRawColumn(const SegData& d, int c, std::vector<uint8_t>& tmp) {
-  if (!segCold(d, c)) return d.host[c].data();
+  if (!segCold(d, c)) {
+    segEnsureHost(const_cast<SegData&>(d), c);
+    return d.host[c].data();
+  }
   const auto& col = d.file->cols[c];
   std::vector<uint8_t> stored(col.len);
   readCol(*d.file, c, stored.data());
@@ -1141,6 +1164,7 @@ void segRawCells(std::vector<CellRead>& reqs) {
 
 long long segRawInt(SegData& d, int c, int64_t r, bool i64) {
   if (!segCold(d, c)) {
+    segEnsureHost(d, c);
     const uint8_t* h = d.host[c].data();
     return i64 ? (long long)((const int64_t*)h)[r] : (long long)((const int32_t*)h)[r];
   }
@@ -1181,12 +1205,20 @@ void segEvictFinish(SegData& d, int c, uint32_t gen) {
   g_pending -= b;
 }
 
+void segEnsureHost(SegData& d, int c, uint64_t bytes) {
+  if (!bytes && ((size_t)c >= d.lazy.size() || !__atomic_load_n(&d.lazy[c], __ATOMIC_ACQUIRE))) return;
+  std::lock_guard<std::mutex> g(d.loadMu);
+  ensureHostLocked(d, c, bytes);
+}
+
 void segDropColumn(SegData& d, int c) {
   std::lock_guard<std::mutex> g(d.loadMu);
   if ((size_t)c >= d.cold.size() || d.cold[c]) return;  // only in the file (a pending eviction frees itself)
   std::vector<uint8_t>& placed = d.enc[c] ? d.encHost[c] : d.host[c];
-  if (d.dev[c]) releaseColumn(d.dev[c], placed.data(), placed.size(), d.mapped[c]);
-  d.devBytes = std::max<int64_t>(0, d.devBytes - (int64_t)placed.size());
+  const size_t pb = placedBytes(d, (size_t)c);
+  if (d.dev[c]) releaseColumn(d.dev[c], placed.data(), pb, d.mapped[c]);
+  d.devBytes = std::max<int64_t>(0, d.devBytes - (int64_t)pb);
+  if ((size_t)c < d.lazy.size()) d.lazy[c] = 0;
   const int64_t b = colHostBytes(d, c);
   d.dev[c] = nullptr;
   d.mapped[c] = 0;

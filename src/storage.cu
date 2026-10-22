@@ -385,10 +385,7 @@ void Table::fillHostMirror(Segment& sg, int c) const {
   static std::mutex mu;
   std::lock_guard<std::mutex> g(mu);
   SegData& d = sg.cd(c);
-  if (!d.host[c].empty()) return;
-  std::vector<uint8_t> h((size_t)sg.n * colBytes(c));
-  d2h(h.data(), d.dev[c], h.size());
-  d.host[c] = std::move(h);
+  segEnsureHost(d, c, (uint64_t)sg.n * colBytes(c));  // (GPU-built segments, GPU-only UPDATE versions)
 }
 
 int64_t Table::liveRows() const {
@@ -1120,6 +1117,14 @@ static uint8_t encodeDecimalDoubles(const double* x, int64_t n, std::vector<uint
   return 0;
 }
 
+bool Table::encodesNewColumns() const { return g_compress == 1 || (g_compress < 0 && gpuVramFill() >= 0.6); }
+
+bool Table::gpuOnlyVersion(int32_t si, int c) const {
+  const SegData& O = segs[si]->cd(c);
+  return cols[c].pt != PType::VEC && !segCold(O, c) && (size_t)c < O.dev.size() && O.dev[c] && !O.mapped[c] && !O.enc[c] &&
+         vramHint(c) != 2 && !encodesNewColumns() && segs[si]->full();
+}
+
 uint8_t Table::encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const {
   // --compress: always; by default only once VRAM is filling up (compression costs ~10% scan speed
   // but multiplies how much fits on the GPU before segments spill to the slower host tier).
@@ -1216,6 +1221,7 @@ void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<in
     D->mx.assign(nc, -INFINITY);
     D->enc.assign(nc, 0);
     D->encHost.resize(nc);
+    D->lazy.assign(nc, 0);
   }
   std::vector<uint8_t> nul(S * K, 0);
   std::vector<int64_t> placed(S * K, 0);
@@ -1225,11 +1231,39 @@ void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<in
     SegData& D = *nd[s];
     const Segment& sg = *segs[sis[s]];
     ColPatch& p = patches[s];
+    const SegData& O = sg.cd(c);
+    if (k < p.dev.size() && p.dev[k]) {  // built on the GPU already (UPDATE's fused path)
+      const double unscale = cols[c].lt == LType::DECIMAL ? pow10i(cols[c].scale) : 1.0;
+      D.dev[c] = p.dev[k];
+      D.lazy[c] = (uint64_t)sg.n * colBytes(c);
+      D.mn[c] = std::min(p.dmn[k] / unscale, O.mn[c]);
+      D.mx[c] = std::max(p.dmx[k] / unscale, O.mx[c]);
+      nul[i] = p.dnul[k];
+      placed[i] = (int64_t)D.lazy[c];
+      return;
+    }
+    if (p.cols[k].empty() && sg.n > 0) {  // GPU-only (gpuOnlyVersion): the VRAM copy patched, the host mirror later
+      double mn, mx;
+      nul[i] = colStats(c, p.vals[k], (int64_t)p.rows.size(), mn, mx);
+      const size_t bytes = (size_t)sg.n * colBytes(c);
+      D.dev[c] = gpuPatchColumn(O.dev[c], bytes, colBytes(c), p.rows.data(), p.vals[k].data(), (int64_t)p.rows.size());
+      if (D.dev[c]) {
+        D.lazy[c] = bytes;
+        D.mn[c] = std::min(mn, O.mn[c]);
+        D.mx[c] = std::max(mx, O.mx[c]);
+        placed[i] = (int64_t)bytes;
+        return;
+      }
+      // (no VRAM for it: the host column after all, the old one with the new values written in)
+      segEnsureHost(const_cast<SegData&>(O), c);
+      p.cols[k] = O.host[c];
+      const int w = colBytes(c);
+      for (size_t j = 0; j < p.rows.size(); ++j) memcpy(p.cols[k].data() + (size_t)p.rows[j] * w, p.vals[k].data() + j * w, w);
+    }
     D.host[c] = std::move(p.cols[k]);
     D.enc[c] = encodeColumn(c, D.host[c], sg.n, D.encHost[c]);
     // The old version raw in VRAM: copied there with just the changed rows uploaded, and the segment
     // elimination range widened by the new values (exact again when the segment is rebuilt).
-    const SegData& O = sg.cd(c);
     if (!D.enc[c] && !O.enc[c] && !segCold(O, c) && O.dev[c] && !O.mapped[c] && vramHint(c) != 2) {
       double mn, mx;
       nul[i] = colStats(c, p.vals[k], (int64_t)p.rows.size(), mn, mx);

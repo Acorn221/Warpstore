@@ -673,6 +673,9 @@ void segEvictFinish(SegData& d, int c, uint32_t gen);
 // A column version no live segment uses any more (a column-level UPDATE replaced it): frees its
 // memory. Called once queries that started earlier are done (rcuDefer).
 void segDropColumn(SegData& d, int c);
+// The host mirror of column c, made from its VRAM copy if it isn't there (a GPU-only version: `lazy`,
+// or `bytes` for a GPU-built segment). No-op otherwise.
+void segEnsureHost(SegData& d, int c, uint64_t bytes = 0);
 void segAccount(SegData& d);  // counts a new segment's host bytes (after it is filled)
 void segFileSync(SegFile& f);  // fdatasync (once)
 void segDirSync();             // fsync of the segments directory (new files' entries)
@@ -702,6 +705,9 @@ struct SegData {
   std::vector<uint32_t> gen;
   std::vector<std::pair<void*, uint8_t>> evicted;
   int64_t hostBytes = 0;  // host + encHost bytes counted in tierHostBytes
+  // Per column: bytes of a host mirror not made yet (a GPU-only version from a column-level UPDATE;
+  // 0: none). segEnsureHost copies it from the VRAM copy when something on the host needs it.
+  std::vector<uint64_t> lazy;
   ~SegData();
 };
 
@@ -1179,10 +1185,19 @@ struct Table {
     std::vector<std::vector<uint8_t>> cols;  // per SET column: the new column
     std::vector<int32_t> rows;               // the rows changed
     std::vector<std::vector<uint8_t>> vals;  // per SET column: their new raw values, in rows' order
+    // per SET column, a version already built on the GPU (gpuUpdateColumn; null: none) with the
+    // min / max of its new values (raw units) and whether one is NULL
+    std::vector<void*> dev;
+    std::vector<double> dmn, dmx;
+    std::vector<uint8_t> dnul;
   };
   void replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<ColPatch>& patches);
   bool compactInstall(struct CompactJob& j);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
+  bool encodesNewColumns() const;  // encodeColumn compresses columns now (--compress, or VRAM 60% full)
+  // Column-level UPDATE: column c's new version in segment si can be made on the GPU alone (its
+  // current version raw in VRAM; the host mirror then made when needed, see SegData::lazy).
+  bool gpuOnlyVersion(int32_t si, int c) const;
   bool colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mn, double& mx) const;
   // Strict mode (tStrictTypes): throw when a stored integer / DECIMAL or a string doesn't fit column c.
   void checkFits(int c, int64_t raw) const;
