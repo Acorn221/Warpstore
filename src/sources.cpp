@@ -15,9 +15,11 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 
 #include "common.h"
+#include "storage.h"  // ioParallel
 
 namespace gdb {
 
@@ -120,12 +122,11 @@ std::string jsonField(const std::string& json, const std::string& key) {
   return it == o.end() || it->second.second ? "" : it->second.first;
 }
 
-std::string jsonLinesToTsv(const std::string& data, const std::vector<std::string>& cols) {
-  std::string out;
-  size_t a = 0;
-  while (a < data.size()) {
+// Lines [a, stop) of data, converted (see jsonLinesToTsv).
+static void jsonLinesRange(const std::string& data, size_t a, size_t stop, const std::vector<std::string>& cols, std::string& out) {
+  while (a < stop) {
     size_t b = data.find('\n', a);
-    if (b == std::string::npos) b = data.size();
+    if (b == std::string::npos || b > stop) b = stop;
     std::string line = data.substr(a, b - a);
     a = b + 1;
     if (line.find_first_not_of(" \t\r") == std::string::npos) continue;
@@ -164,6 +165,35 @@ std::string jsonLinesToTsv(const std::string& data, const std::vector<std::strin
     }
     out += '\n';
   }
+}
+
+std::string jsonLinesToTsv(const std::string& data, const std::vector<std::string>& cols) {
+  // Pieces of whole lines, converted in parallel, then joined in order.
+  const size_t n = data.size() < (4u << 20) ? 1 : 4 * std::max(1u, std::thread::hardware_concurrency());
+  std::vector<size_t> cut{0};
+  for (size_t k = 1; k < n; ++k) {
+    size_t at = std::max(cut.back(), data.size() * k / n);
+    while (at < data.size() && at > 0 && data[at - 1] != '\n') ++at;
+    cut.push_back(at);
+  }
+  cut.push_back(data.size());
+  std::vector<std::string> parts(n);
+  std::vector<std::exception_ptr> errs(n);
+  ioParallel(n, [&](size_t k) {
+    try {
+      jsonLinesRange(data, cut[k], cut[k + 1], cols, parts[k]);
+    } catch (...) {
+      errs[k] = std::current_exception();
+    }
+  });
+  for (auto& e : errs)
+    if (e) std::rethrow_exception(e);
+  if (n == 1) return std::move(parts[0]);
+  size_t total = 0;
+  for (auto& p : parts) total += p.size();
+  std::string out;
+  out.reserve(total);
+  for (auto& p : parts) out += p;
   return out;
 }
 
