@@ -962,7 +962,7 @@ struct Table {
   // columns): whole columns per partition for plain tables, row by row otherwise.
   // partOfRow: each row's partition when known (an UPDATE that keeps the shard key): no re-hashing.
   void appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n,
-                     const int32_t* partOfRow = nullptr);
+                     const int32_t* partOfRow = nullptr, bool nullsKnown = false);  // nullsKnown: hasNull already set
   // Set while a statement holds row locations across appends: full write buffers are flushed after.
   bool deferFlush = false;
   void deleteAt(Loc l);

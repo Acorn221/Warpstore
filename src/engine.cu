@@ -7658,12 +7658,25 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
       }
     }
   } failLog{s.path, copyTo, n};
+  std::vector<double> colMs(t->cols.size());
+  double cbMs = 0, appMs = 0;
   const bool direct = !vec && parquetScan(data, wanted, [&](int64_t rows, std::vector<PqChunk>& in) {
+    const auto cb0 = Clock::now();
+    struct CbTime {
+      double& acc;
+      Clock::time_point t0;
+      ~CbTime() { acc += msSince(t0); }
+    } cbTime{cbMs, cb0};
     const size_t nc = t->cols.size();
     std::vector<std::vector<int64_t>> iv(nc);
     std::vector<std::vector<double>> dv(nc);
     std::vector<std::exception_ptr> errs(nc);
     ioParallel(nc, [&](size_t c) {  // one column per task (each its own dictionary)
+      struct ColTime {  // (WARPSTORE_TRACE: per-column conversion time)
+        double& acc;
+        Clock::time_point t0 = Clock::now();
+        ~ColTime() { acc += msSince(t0); }
+      } colTime{colMs[c]};
       try {
         const ColumnMeta& cm = t->cols[c];
         const PqChunk& p = in[c];
@@ -7751,6 +7764,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
           t->rawOf((int)c, v, i0, d0);
           if (f64) dv[c][r] = d0;
           else iv[c][r] = i0;
+          if (f64 ? d0 != d0 : i0 == nul) null(r);  // (a value converted to NULL, e.g. an invalid date)
         }
       } catch (...) {
         errs[c] = std::current_exception();
@@ -7765,7 +7779,9 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
         else t->autoNext = std::max<int64_t>(t->autoNext, v + 1);
       }
     }
-    t->appendColumns(iv, dv, rows);
+    const auto ap0 = Clock::now();
+    t->appendColumns(iv, dv, rows, nullptr, true);  // (null() set hasNull while converting)
+    appMs += msSince(ap0);
     n += rows;
     checkKilled();
     lk.unlock();  // (readers get in between row groups)
@@ -7795,7 +7811,21 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     unlink(staged.c_str());
   }
   failLog.armed = false;
+  if (envSetting("TRACE")) {
+    std::vector<size_t> ord(colMs.size());
+    for (size_t c = 0; c < ord.size(); ++c) ord[c] = c;
+    std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return colMs[a] > colMs[b]; });
+    std::string top;
+    for (size_t k = 0; k < std::min<size_t>(8, ord.size()); ++k) {
+      char b[96];
+      snprintf(b, sizeof b, " %s %.0f", t->cols[ord[k]].name.c_str(), colMs[ord[k]]);
+      top += b;
+    }
+    fprintf(stderr, "[trace] parquet load%s: %.0f ms (conversion callbacks %.0f, appends %.0f); slowest columns (ms):%s\n", direct ? "" : " (text path)",
+            msSince(t0), cbMs, appMs, top.c_str());
+  }
   lk.unlock();
+  const auto cp0 = Clock::now();
   if (!copyTo.empty()) {
     const uint32_t crc = copyFile(s.path, copyTo);
     const std::string named = crcName(copyTo, crc, false);
@@ -7803,6 +7833,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     tLoadLogPath = named;
     loadedBytes_ += (int64_t)map.n;
   }
+  if (envSetting("TRACE")) fprintf(stderr, "[trace] parquet load: WAL copy %.0f ms\n", msSince(cp0));
   warmDicts(t);
   char info[128];
   snprintf(info, sizeof info, "Records: %lld  Loaded in %.1f s", (long long)n, msSince(t0) / 1000);

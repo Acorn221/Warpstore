@@ -698,20 +698,22 @@ void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
 }
 
 void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n,
-                          const int32_t* partOfRow) {
+                          const int32_t* partOfRow, bool nullsKnown) {
   const size_t nc = cols.size();
-  for (size_t c = 0; c < nc; ++c) {
+  for (size_t c = 0; c < nc; ++c)
     if (cols[c].pt == PType::VEC) throw SqlError("internal: appendColumns with a VECTOR column", 1105);
-    if (hasNull[c]) continue;
-    if (cols[c].pt == PType::F64) {
-      for (double x : dv[c])
-        if (x != x) { hasNull[c] = 1; break; }
-    } else {
-      const int64_t nul = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
-      for (int64_t x : iv[c])
-        if (x == nul) { hasNull[c] = 1; break; }
-    }
-  }
+  if (!nullsKnown)  // (the column scans on all cores; a caller that set hasNull while converting skips them)
+    ioParallel(nc, [&](size_t c) {
+      if (hasNull[c]) return;
+      if (cols[c].pt == PType::F64) {
+        for (double x : dv[c])
+          if (x != x) { hasNull[c] = 1; return; }
+      } else {
+        const int64_t nul = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
+        for (int64_t x : iv[c])
+          if (x == nul) { hasNull[c] = 1; return; }
+      }
+    }, true);
   std::vector<int64_t> ints(nc);
   std::vector<double> dbls(nc);
   auto cell = [&](size_t c, int64_t r) {
@@ -748,11 +750,26 @@ void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std
       const size_t k = std::min(list.size() - done, room);
       buf.reserveForAppend((int64_t)k);
       const uint32_t* idx = list.data() + done;
+      const bool run = k > 0 && idx[k - 1] - idx[0] == k - 1;  // consecutive rows (no shard key): no index
       ioParallel(nc, [&](size_t c) {
         std::vector<uint8_t>& dst = buf.cols[c];
         const size_t w = (size_t)psize(cols[c].pt), o = dst.size();
         dst.resize(o + k * w);
         uint8_t* d = dst.data() + o;
+        if (run) {
+          const size_t f = idx[0];
+          switch (cols[c].pt) {
+            case PType::I32: {
+              const int64_t* sp = iv[c].data() + f;
+              int32_t* dp = (int32_t*)d;
+              for (size_t j = 0; j < k; ++j) dp[j] = (int32_t)sp[j];
+              break;
+            }
+            case PType::I64: memcpy(d, iv[c].data() + f, k * 8); break;
+            default: memcpy(d, dv[c].data() + f, k * 8); break;
+          }
+          return;
+        }
         switch (cols[c].pt) {
           case PType::I32: for (size_t j = 0; j < k; ++j) ((int32_t*)d)[j] = (int32_t)iv[c][idx[j]]; break;
           case PType::I64: for (size_t j = 0; j < k; ++j) ((int64_t*)d)[j] = iv[c][idx[j]]; break;
