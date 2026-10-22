@@ -41,4 +41,18 @@ c.eq("utf-8 substring / left / right", q("SELECT SUBSTRING('привет', 1, 3)
 c.eq("utf-8 case mapping / reverse", q("SELECT UPPER('привет мир'), LOWER('ПРИВЕТ Ünïcödé'), REVERSE('añb')"), [("ПРИВЕТ МИР", "привет ünïcödé", "bña")])
 c.eq("utf-8 pad / locate / lengths", q("SELECT LPAD('ж', 4, 'аб'), LOCATE('в', 'привет'), INSTR('日本語', '語'), CHAR_LENGTH('日本語'), LENGTH('日本語')"),
      [("абаж", 4, 3, 3, 9)])
+# GROUP BY DATE_FORMAT(datetime, ..): evaluated per time bucket (here: minutes) on the GPU.
+cur.execute("CREATE DATABASE IF NOT EXISTS smoke2")
+cur.execute("CREATE TABLE smoke2.ts (id INT, t DATETIME)")
+base = datetime.datetime(2024, 3, 9, 22, 58, 0)
+tvals = [base + datetime.timedelta(seconds=37 * i) for i in range(400)]
+cur.execute("INSERT INTO smoke2.ts VALUES " + ",".join(f"({i}, '{v}')" for i, v in enumerate(tvals)) + ", (999, NULL)")
+want = {}
+for v in tvals:
+    k = v.strftime("%Y/%m/%d %H:%M")
+    want[k] = want.get(k, 0) + 1
+want = sorted(want.items()) + [(None, 1)]
+got = q("SELECT DATE_FORMAT(t, '%Y/%m/%d %H:%i') k, COUNT(*) FROM smoke2.ts GROUP BY k ORDER BY k IS NULL, k")
+c.eq("GROUP BY DATE_FORMAT", got, want)
+cur.execute("DROP DATABASE smoke2")
 c.done()

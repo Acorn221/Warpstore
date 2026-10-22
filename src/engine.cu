@@ -2849,9 +2849,88 @@ bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi);
 // hi - lo + 1 values (hi >= lo), without overflowing for ranges wider than INT64_MAX.
 static inline uint64_t span64(int64_t lo, int64_t hi) { return (uint64_t)hi - (uint64_t)lo; }
 
+// DATETIME column bt.bc used only through DATE_FORMAT(col, '<literal>'): the result depends only on
+// the time bucket of the format's finest field (second / minute / hour / day), in microseconds; 0
+// when the column is used otherwise (or the format has finer or unknown fields).
+static int64_t dateFormatBucket(const ExprP& e, int bt, int bc) {
+  if (!e) return INT64_MAX;
+  if (e->kind == Expr::COL) return e->bt == bt && e->bc == bc ? 0 : INT64_MAX;
+  if (e->kind == Expr::FUNC && e->op == "DATE_FORMAT" && e->args.size() == 2 && e->args[0]->kind == Expr::COL && e->args[0]->bt == bt &&
+      e->args[0]->bc == bc && e->args[1]->kind == Expr::LIT && e->args[1]->lit.kind == Value::STR) {
+    const std::string& f = e->args[1]->lit.s;
+    int64_t unit = 86400000000ll;
+    for (size_t i = 0; i + 1 < f.size(); ++i) {
+      if (f[i] != '%') continue;
+      const char k = f[++i];
+      if (strchr("sSTr", k)) unit = std::min<int64_t>(unit, 1000000);
+      else if (k == 'i') unit = std::min<int64_t>(unit, 60000000);
+      else if (strchr("HhIklp", k)) unit = std::min<int64_t>(unit, 3600000000ll);
+      else if (!strchr("dejDaWwmcbMYyUuVvXx%", k)) return 0;  // (%f and the rest: per value)
+    }
+    return unit;
+  }
+  int64_t u = INT64_MAX;
+  for (auto& a : e->args) {
+    const int64_t x = dateFormatBucket(a, bt, bc);
+    if (x == 0) return 0;
+    u = std::min(u, x);
+  }
+  return u;
+}
+
 void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
   const Table& t = *c.tabs[bt];
   const LType lt = t.cols[bc].lt;
+  if (lt == LType::DATETIME) {  // DATE_FORMAT(ts, ..) only: per time bucket
+    const int64_t unit = dateFormatBucket(e, bt, bc);
+    if (unit <= 1 || unit == INT64_MAX) return;
+    int64_t lo, hi;
+    if (!colRange(t, bc, lo, hi) || lo < 0 || hi / unit - lo / unit >= (1 << 20)) return;
+    const int64_t b0 = lo / unit;
+    const size_t N = (size_t)(hi / unit - b0 + 1);
+    auto colSlot = [bt = bt, bc = bc](int tt, int cc) { return tt == bt && cc == bc ? 0 : -1; };
+    std::vector<Value> res(N);
+    parallelFor(N, [&](size_t b, size_t en) {
+      PostCtx tpc;
+      std::vector<Value> trow(1);
+      tpc.row = &trow;
+      tpc.colSlot = colSlot;
+      for (size_t i = b; i < en; ++i) {
+        trow[0] = Value::Ts((b0 + (int64_t)i) * unit);
+        res[i] = evalPost(e, tpc);
+      }
+    });
+    Value nullRes;
+    {
+      PostCtx tpc;
+      std::vector<Value> trow(1, Value::Null());
+      tpc.row = &trow;
+      tpc.colSlot = colSlot;
+      nullRes = evalPost(e, tpc);
+    }
+    std::vector<double> map(N);
+    std::shared_ptr<Dict> outShared;
+    if (e->ty == LType::VARCHAR) {
+      outShared = std::make_shared<Dict>();
+      c.sharedDicts.push_back(outShared);
+      for (size_t i = 0; i < N; ++i) map[i] = res[i].isNull() ? nullv() : (double)outShared->getOrAdd(res[i].toString());
+    } else {
+      for (size_t i = 0; i < N; ++i) map[i] = res[i].isNull() ? nullv() : numOf(res[i]);
+    }
+    ExprP bucket = mkCall(FN_IDIV, {boundCol(c, bt, bc), boundLit(Value::I(unit))}, LType::BIGINT);
+    ExprP idx = boundNode(Expr::BIN, "-", {bucket, boundLit(Value::I(b0))}, LType::BIGINT);
+    ExprP gpu = boundNode(Expr::FUNC, "#MAP", {idx}, outShared ? LType::BIGINT : e->ty);
+    gpu->aux = std::make_shared<std::vector<double>>(std::move(map));
+    if (!nullRes.isNull()) {
+      ExprP whenNull = boundNode(Expr::FUNC, "ISNULL", {boundCol(c, bt, bc)}, LType::INT);
+      ExprP nullVal = outShared ? boundLit(Value::I(outShared->getOrAdd(nullRes.toString()))) : boundLit(Value::D(numOf(nullRes)));
+      gpu = boundNode(Expr::CASE, "", {whenNull, nullVal, gpu}, outShared ? LType::BIGINT : e->ty);
+    }
+    ExprP node = boundNode(Expr::FUNC, "#ENC:" + std::to_string(++encSeq), {gpu, e}, e->ty);
+    if (outShared) c.exprDict[node.get()] = outShared.get();
+    e = node;
+    return;
+  }
   if (lt != LType::INT && lt != LType::BIGINT && lt != LType::DATE) return;
   const std::string es = upper(e->str());
   for (const char* f : {"NOW(", "RAND(", "UUID(", "CURDATE(", "CURTIME(", "SYSDATE(", "CURRENT_", "UNIX_TIMESTAMP()", "UTC_"})
@@ -7795,8 +7874,21 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   ExprP having = s.having;
   if (having) { substAliases(having); bind(having, ctx); }
   std::vector<OrderItem> orderBy;
+  std::function<void(ExprP&)> substOrder = [&](ExprP& e) {  // select-list aliases inside ORDER BY expressions (not in aggregates)
+    if (e->kind == Expr::COL && e->table.empty()) {
+      for (auto& it : items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), e->name.c_str()) == 0) { e = it.e; return; }
+      return;
+    }
+    if (e->kind == Expr::FUNC && (isAggName(e->op) || isHostAggName(e->op))) return;
+    for (auto& a : e->args) substOrder(a);
+  };
   for (auto& o : s.orderBy) {
     OrderItem oi{resolveAlias(o.e), o.desc};
+    if (oi.e == o.e && !oi.e->args.empty() && !oi.e->bound) {
+      oi.e = cloneExpr(oi.e);
+      substOrder(oi.e);
+    }
     bind(oi.e, ctx);
     orderBy.push_back(oi);
   }
