@@ -367,15 +367,18 @@ void warmDicts(const std::shared_ptr<Table>& t) {
   std::thread([t] {
     lowPriority();
     try {
-      {  // string -> code indexes first (dictionaries loaded from a snapshot are indexed lazily)
+      // (the table lock only to take the dictionaries: they are safe to read and index without it, and
+      // holding it through seconds of sorting kept writers waiting)
+      std::vector<std::shared_ptr<Dict>> ds;
+      {
         std::shared_lock<FairSharedMutex> lk(t->mu);
-        for (auto& d : t->dicts)
-          if (d) d->index();
+        ds = t->dicts;
       }
+      for (auto& d : ds)  // string -> code indexes first (dictionaries loaded from a snapshot are indexed lazily)
+        if (d) d->index();
       for (int ci : {0, 1}) {  // binary collation first (no per-table collation is stored)
         tCi = ci;
-        std::shared_lock<FairSharedMutex> lk(t->mu);
-        for (auto& d : t->dicts)
+        for (auto& d : ds)
           if (d && d->strs.size() >= 50000) sortedDict(*d);
       }
       std::shared_lock<FairSharedMutex> lk(t->mu);
@@ -524,7 +527,7 @@ struct BindCtx {
   std::vector<std::shared_ptr<Table>> tabs;
   std::vector<std::string> aliases;
   std::vector<std::vector<std::string>> usingCols;  // per FROM entry: JOIN .. USING columns
-  bool rowWise = false;  // UPDATE: EMBED is evaluated for the matched rows only, not for a whole dictionary
+  bool rowWise = false;  // UPDATE SET: evaluated for the matched rows only (no per-dictionary encoding)
   bool inAgg = false;
   // Binding the select list of an unordered, LIMIT-ed plain projection: string functions are
   // evaluated per output row on the host instead of over the whole (large) dictionary.
@@ -3465,7 +3468,7 @@ void encodeIntDomain(ExprP& e, BindCtx& c, int bt, int bc) {
 
 void encodeStrings(ExprP& e, BindCtx& c) {
   if (hasAgg(e)) return;
-  if (c.rowWise && e->str().find("EMBED(") != std::string::npos) return;
+  if (c.rowWise) return;  // UPDATE .. SET: evaluated for the matched rows only (not a whole dictionary)
   std::set<std::pair<int, int>> cs;
   colsOf(e, cs);
   if (cs.size() != 1) return;  // several columns: evaluated per result row on the host
@@ -8056,7 +8059,11 @@ static void markDeleted(Table* t, const std::vector<Loc>& matched);
 // appended (full write buffers are flushed at the end).
 static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std::vector<std::pair<int, ExprP>>& sets,
                            const std::set<int>& reads) {
+  const bool tr = envSetting("TRACE") != nullptr;
+  auto ph = Clock::now();
+  double tg = 0, ts = 0, ta = 0;
   markDeleted(&t, matched);
+  if (tr) fprintf(stderr, "[trace] update: markDeleted %.1f ms\n", msSince(ph));
   t.deferFlush = true;
   struct Flush {
     Table& t;
@@ -8099,26 +8106,47 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         }
       }
     };
+    ph = Clock::now();
     if (n < 4096)  // (a few rows, e.g. by primary key: not worth a task per column)
       for (size_t c = 0; c < nc; ++c) gather(c);
     else
       ioParallel(nc, gather, true);
-    int64_t i0;
-    double d0;
-    for (size_t i = 0; i < n; ++i) {
-      for (int c : reads) cur[c] = cellValue(t, ls[i], c);
-      for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
-      for (size_t j = 0; j < sets.size(); ++j) {
-        const int c = sets[j].first;
-        Value& v = vals[j];
-        if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
-        t.rawOf(c, v, i0, d0);
-        if (t.cols[c].pt == PType::F64) dv[c][i] = d0;
-        else iv[c][i] = i0;
+    tg += msSince(ph), ph = Clock::now();
+    // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
+    // row order, as a replay of the statement codes them).
+    auto setRows = [&](size_t b, size_t e, std::vector<Value>& cur, std::vector<Value>& vals, PostCtx& pc) {
+      int64_t i0;
+      double d0;
+      for (size_t i = b; i < e; ++i) {
+        for (int c : reads) cur[c] = cellValue(t, ls[i], c);
+        for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
+        for (size_t j = 0; j < sets.size(); ++j) {
+          const int c = sets[j].first;
+          Value& v = vals[j];
+          if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+          t.rawOf(c, v, i0, d0);
+          if (t.cols[c].pt == PType::F64) dv[c][i] = d0;
+          else iv[c][i] = i0;
+        }
       }
+    };
+    bool strSet = false;
+    for (auto& [c, e] : sets) strSet = strSet || t.cols[c].lt == LType::VARCHAR;
+    if (strSet || n < 16384) {
+      setRows(0, n, cur, vals, pc);
+    } else {
+      parallelFor(n, [&](size_t b, size_t e) {
+        std::vector<Value> lcur(nc), lvals(sets.size());
+        PostCtx lpc = pc;
+        lpc.row = &lcur;
+        setRows(b, e, lcur, lvals, lpc);
+      }, 4096);
     }
+    ts += msSince(ph), ph = Clock::now();
     t.appendColumns(iv, dv, (int64_t)n);
+    ta += msSince(ph);
   }
+  if (tr) fprintf(stderr, "[trace] update: gather %.1f ms, set %.1f ms, append %.1f ms\n", tg, ts, ta);
   return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
 }
 
@@ -8180,6 +8208,7 @@ ResultSet Engine::doModify(Stmt& s) {
     }
   };
 
+  const auto modT0 = Clock::now();
   std::vector<Loc> matched;
   int64_t key;
   bool ixFound = false;
@@ -8214,14 +8243,20 @@ ResultSet Engine::doModify(Stmt& s) {
       int64_t m = gpuSelect(comp.env, (bool)s.where, wp, sg.n, sdel, idx.p);
       for (int32_t r : idx.download(m)) matched.push_back(Loc{(int32_t)si, r});
     }
-    for (int p : parts) {
+    for (int p : parts) {  // write-buffer rows: on the host, on all cores (chunks kept in row order)
       const WriteBuffer& b = *t->bufs[p];
       hostCols(bufLoc(p, 0).seg);
-      for (int64_t r = 0; r < b.n; ++r) {
-        if (b.del->test(r)) continue;
-        if (s.where && evalProg(henv, wp, r) == 0) continue;
-        matched.push_back(bufLoc(p, r));
-      }
+      const size_t nch = std::max<size_t>(1, std::min<size_t>(64, (size_t)b.n / 32768));
+      std::vector<std::vector<Loc>> part(nch);
+      parallelFor(nch, [&](size_t cb, size_t ce) {
+        for (size_t ch = cb; ch < ce; ++ch)
+          for (int64_t r = (int64_t)(b.n * ch / nch); r < (int64_t)(b.n * (ch + 1) / nch); ++r) {
+            if (b.del->test(r)) continue;
+            if (s.where && evalProg(henv, wp, r) == 0) continue;
+            part[ch].push_back(bufLoc(p, r));
+          }
+      }, 1);
+      for (auto& v : part) matched.insert(matched.end(), v.begin(), v.end());
     }
   }
 
@@ -8247,7 +8282,12 @@ ResultSet Engine::doModify(Stmt& s) {
       return true;
     };
     for (auto& [c, e] : sets) raw = raw && c != t->autoIncCol && plain(e);
-    if (raw) return updateRaw(*t, matched, sets, reads);
+    if (raw) {
+      const auto u0 = Clock::now();
+      ResultSet r = updateRaw(*t, matched, sets, reads);
+      if (envSetting("TRACE")) fprintf(stderr, "[trace] update: match %.1f ms, rewrite %.1f ms (%zu rows)\n", std::chrono::duration<double, std::milli>(u0 - modT0).count(), msSince(u0), matched.size());
+      return r;
+    }
   }
   std::vector<std::vector<Value>> newRows;
   if (s.type == Stmt::UPDATE) {
