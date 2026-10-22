@@ -7681,6 +7681,27 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
         const ColumnMeta& cm = t->cols[c];
         const PqChunk& p = in[c];
         const bool f64 = cm.pt == PType::F64;
+        {  // No NULLs and the values as they are: the decoded array becomes the column (no copy).
+          const bool exactI = p.kind == 1 && ((p.unit == 0 && (cm.lt == LType::INT || cm.lt == LType::BIGINT)) ||
+                                              (p.unit == 1 && cm.lt == LType::DATE) || (p.unit == 2 && cm.lt == LType::DATETIME) ||
+                                              (p.unit == 3 && cm.lt == LType::DECIMAL && p.scale == cm.scale));
+          const bool exactD = p.kind == 2 && cm.lt == LType::DOUBLE;
+          if ((exactI || exactD) && (int)c != t->autoIncCol && memchr(p.valid.data(), 0, (size_t)rows) == nullptr) {
+            bool fits = true;
+            if (exactI && cm.pt == PType::I32)
+              for (int64_t r = 0; r < rows && fits; ++r) fits = p.i[r] > INT32_MIN && p.i[r] <= INT32_MAX;
+            if (fits && exactD && (int64_t)p.d.size() >= rows) {
+              in[c].d.resize((size_t)rows);
+              dv[c].swap(in[c].d);
+              return;
+            }
+            if (fits && exactI && (int64_t)p.i.size() >= rows) {
+              in[c].i.resize((size_t)rows);
+              iv[c].swap(in[c].i);
+              return;
+            }
+          }
+        }
         if (f64) dv[c].resize(rows);
         else iv[c].resize(rows);
         const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
@@ -7816,7 +7837,10 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     for (size_t c = 0; c < ord.size(); ++c) ord[c] = c;
     std::sort(ord.begin(), ord.end(), [&](size_t a, size_t b) { return colMs[a] > colMs[b]; });
     std::string top;
-    for (size_t k = 0; k < std::min<size_t>(8, ord.size()); ++k) {
+    double sum = 0;
+    for (double x : colMs) sum += x;
+    top += " [all columns " + std::to_string((int)sum) + " ms]";
+    for (size_t k = 0; k < std::min<size_t>(20, ord.size()); ++k) {
       char b[96];
       snprintf(b, sizeof b, " %s %.0f", t->cols[ord[k]].name.c_str(), colMs[ord[k]]);
       top += b;
