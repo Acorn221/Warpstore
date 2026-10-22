@@ -80,6 +80,13 @@ g.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id")
 got = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in g.fetchall()]
 want = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in d.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id").fetchall()]
 INSERT_CHECK = (got, want)  # (checked with the queries below)
+# More GROUP BY keys than the GPU path takes (8): DISTINCT / GROUP BY on the host.
+MANY_KEYS = []
+for sql in ("SELECT DISTINCT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d FROM t1 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
+            "SELECT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d, m > 0, COUNT(*), SUM(c) FROM t1 "
+            "GROUP BY a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d, m > 0 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"):
+    g.execute(sql)
+    MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 
 INT_COLS = {"t1": ["a", "b", "id"], "t2": ["x", "t1_id", "id"]}
 NUM_COLS = {"t1": ["c", "m"], "t2": []}
@@ -315,6 +322,8 @@ def gen():
 
 c = Checker()
 c.eq("INSERT .. SELECT copies", *INSERT_CHECK)
+for sql, mine, theirs in MANY_KEYS:
+    c.check("many GROUP BY keys: " + sql[:60], norm_rows(mine) == norm_rows(theirs), f"{len(mine)} vs {len(theirs)} rows")
 errors = {}
 t0 = time.time()
 for i in range(N):

@@ -11032,7 +11032,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   tWantVals = typed;
   ResultSet out;
   std::unique_ptr<Stmt> pristine;
-  if (!s.groupBy.empty()) pristine = std::make_unique<Stmt>(cloneStmt(s));
+  if (!s.groupBy.empty() || s.distinct) pristine = std::make_unique<Stmt>(cloneStmt(s));
   try {
     tRawNumber = rawNumber;
     tColumnar = columnar;
@@ -11041,8 +11041,30 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     tRawNumber = tColumnar = tInsertCols = false;
   } catch (SqlError& e) {
     tWantVals = savedWant;
-    if (pristine && std::string(e.what()).find("GROUP BY on this string") != std::string::npos)
+    const std::string msg = e.what();
+    // GROUP BY the GPU can't run (a string key it can't group, more than 8 keys): on the host.
+    if (pristine && (msg.find("GROUP BY on this string") != std::string::npos || msg.find("GROUP BY expressions are supported") != std::string::npos)) {
+      if (pristine->groupBy.empty()) {  // SELECT DISTINCT ..: GROUP BY its items
+        bool star = false;
+        for (auto& it : pristine->items) star = star || it.e->kind == Expr::STAR;
+        if (star) {  // (DISTINCT *: every column of the one table)
+          if (pristine->from.size() != 1 || pristine->from[0].sub || !pristine->joinConds.empty()) throw;
+          auto t = cat_.get(pristine->from[0].name);
+          pristine->items.clear();
+          for (auto& c : t->cols) {
+            auto col = std::make_shared<Expr>();
+            col->kind = Expr::COL;
+            col->name = c.name;
+            pristine->items.push_back({col, ""});
+          }
+        }
+        for (auto& it : pristine->items)
+          if (hasAgg(it.e)) throw;
+        for (auto& it : pristine->items) pristine->groupBy.push_back(cloneExpr(it.e));
+        pristine->distinct = false;
+      }
       return hostAggregate(*pristine, q, explain, typed);
+    }
     throw;
   } catch (...) {
     tWantVals = savedWant;
