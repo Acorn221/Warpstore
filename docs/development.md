@@ -50,3 +50,18 @@ SET warpstore_join_filter_rows = 2000000;     -- tables at least this big are sc
 `python bench/qtime.py "SELECT ..." [--compare]` wraps these: min/median/p95 over N runs, the
 profile, the plan, and with `--compare` the query timed with each optimization switched off.
 `python bench/qtime.py --plancache` lists compiled plans.
+
+### CPU profiling
+
+`perf` and attaching gdb often aren't available (kernel.perf_event_paranoid, yama ptrace scope), so
+the server has its own sampler: `WARPSTORE_PROFILE=/tmp/prof.txt build/warpstore ...` samples the
+stacks of the threads using CPU (SIGPROF every ms of process CPU time) and rewrites the file every
+second. `python scripts/profsym.py /tmp/prof.txt` lists the functions with the most samples (self and
+total; `--callers FUNC`); with a build that has line tables (`cmake -B build-prof
+-DCMAKE_CXX_FLAGS=-g1 -DCMAKE_CUDA_FLAGS=-Xcompiler=-g1`) `--lines` lists the hottest source lines.
+`WARPSTORE_TRACE=1` prints per-stage timings of loads, UPDATEs, snapshots and compactions.
+
+Regression checks beyond `tests/run.py` after changes to VRAM, RCU or segment memory handling:
+`bench/tpch_full.py --sf 10 --keep <dir> --ws-args "--memory-limit 0"` (WARPSTORE_TEST_MEM=16G,
+about 10 minutes: all 22 queries must match), and ClickBench (`bench/clickbench/run.py`, then
+`verify_ties.py` for the queries that only break ties differently).

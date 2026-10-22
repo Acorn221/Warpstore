@@ -232,8 +232,12 @@ Python MySQL client):
 
 | Scale | Warpstore hot | DuckDB hot | Warpstore first run | DuckDB first run | Results |
 |---|---:|---:|---:|---:|---|
-| SF1 (6M lineitem rows) | 5.8 ms | 37 ms | 12 ms | 45 ms | 22/22 match |
-| SF10 (60M lineitem rows, in host memory) | 38-51 ms | 206-260 ms | 71-108 ms | 225-330 ms | 22/22 match |
+| SF1 (6M lineitem rows) | 5.8-6.6 ms | 37-45 ms | 12-14 ms | 45-60 ms | 22/22 match |
+| SF10 (60M lineitem rows, in host memory) | 38-51 ms | 206-321 ms | 71-108 ms | 225-482 ms | 22/22 match |
+
+(Ranges: runs on different days, some with other jobs loading the machine; both engines measured in
+the same run. The times include fetching the results through the Python client, which favours
+DuckDB on large results: Q16's 18K rows take ~23 ms in the server and ~55 ms to parse in pymysql.)
 
 At SF10 the cached table columns fill most of the 10 GB of VRAM; the joins of Q7, Q9, Q18 and Q21
 need more, so those queries first move the coldest cached columns to host memory and are retried
@@ -368,9 +372,13 @@ of the snapshotted table takes 6.4 s (13.6 s before; dictionaries are open-addre
 
 **Bulk writes** (4-column table, this machine): `INSERT .. SELECT` copies about 11M rows/s (the
 projection comes back as columns and is appended a column at a time; it used to build a row of
-values per row, at about 2M rows/s, and stopped at 20M rows); an UPDATE of 5.3M rows takes 1.9 s
-(new rows start as the old rows' stored cells, so only the SET columns are converted; it was about
-0.9M rows/s); DELETE of 5.3M rows 1.0 s.
+values per row, at about 2M rows/s, and stopped at 20M rows); DELETE of 5.3M rows 1.0 s. **UPDATE** rewrites only
+the SET columns of the segments it touches (rows keep their places: no dead rows, re-inserts or
+compaction afterwards, keys and indexes untouched), and when the old column is raw in VRAM the new
+one is computed on the GPU (constant, column copy, column +/- constant) with its host copy made only
+when needed: on TPC-H SF1 lineitem an UPDATE of 1.1M rows (`l_discount + 0.01`) takes ~31 ms (DuckDB
+~29 ms) and of 2M rows x 2 columns ~40 ms (DuckDB ~57 ms); small UPDATEs still move their rows
+(~0.3 ms for one row).
 
 **Concurrent analytics** (ClickBench 10M rows, clients each running random queries of the 43, hot):
 1 client 250 q/s; 4, 8 and 16 clients about 340 q/s with no errors. Before, concurrent queries
