@@ -10250,7 +10250,8 @@ bool fromHasColumn(Catalog& cat, const Stmt& s, const std::string& col) {
 }
 bool fromHasAlias(const Stmt& s, const std::string& a) {
   for (auto& f : s.from)
-    if (strcasecmp(f.alias.c_str(), a.c_str()) == 0 || strcasecmp(f.name.c_str(), a.c_str()) == 0) return true;
+    if (strcasecmp(f.alias.c_str(), a.c_str()) == 0 || (f.alias.empty() && strcasecmp(f.name.c_str(), a.c_str()) == 0))
+      return true;  // (an aliased table is only visible by its alias)
   return false;
 }
 }  // namespace
@@ -10320,8 +10321,17 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
       rest.push_back(c);
     }
     if (!outerCol) return false;
-    ExprP w;
-    for (auto& r : rest) w = w ? mkBin("AND", w, r) : r;
+    // NULLs never satisfy the equality: inner NULLs are dropped and a NULL outer value gives false
+    // (not NULL, which NOT EXISTS would keep as NULL).
+    auto notNull = [](ExprP x) {
+      auto n = std::make_shared<Expr>();
+      n->kind = Expr::FUNC;
+      n->op = "ISNOTNULL";
+      n->args = {x};
+      return n;
+    };
+    ExprP w = notNull(cloneExpr(innerCol));
+    for (auto& r : rest) w = mkBin("AND", w, r);
     sub.where = w;
     sub.items = {SelectItem{innerCol, ""}};
     sub.orderBy.clear();
@@ -10331,7 +10341,7 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     in->kind = Expr::INLIST;
     in->args = {cloneExpr(outerCol)};
     in->sub = std::make_shared<Stmt>(std::move(sub));
-    e = in;
+    e = mkBin("AND", notNull(cloneExpr(outerCol)), in);
     return true;
   };
   // Any other correlated scalar subquery: evaluate it once per distinct combination of the outer
@@ -10355,6 +10365,25 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     for (auto& c : outerCols) dq.items.push_back(SelectItem{cloneExpr(c), ""});
     dq.distinct = true;
     dq.where.reset();
+    if (s.from.size() == 1) {  // one outer table: only the outer values its other filters let through
+      std::function<bool(const ExprP&)> hasSub = [&](const ExprP& x) {
+        if (!x) return false;
+        if (x->sub) return true;
+        for (auto& a : x->args)
+          if (hasSub(a)) return true;
+        return false;
+      };
+      std::function<void(const ExprP&)> keep = [&](const ExprP& x) {
+        if (!x) return;
+        if (x->kind == Expr::BIN && x->op == "AND") {
+          keep(x->args[0]);
+          keep(x->args[1]);
+        } else if (!hasSub(x)) {
+          dq.where = dq.where ? mkBin("AND", dq.where, cloneExpr(x)) : cloneExpr(x);
+        }
+      };
+      keep(s.where);
+    }
     dq.having.reset();
     dq.groupBy.clear();
     dq.orderBy.clear();
@@ -10400,12 +10429,62 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     ref.name = tmp;
     ref.alias = alias;
     ref.join = 1;
+    // NULL outer values never match "=": with one outer column, its result is picked by IF(col IS
+    // NULL, ..); with more, the columns holding NULLs are joined NULL-safely.
+    auto isNull = [](ExprP x) {
+      auto n = std::make_shared<Expr>();
+      n->kind = Expr::FUNC;
+      n->op = "ISNULL";
+      n->args = {x};
+      return n;
+    };
+    std::vector<bool> nullKey(outerCols.size());
+    std::optional<Value> nullVal;
+    for (auto& row : tab.vals)
+      for (size_t k = 0; k < outerCols.size(); ++k)
+        if (row[k].isNull()) {
+          nullKey[k] = true;
+          if (outerCols.size() == 1) nullVal = row.back();
+        }
     for (size_t k = 0; k < outerCols.size(); ++k) {
-      ExprP eq = mkBin("=", mkCol(alias, "__o" + std::to_string(k)), cloneExpr(outerCols[k]));
+      ExprP l = mkCol(alias, "__o" + std::to_string(k)), r = cloneExpr(outerCols[k]);
+      ExprP eq = mkBin("=", l, r);
+      if (nullKey[k] && outerCols.size() > 1) {
+        auto co = std::make_shared<Expr>();
+        co->kind = Expr::FUNC;
+        co->op = "COALESCE";
+        co->args = {eq, mkBin("AND", isNull(cloneExpr(l)), isNull(cloneExpr(r)))};
+        eq = co;
+      }
       ref.on = ref.on ? mkBin("AND", ref.on, eq) : eq;
     }
     s.from.push_back(ref);
     e = mkCol(alias, "__v");
+    if (nullVal && !nullVal->isNull()) {
+      auto f = std::make_shared<Expr>();
+      f->kind = Expr::FUNC;
+      f->op = "IF";
+      f->args = {isNull(cloneExpr(outerCols[0])), mkLit(*nullVal), e};
+      e = f;
+    }
+  };
+  // Any other correlated EXISTS: (SELECT 1 .. LIMIT 1) IS NOT NULL, evaluated per outer value.
+  auto existsPerOuterValue = [&](ExprP& e) {
+    Stmt sub = cloneStmt(*e->sub);
+    sub.items = {SelectItem{mkLit(Value::I(1)), ""}};
+    sub.orderBy.clear();
+    sub.limit = 1;
+    sub.offset = 0;
+    auto sq = std::make_shared<Expr>();
+    sq->kind = Expr::SUBQUERY;
+    sq->sub = std::make_shared<Stmt>(std::move(sub));
+    ExprP v = sq;
+    applyPerOuterValue(v);
+    auto nn = std::make_shared<Expr>();
+    nn->kind = Expr::FUNC;
+    nn->op = "ISNOTNULL";
+    nn->args = {v};
+    e = nn;
   };
   std::function<void(ExprP&)> fix = [&](ExprP& e) {
     if (!e) return;
@@ -10513,7 +10592,10 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     if (e->kind == Expr::FUNC && e->op == "EXISTS") {
       Stmt sub = cloneStmt(*e->sub);
       if (correlated(sub)) {
-        if (!decorrelateExists(e)) {
+        if (decorrelateExists(e)) {
+          fix(e);
+          return;
+        } else {
           // EXISTS (.. WHERE <equalities with the outer query> AND inner.c <> outer.d AND <local filters>)
           //   = COUNT(.. equalities, filters, c IS NOT NULL) - COUNT(.. equalities, filters, c = d) > 0
           // (both equality-correlated counts, decorrelated into grouped LEFT JOINs).
@@ -10542,7 +10624,10 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
               keep.push_back(c);
             }
           }
-          if (!ok || !neq) throw SqlError("this correlated EXISTS subquery is not supported", 1235);
+          if (!ok || !neq) {
+            existsPerOuterValue(e);
+            return;
+          }
           // EXISTS (.. inner.c <> outer.d ..) <=> MIN(c) <> d OR MAX(c) <> d over the rows matching the
           // equalities and filters (if any c differs from d, the smallest or the largest does): one
           // grouped derived table on the equality keys, LEFT JOINed, instead of a correlated scan.
@@ -10559,7 +10644,10 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
               local.push_back(k);
             }
           }
-          if (innerKeys.empty()) throw SqlError("this correlated EXISTS subquery is not supported (no equality with the outer query)", 1235);
+          if (innerKeys.empty()) {
+            existsPerOuterValue(e);
+            return;
+          }
           Stmt ds = cloneStmt(sub);
           ExprP w;
           for (auto& l : local) w = w ? mkBin("AND", w, cloneExpr(l)) : cloneExpr(l);
@@ -10581,7 +10669,10 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
           ds.items.push_back(SelectItem{agg("MAX"), "__mx"});
           ds.orderBy.clear();
           ds.limit = -1;
-          if (correlated(ds)) throw SqlError("this correlated EXISTS subquery is not supported", 1235);
+          if (correlated(ds)) {
+            existsPerOuterValue(e);
+            return;
+          }
           static std::atomic<int> ex{0};
           const std::string alias = "__ex" + std::to_string(++ex);
           TableRef ref;
@@ -10610,7 +10701,57 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     }
     if (e->kind == Expr::INLIST && e->sub) {
       Stmt sub = cloneStmt(*e->sub);
-      if (correlated(sub)) throw SqlError("correlated IN subqueries are not supported yet", 1235);
+      if (correlated(sub)) {
+        // x IN (SELECT c .. WHERE w) -> EXISTS (SELECT 1 .. WHERE w AND c = x); NOT IN ->
+        // NOT EXISTS (.. AND (c = x OR c IS NULL OR x IS NULL)) (true only when nothing could match).
+        bool agg = !sub.groupBy.empty() || sub.having || sub.items.size() != 1 || sub.limit >= 0 || sub.unionNext || sub.distinct;
+        for (auto& it : sub.items) agg = agg || hasAgg(it.e);
+        if (agg || e->args.size() != 1) throw SqlError("this correlated IN subquery is not supported", 1235);
+        const ExprP c = sub.items[0].e;
+        ExprP x = cloneExpr(e->args[0]);
+        std::function<void(ExprP&)> qualify = [&](ExprP& y) {  // outer columns, named by their outer table
+          if (!y) return;
+          if (y->kind == Expr::COL && y->table.empty()) {
+            for (auto& f : s.from) {
+              Stmt one;
+              one.from = {f};
+              if (!f.sub && fromHasColumn(cat_, one, y->name)) {
+                y->table = f.alias.empty() ? f.name : f.alias;
+                break;
+              }
+            }
+          }
+          for (auto& a : y->args) qualify(a);
+        };
+        qualify(x);
+        ExprP cond = mkBin("=", cloneExpr(c), cloneExpr(x));
+        if (e->neg) {
+          auto isNull = [](ExprP a) {
+            auto n = std::make_shared<Expr>();
+            n->kind = Expr::FUNC;
+            n->op = "ISNULL";
+            n->args = {a};
+            return n;
+          };
+          cond = mkBin("OR", mkBin("OR", cond, isNull(cloneExpr(c))), isNull(cloneExpr(x)));
+        }
+        sub.where = sub.where ? mkBin("AND", sub.where, cond) : cond;
+        auto ex = std::make_shared<Expr>();
+        ex->kind = Expr::FUNC;
+        ex->op = "EXISTS";
+        ex->sub = std::make_shared<Stmt>(std::move(sub));
+        ExprP r = ex;
+        if (e->neg) {
+          auto nt = std::make_shared<Expr>();
+          nt->kind = Expr::UNARY;
+          nt->op = "NOT";
+          nt->args = {ex};
+          r = nt;
+        }
+        e = r;
+        fix(e);
+        return;
+      }
       // Only the set of values matters: numbers come back as one raw array (no row objects).
       tRawNumber = true;
       ResultSet r;

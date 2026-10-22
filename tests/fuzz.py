@@ -357,6 +357,40 @@ c.eq("INSERT .. SELECT copies", *INSERT_CHECK)
 for sql, mine, theirs in MANY_KEYS:
     c.check("many GROUP BY keys: " + sql[:60], norm_rows(mine) == norm_rows(theirs),
             f"{len(mine)} vs {len(theirs)} rows; first difference: " + str([(x, y) for x, y in zip(norm_rows(mine), norm_rows(theirs)) if x != y][:2]))
+# Correlated subqueries (EXISTS / NOT EXISTS / IN / NOT IN / scalar), equality and non-equality
+# correlation, with and without an alias on the inner table.
+for i in range(max(N // 10, 10)):
+    lo = R.randint(1, 2900)
+    rng = f"t1.id BETWEEN {lo} AND {lo + R.randint(0, 60)}"
+    op = R.choice(["=", "<>", "<", ">="])
+    inner, ref = R.choice([("t2", "t2"), ("t2 z", "z")])
+    p2 = pred([("t2", "t2")]) if R.random() < 0.5 else None
+    extra = lambda x: f" AND {(x.my if hasattr(x, 'my') else x).replace('t2.', ref + '.')}" if x else ""
+    kind = R.random()
+    if kind < 0.35:
+        neg = R.choice(["", "NOT "])
+        body = f"SELECT 1 FROM {inner} WHERE {ref}.t1_id {op} t1.a"
+        my = f"SELECT t1.id FROM t1 WHERE {rng} AND {neg}EXISTS ({body}{extra(p2)})"
+        dk = f"SELECT t1.id FROM t1 WHERE {rng} AND {neg}EXISTS ({body}{extra(p2 and p2.dk)})"
+    elif kind < 0.7:
+        neg = R.choice(["", "NOT "])
+        body = f"SELECT {ref}.x FROM {inner} WHERE {ref}.t1_id {op} t1.id"
+        my = f"SELECT t1.id FROM t1 WHERE {rng} AND t1.a {neg}IN ({body}{extra(p2)})"
+        dk = f"SELECT t1.id FROM t1 WHERE {rng} AND t1.a {neg}IN ({body}{extra(p2 and p2.dk)})"
+    else:
+        fn = R.choice(["MAX", "MIN", "COUNT", "SUM"])
+        body = f"SELECT {fn}({ref}.x) FROM {inner} WHERE {ref}.t1_id {op} t1.id"
+        my = f"SELECT t1.id, ({body}{extra(p2)}) FROM t1 WHERE {rng}"
+        dk = f"SELECT t1.id, ({body}{extra(p2 and p2.dk)}) FROM t1 WHERE {rng}"
+    want = d.execute(dk).fetchall()
+    try:
+        g.execute(my)
+        got = g.fetchall()
+    except pymysql.MySQLError as e:
+        c.check(f"correlated {i}", False, f"ERROR {e.args}\n  {my}")
+        continue
+    c.check(f"correlated {i}", norm_rows(got, ordered=False) == norm_rows(want, ordered=False),
+            f"\n  {my}\n  warpstore {norm_rows(got, ordered=False)[:5]}\n  duckdb {norm_rows(want, ordered=False)[:5]}")
 errors = {}
 t0 = time.time()
 for i in range(N):
