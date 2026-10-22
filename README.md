@@ -6,14 +6,14 @@ column segments kept in GPU memory. Built in: vector search (GPU graph index), e
 full-text search, S3 / Kafka / MySQL change-data-capture ingest, replication with failover, backups
 with point-in-time restore, MVCC.
 
-### 13x faster than DuckDB, 24x faster than ClickHouse, 87x faster than SingleStore
+### 15x faster than DuckDB, 27x faster than ClickHouse, 97x faster than SingleStore
 
 | ClickBench, all 43 queries (10M rows, hot) | Total time | Warpstore is faster by |
 |---|---:|---:|
-| **Warpstore** (one RTX 3080) | **0.23 s** | — |
-| DuckDB 1.5.6 | 6.2 s | **13.5x** |
-| ClickHouse 25.8 | 9.5 s | **24x** |
-| SingleStore 9.1 | 30.1 s | **87x** |
+| **Warpstore** (one RTX 3080) | **0.18 s** | — |
+| DuckDB 1.5.6 | 6.2 s | **15x** |
+| ClickHouse 25.8 | 9.5 s | **27x** |
+| SingleStore 9.1 | 30.1 s | **97x** |
 | MySQL 8.4 (dashboard queries, 5M rows) | 1.2 to 16 s per query | **46x to 2,367x** |
 
 <sub>Same machine (Ryzen 5 5500, 12 threads, + RTX 3080), geometric mean per query, Warpstore won 42
@@ -56,9 +56,9 @@ what it is good and bad at.
 |---|---|---|
 | **MySQL / MariaDB** | You need dashboards, reports or search over your data in milliseconds instead of seconds (46x to 2,000x faster here), or vectors / embeddings / full-text in SQL. Run it as a live copy of MySQL (change data capture) and keep MySQL as the system of record. | Data much larger than RAM with random access to it, decades of tooling and operational knowledge, strict durability by default, full MySQL compatibility, no GPU in the budget. Point lookups by key are fast in both. |
 | **PostgreSQL** | The same analytics and search speed-ups, through the MySQL protocol and ORMs. | You rely on PostgreSQL's dialect or extensions (PostGIS, pgvector ecosystem, PL/pgSQL), SERIALIZABLE isolation, foreign keys, triggers. |
-| **SingleStore** | Same model (row-store write buffer, columnar segments, MySQL protocol, SHARD / SORT keys, pipelines) but open source (AGPL), no licence fees, and 87x faster on one machine here. | You need a mature distributed system: high availability across nodes, managed cloud, bottomless storage on object stores for data larger than memory, enterprise support. |
-| **ClickHouse** | You also need transactions, UPDATE / DELETE as ordinary statements, the MySQL protocol for applications and ORMs, and lower latency (24x faster here at 10M rows). | Very large data (billions of rows on disk), append-mostly logs and events, mature clustering, CPU-only servers. |
-| **DuckDB** | A server that many clients and applications share, with transactions, replication and ingest pipelines (13x faster here). | An embedded, in-process engine for notebooks and data science, files (Parquet, CSV) larger than memory, no server and no GPU. |
+| **SingleStore** | Same model (row-store write buffer, columnar segments, MySQL protocol, SHARD / SORT keys, pipelines) but open source (AGPL), no licence fees, and 97x faster on one machine here. | You need a mature distributed system: high availability across nodes, managed cloud, bottomless storage on object stores for data larger than memory, enterprise support. |
+| **ClickHouse** | You also need transactions, UPDATE / DELETE as ordinary statements, the MySQL protocol for applications and ORMs, and lower latency (27x faster here at 10M rows). | Very large data (billions of rows on disk), append-mostly logs and events, mature clustering, CPU-only servers. |
+| **DuckDB** | A server that many clients and applications share, with transactions, replication and ingest pipelines (15x faster here). | An embedded, in-process engine for notebooks and data science, files (Parquet, CSV) larger than memory, no server and no GPU. |
 
 **Durability**, for comparison: commits are acknowledged before the WAL reaches disk by default (as in
 SingleStore; a power cut can lose the last ~10 ms, a crash of the process loses nothing). Use

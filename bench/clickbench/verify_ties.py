@@ -16,7 +16,8 @@ def norm(r):
         elif isinstance(v, str): out.append(re.sub(r"[\t\n\r]", " ", v))  # the TSV export replaced these
         else: out.append(v)
     return tuple(out)
-c = pymysql.connect(host="127.0.0.1", port=3307, user="root", autocommit=True, read_timeout=300).cursor()
+import os
+c = pymysql.connect(host="127.0.0.1", port=3307, user="root", autocommit=True, read_timeout=300, database=os.environ.get("WARPSTORE_DB")).cursor()
 c.execute("SET collation_connection = utf8mb4_bin")
 d = duckdb.connect("data/clickbench/hits10m.duckdb", read_only=True)
 for i in map(int, sys.argv[2:]):

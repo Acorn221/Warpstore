@@ -15,7 +15,8 @@ def norm(rows):
         out.append(tuple(t))
     return sorted(out, key=str)
 res = {}
-g = pymysql.connect(host="127.0.0.1", port=3307, user="root", autocommit=True, read_timeout=90)
+import os
+g = pymysql.connect(host="127.0.0.1", port=3307, user="root", autocommit=True, read_timeout=90, database=os.environ.get("WARPSTORE_DB"))
 gc = g.cursor()
 gc.execute("SET collation_connection = utf8mb4_bin"); gc.execute("SET warpstore_codegen = SYNC")
 d = duckdb.connect("data/clickbench/hits10m.duckdb", read_only=True)
