@@ -343,10 +343,11 @@ int64_t Table::bufferTotal() const {
 void Table::fillHostMirror(Segment& sg, int c) const {
   static std::mutex mu;
   std::lock_guard<std::mutex> g(mu);
-  if (!sg.host[c].empty()) return;
+  SegData& d = sg.cd(c);
+  if (!d.host[c].empty()) return;
   std::vector<uint8_t> h((size_t)sg.n * colBytes(c));
-  d2h(h.data(), sg.dev[c], h.size());
-  sg.host[c] = std::move(h);
+  d2h(h.data(), d.dev[c], h.size());
+  d.host[c] = std::move(h);
 }
 
 int64_t Table::liveRows() const {
@@ -358,7 +359,7 @@ int64_t Table::liveRows() const {
 int64_t Table::vramBytes() const {
   int64_t b = 0;
   for (auto& s : segs) {
-    b += s->devBytes;
+    b += s->devBytes();
     b += (s->n + 31) / 32 * 4;
   }
   for (auto& bp : bufs) {
@@ -1053,44 +1054,112 @@ uint64_t nextSegmentId() {
   return ++ids;
 }
 
+// Segment elimination metadata of a column (DECIMAL in real units); true if it has a NULL.
+bool Table::colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mnOut, double& mxOut) const {
+  double mn = INFINITY, mx = -INFINITY;
+  bool nul = false;
+  const double unscale = cols[c].lt == LType::DECIMAL ? pow10i(cols[c].scale) : 1.0;
+  for (int64_t i = 0; i < n; ++i) {
+    double v = readNum(h, cols[c].pt, i) / unscale;
+    if (v != v) {
+      nul = true;
+      continue;
+    }
+    mn = std::min(mn, v);
+    mx = std::max(mx, v);
+  }
+  mnOut = mn;
+  mxOut = mx;
+  return nul;
+}
+
+void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<std::vector<std::vector<uint8_t>>>& data) {
+  const size_t nc = cols.size(), S = sis.size(), K = setCols.size();
+  std::vector<std::shared_ptr<SegData>> nd(S);
+  for (auto& D : nd) {
+    D = std::make_shared<SegData>();
+    D->host.resize(nc);
+    D->dev.assign(nc, nullptr);
+    D->mapped.assign(nc, 0);
+    D->uses.assign(nc, 0);
+    D->heat.assign(nc, 0.f);
+    D->mn.assign(nc, INFINITY);
+    D->mx.assign(nc, -INFINITY);
+    D->enc.assign(nc, 0);
+    D->encHost.resize(nc);
+  }
+  std::vector<uint8_t> nul(S * K, 0);
+  ioParallel(S * K, [&](size_t i) {  // stats and encoding: a task per segment and column
+    const size_t s = i / K, k = i % K;
+    const int c = setCols[k];
+    SegData& D = *nd[s];
+    D.host[c] = std::move(data[s][k]);
+    nul[i] = colStats(c, D.host[c], segs[sis[s]]->n, D.mn[c], D.mx[c]);
+    D.enc[c] = encodeColumn(c, D.host[c], segs[sis[s]]->n, D.encHost[c]);
+  }, true);
+  for (size_t i = 0; i < S * K; ++i)
+    if (nul[i]) hasNull[setCols[i % K]] = 1;
+  std::vector<std::pair<std::shared_ptr<SegData>, int>> olds;  // the versions replaced
+  for (size_t s = 0; s < S; ++s) {
+    SegData& D = *nd[s];
+    for (int c : setCols) {
+      bool m = false;
+      std::vector<uint8_t>& placed = D.enc[c] ? D.encHost[c] : D.host[c];
+      D.dev[c] = placeColumn(placed.data(), placed.size(), m, vramHint(c) == 2);
+      D.mapped[c] = m;
+      D.devBytes += (int64_t)placed.size();
+    }
+    segAccount(D);
+    const std::shared_ptr<Segment>& old = segs[sis[s]];
+    auto ns = std::make_shared<Segment>(*old);  // (shares the data, the other versions and the deleted-row bitmap)
+    ns->id = nextSegmentId();
+    ns->ov.resize(nc);
+    for (int c : setCols) {
+      olds.push_back({old->cdp(c), c});
+      ns->ov[c] = nd[s];
+    }
+    for (auto& ix : indexes)
+      if (ix.cagra) {
+        std::lock_guard<std::mutex> g(ix.cagra->mu);
+        ix.cagra->graphs.erase(old->id);
+      }
+    segs[sis[s]] = std::move(ns);
+  }
+  // Snapshots of the table taken earlier still read the old versions: freed after them.
+  rcuDefer([olds] {
+    for (auto& [d, c] : olds) segDropColumn(*d, c);
+  });
+}
+
 std::shared_ptr<Segment> Table::makeSegment(int part, size_t n, const std::function<const uint8_t*(int)>& src, const int32_t* idx) const {
   auto seg = std::make_shared<Segment>();
   seg->id = nextSegmentId();
   seg->part = part;
   seg->n = (int64_t)n;
-  seg->host.resize(cols.size());
-  seg->dev.resize(cols.size(), nullptr);
-  seg->mapped.assign(cols.size(), 0);
-  seg->uses.assign(cols.size(), 0);
-  seg->heat.assign(cols.size(), 0.f);
-  seg->mn.resize(cols.size());
-  seg->mx.resize(cols.size());
-  seg->enc.assign(cols.size(), 0);
-  seg->encHost.resize(cols.size());
+  seg->d->host.resize(cols.size());
+  seg->d->dev.resize(cols.size(), nullptr);
+  seg->d->mapped.assign(cols.size(), 0);
+  seg->d->uses.assign(cols.size(), 0);
+  seg->d->heat.assign(cols.size(), 0.f);
+  seg->d->mn.resize(cols.size());
+  seg->d->mx.resize(cols.size());
+  seg->d->enc.assign(cols.size(), 0);
+  seg->d->encHost.resize(cols.size());
   ioParallel(cols.size(), [&](size_t c) {  // gather, stats and encoding: one column per task
     int sz = colBytes((int)c);
-    auto& h = seg->host[c];
+    auto& h = seg->d->host[c];
     h.resize(n * sz);
     const uint8_t* from = src((int)c);
     for (size_t i = 0; i < n; ++i) memcpy(&h[i * sz], from + (size_t)idx[i] * sz, sz);
-    double mn = INFINITY, mx = -INFINITY;
-    const double unscale = cols[c].lt == LType::DECIMAL ? pow10i(cols[c].scale) : 1.0;
-    for (size_t i = 0; i < n; ++i) {
-      double v = readNum(h, cols[c].pt, (int64_t)i) / unscale;  // DECIMAL stats in real units
-      if (v != v) continue;  // NULL
-      mn = std::min(mn, v);
-      mx = std::max(mx, v);
-    }
-    seg->mn[c] = mn;
-    seg->mx[c] = mx;
-    seg->enc[c] = encodeColumn((int)c, h, (int64_t)n, seg->encHost[c]);
+    colStats((int)c, h, (int64_t)n, seg->d->mn[c], seg->d->mx[c]);
+    seg->d->enc[c] = encodeColumn((int)c, h, (int64_t)n, seg->d->encHost[c]);
   }, true);
   for (size_t c = 0; c < cols.size(); ++c) {
     bool m = false;
-    std::vector<uint8_t>& placed = seg->enc[c] ? seg->encHost[c] : seg->host[c];
-    seg->dev[c] = placeColumn(placed.data(), placed.size(), m, vramHint((int)c) == 2);
-    seg->mapped[c] = m;
-    seg->devBytes += (int64_t)placed.size();
+    std::vector<uint8_t>& placed = seg->d->enc[c] ? seg->d->encHost[c] : seg->d->host[c];
+    seg->d->dev[c] = placeColumn(placed.data(), placed.size(), m, vramHint((int)c) == 2);
+    seg->d->mapped[c] = m;
+    seg->d->devBytes += (int64_t)placed.size();
   }
   seg->del->host.assign((n + 31) / 32, 0);
   segAccount(*seg->d);
@@ -1111,7 +1180,7 @@ std::vector<CompactJob> Table::compactPlan() const {
     int64_t live = 0;
     for (auto& sp : segs) {
       const Segment& sg = *sp;
-      if (sg.part != p || sg.n == 0 || sg.uses.size() != sg.dev.size()) continue;
+      if (sg.part != p || sg.n == 0 || !sg.full()) continue;
       const int64_t nd = sg.ndel();
       const bool d = nd * 4 >= sg.n;
       if (!d && sg.n - nd >= small) continue;
@@ -1146,7 +1215,7 @@ void Table::compactBuild(CompactJob& j) const {
     std::vector<uint8_t> scratch;
     size_t g = 0;
     for (size_t k = 0; k < no; ++k) {
-      const uint8_t* raw = segRawColumn(*j.olds[k]->d, (int)c, scratch);  // (cold: read from its file)
+      const uint8_t* raw = segRawColumn(j.olds[k]->cd(c), (int)c, scratch);  // (cold: read from its file)
       for (; g < L && origin[g].first == (int32_t)k; ++g) memcpy(&tmp[c][g * sz], raw + (size_t)origin[g].second * sz, sz);
     }
   });
@@ -1251,7 +1320,7 @@ void Table::flushPart(int part) {
     std::shared_ptr<Segment> seg = makeSegment(part, n, [&](int c) { return buf.cols[c].data(); }, live.data() + start);
     int32_t segId = (int32_t)segs.size();
     if (pk >= 0)
-      for (size_t i = 0; i < n; ++i) pkIndex[readInt(seg->host[pk], cols[pk].pt, (int64_t)i)] = Loc{segId, (int32_t)i};
+      for (size_t i = 0; i < n; ++i) pkIndex[readInt(seg->d->host[pk], cols[pk].pt, (int64_t)i)] = Loc{segId, (int32_t)i};
     segs.push_back(std::move(seg));
     for (auto& ix : indexes)  // the rows moved from the write buffer into the new segment
       for (size_t i = 0; i < n; ++i) {

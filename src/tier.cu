@@ -803,8 +803,9 @@ void readAhead(int c) {
   int started = 0;
   for (size_t j = tAheadPos + 1; j < tAhead.size() && started < 8 && tFetchBytes < aheadBudget(); ++j) {
     const ScanAheadItem& it = tAhead[j];
-    if (!segCold(*it.d, c) || tFetches.count({it.d, c, it.lo})) continue;
-    auto file = it.d->file;
+    SegData* d = &it.seg->cd(c);
+    if (!segCold(*d, c) || tFetches.count({d, c, it.lo})) continue;
+    auto file = d->file;
     const auto& col = file->cols[c];
     if (it.lo == 0 && it.n >= file->rows && g_hostBytes + (int64_t)col.len + (col.enc ? file->rows * (int64_t)col.width : 0) <= g_memLimit)
       continue;  // (it goes into the cache when the scan gets to it)
@@ -814,7 +815,7 @@ void readAhead(int c) {
     f->len = total;
     const bool gpu = gpuPath(col, n);
     const size_t cap = pinClass(std::max<size_t>(gpu ? col.blocks[(std::min(lo + n, file->rows) - 1) / col.blockRows + 1] - col.blocks[lo / col.blockRows] : total, 1));
-    tFetches[{it.d, c, it.lo}] = f;
+    tFetches[{d, c, it.lo}] = f;
     tFetchBytes += (int64_t)cap;
     ++started;
     ioPool().submit([f, file, c, lo, n, gpu, cap] {
@@ -1169,6 +1170,22 @@ void segEvictFinish(SegData& d, int c, uint32_t gen) {
   d.hostBytes -= b;
   g_hostBytes -= b;
   g_pending -= b;
+}
+
+void segDropColumn(SegData& d, int c) {
+  std::lock_guard<std::mutex> g(d.loadMu);
+  if ((size_t)c >= d.cold.size() || d.cold[c]) return;  // only in the file (a pending eviction frees itself)
+  std::vector<uint8_t>& placed = d.enc[c] ? d.encHost[c] : d.host[c];
+  if (d.dev[c]) releaseColumn(d.dev[c], placed.data(), placed.size(), d.mapped[c]);
+  d.devBytes = std::max<int64_t>(0, d.devBytes - (int64_t)placed.size());
+  const int64_t b = colHostBytes(d, c);
+  d.dev[c] = nullptr;
+  d.mapped[c] = 0;
+  std::vector<uint8_t>().swap(d.host[c]);
+  std::vector<uint8_t>().swap(d.encHost[c]);
+  d.enc[c] = 0;
+  d.hostBytes -= b;
+  g_hostBytes -= b;
 }
 
 }  // namespace gdb

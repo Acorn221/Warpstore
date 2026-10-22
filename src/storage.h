@@ -629,8 +629,9 @@ void scanFlush();
 void releaseScanTemps();       // frees this thread's scan-only column copies (after the kernels using them)
 void releaseStatementTemps();  // ... and read-aheads not used (end of statement)
 // The segment batches the running scan visits, in order, for read-ahead (exchange: save / restore).
+struct Segment;
 struct ScanAheadItem {
-  SegData* d;
+  const Segment* seg;  // (column c's data: seg->cd(c))
   int64_t lo, n;
 };
 void scanAheadExchange(std::vector<ScanAheadItem>& items, size_t& pos);
@@ -653,6 +654,9 @@ void segRawCells(std::vector<CellRead>& reqs);  // many cells, each block read o
 // Returns the bytes evicted (0: the column was not evictable).
 int64_t segEvictBegin(SegData& d, int c, uint32_t& gen);
 void segEvictFinish(SegData& d, int c, uint32_t gen);
+// A column version no live segment uses any more (a column-level UPDATE replaced it): frees its
+// memory. Called once queries that started earlier are done (rcuDefer).
+void segDropColumn(SegData& d, int c);
 void segAccount(SegData& d);  // counts a new segment's host bytes (after it is filled)
 void segFileSync(SegFile& f);  // fdatasync (once)
 void segDirSync();             // fsync of the segments directory (new files' entries)
@@ -690,24 +694,53 @@ struct Segment {
   int part = 0;  // partition this segment belongs to
   int64_t n = 0;
   std::shared_ptr<SegData> d = std::make_shared<SegData>();
-  // (the column data, by its old names)
-  std::vector<std::vector<uint8_t>>& host = d->host;
-  std::vector<void*>& dev = d->dev;
-  std::vector<uint8_t>& mapped = d->mapped;
-  std::vector<uint32_t>& uses = d->uses;
-  std::vector<float>& heat = d->heat;
-  std::vector<uint8_t>& enc = d->enc;
-  std::vector<std::vector<uint8_t>>& encHost = d->encHost;
-  int64_t& devBytes = d->devBytes;
-  std::vector<double>& mn = d->mn;
-  std::vector<double>& mx = d->mx;
+  // Column-level UPDATE: per column, the SegData holding its current version when that is not d
+  // (empty: every column is in d). A SegData made by an UPDATE holds only the columns it changed
+  // (the others have no bytes: width 0 in its file). Like d, never changed once installed.
+  std::vector<std::shared_ptr<SegData>> ov;
+  SegData& cd(size_t c) const { return c < ov.size() && ov[c] ? *ov[c] : *d; }
+  const std::shared_ptr<SegData>& cdp(size_t c) const { return c < ov.size() && ov[c] ? ov[c] : d; }
   DelP del = std::make_shared<DelBits>();
   Segment() = default;
-  Segment(const Segment& o) : id(o.id), part(o.part), n(o.n), d(o.d), del(o.del) {}  // a snapshot: shares data and bitmap
+  Segment(const Segment& o) : id(o.id), part(o.part), n(o.n), d(o.d), ov(o.ov), del(o.del) {}  // a snapshot: shares data and bitmap
   Segment& operator=(const Segment&) = delete;
   int64_t ndel() const { return del->ndel; }
   const std::vector<uint32_t>& delHost() const { return del->host; }
   const uint32_t* delDev() { return del->device((n + 31) / 32); }
+  // d and the column-level UPDATE versions (each once)
+  template <class F> void eachData(F&& f) const {
+    f(*d);
+    for (size_t c = 0; c < ov.size(); ++c) {
+      bool seen = !ov[c];
+      for (size_t k = 0; k < c && !seen; ++k) seen = ov[k] == ov[c];
+      if (!seen) f(*ov[c]);
+    }
+  }
+  int64_t devBytes() const {
+    int64_t b = 0;
+    eachData([&](const SegData& x) { b += x.devBytes; });
+    return b;
+  }
+  bool full() const { return d->uses.size() == d->dev.size(); }
+  // Every column's device pointer / encoding: d's own vectors, or (columns with an UPDATE's
+  // version) assembled in tmp.
+  const std::vector<void*>& devs(std::vector<void*>& tmp) const {
+    if (ov.empty()) return d->dev;
+    tmp.resize(d->dev.size());
+    for (size_t c = 0; c < tmp.size(); ++c) tmp[c] = cd(c).dev[c];
+    return tmp;
+  }
+  const std::vector<uint8_t>& encs(std::vector<uint8_t>& tmp) const {
+    if (ov.empty()) return d->enc;
+    tmp.resize(d->enc.size());
+    for (size_t c = 0; c < tmp.size(); ++c) tmp[c] = cd(c).enc[c];
+    return tmp;
+  }
+  bool hasFile() const {  // some column's data is in a segment file (disk tier)
+    bool f = false;
+    eachData([&](const SegData& x) { f = f || x.file; });
+    return f;
+  }  // has the cache metadata (not a GPU-built temp table)
 };
 
 // VRAM copy of a write buffer's columns: rows [0, rows) uploaded, room for cap rows. Replaced (not
@@ -770,6 +803,12 @@ struct WriteBuffer {
 uint64_t rcuEnter();
 void rcuExit(uint64_t ticket);
 void rcuDefer(std::function<void()> fn);
+struct RcuGuard {  // (a reader outside a query's snapshot scope: compaction, snapshot writing, the tier balancer)
+  uint64_t ticket = rcuEnter();
+  RcuGuard() = default;
+  RcuGuard(const RcuGuard&) = delete;
+  ~RcuGuard() { rcuExit(ticket); }
+};
 // Runs fn(i) for i in [0, n) on the I/O thread pool and waits (fn must not throw). Urgent work goes
 // ahead of what is queued.
 void ioParallel(size_t n, const std::function<void(size_t)>& fn, bool urgent = false);
@@ -1077,9 +1116,10 @@ struct Table {
   const std::vector<uint8_t>& colData(Loc l, int c) const {
     if (l.seg < 0) return bufs[bufPart(l)]->cols[c];
     Segment& sg = *segs[l.seg];
-    if (segCold(*sg.d, c)) segLoad(*sg.d, c);
-    if (sg.host[c].empty() && sg.n > 0 && sg.dev[c] && !sg.enc[c]) fillHostMirror(sg, c);  // GPU-built temp tables
-    return sg.host[c];
+    SegData& d = sg.cd(c);
+    if (segCold(d, c)) segLoad(d, c);
+    if (d.host[c].empty() && sg.n > 0 && d.dev[c] && !d.enc[c]) fillHostMirror(sg, c);  // GPU-built temp tables
+    return d.host[c];
   }
   void fillHostMirror(Segment& sg, int c) const;
 
@@ -1112,8 +1152,13 @@ struct Table {
   // exclusive lock (false: the table changed shape meanwhile; try again later).
   std::vector<struct CompactJob> compactPlan() const;
   void compactBuild(struct CompactJob& j) const;
+  // Column-level UPDATE: in segment sis[s], column setCols[k] becomes data[s][k] (the whole raw
+  // column, moved from). Each segment is replaced by a new version (Segment::ov) sharing the rest;
+  // rows keep their places, so keys and indexes on other columns are unchanged.
+  void replaceColumns(const std::vector<int32_t>& sis, const std::vector<int>& setCols, std::vector<std::vector<std::vector<uint8_t>>>& data);
   bool compactInstall(struct CompactJob& j);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
+  bool colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mn, double& mx) const;
   // srcOf[c]: which field of each line feeds column c (-1: NULL / AUTO_INCREMENT); empty = in order.
   // yield: called every 256K rows with no row half-written (the caller may drop and retake its lock).
   // copyTo: also writes the file there, zstd-compressed (for the WAL). A load that fails keeps the

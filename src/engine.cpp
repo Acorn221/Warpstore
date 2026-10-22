@@ -186,7 +186,10 @@ void Engine::compactTables() {
         rows += j.olds[k]->n;
         for (uint32_t w : j.bits[k]) dead += __builtin_popcount(w);
       }
-      t->compactBuild(j);
+      {
+        RcuGuard rcu;  // (column versions replaced meanwhile stay readable)
+        t->compactBuild(j);
+      }
       bool ok;
       {
         std::unique_lock<FairSharedMutex> lk(t->mu);
@@ -204,11 +207,13 @@ void Engine::compactTables() {
 // are read back, hottest first (after a restart everything is cold: the cache fills up again).
 void Engine::tierBalance() {
   if (!tierEnabled()) return;
+  RcuGuard rcu;
   const int64_t limit = tierMemLimit();
   const int64_t used = tierHostBytes() - tierPendingBytes();
   struct Ent {
     std::shared_ptr<Table> t;
     std::shared_ptr<Segment> seg;
+    std::shared_ptr<SegData> d;  // the segment's data of column c
     int c;
     float heat;
     int64_t bytes;
@@ -231,18 +236,20 @@ void Engine::tierBalance() {
       if (ix.vec && ix.algo == 1) pinned[ix.cols[0]] = 1;  // CAGRA graphs refer to the column's VRAM
     for (auto& sp : t->segs) {
       Segment& sg = *sp;
-      if (sg.uses.size() != sg.dev.size() || sg.n == 0 || sg.d->cold.size() != sg.dev.size()) continue;
-      for (size_t c = 0; c < sg.dev.size(); ++c) {
-        const bool cold = segCold(*sg.d, (int)c);
+      if (!sg.full() || sg.n == 0 || sg.d->cold.size() != sg.d->dev.size()) continue;
+      for (size_t c = 0; c < sg.d->dev.size(); ++c) {
+        const std::shared_ptr<SegData>& dp = sg.cdp(c);
+        SegData& D = *dp;
+        const bool cold = segCold(D, (int)c);
         if (cold) {  // (present columns' heat is kept by vramBalance)
-          const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
-          sg.heat[c] = sg.heat[c] * 0.9f + (float)u;
+          const uint32_t u = __atomic_exchange_n(&D.uses[c], 0u, __ATOMIC_RELAXED);
+          D.heat[c] = D.heat[c] * 0.9f + (float)u;
         }
         if (evict == cold || (evict && pinned[c])) continue;
-        const auto& fc = cold ? sg.d->file->cols[c] : SegFile::Col{};
+        const auto& fc = cold ? D.file->cols[c] : SegFile::Col{};
         const int64_t b = cold ? (int64_t)fc.len + (fc.enc ? sg.n * (int64_t)fc.width : 0)
-                               : (int64_t)sg.host[c].size() + (sg.enc[c] ? (int64_t)sg.encHost[c].size() : 0);
-        ents.push_back({t, sp, (int)c, sg.heat[c], b});
+                               : (int64_t)D.host[c].size() + (D.enc[c] ? (int64_t)D.encHost[c].size() : 0);
+        ents.push_back({t, sp, dp, (int)c, D.heat[c], b});
       }
     }
   }
@@ -252,7 +259,7 @@ void Engine::tierBalance() {
     size_t k = 0;
     while (k < ents.size() && got < need) got += ents[k++].bytes;
     ents.resize(k);
-    for (auto& e : ents) segFileEnsure(*e.seg->d, e.seg->n, e.t->sortKey);  // (outside the table lock: the data is immutable)
+    for (auto& e : ents) segFileEnsure(*e.d, e.seg->n, e.t->sortKey);  // (outside the table lock: the data is immutable)
     std::map<Table*, std::vector<const Ent*>> byTable;
     for (auto& e : ents) byTable[e.t.get()].push_back(&e);
     for (auto& [tp, list] : byTable) {
@@ -264,7 +271,7 @@ void Engine::tierBalance() {
         for (auto* e : list) {
           if (!alive.count(e->seg.get())) continue;
           uint32_t gen = 0;
-          if (segEvictBegin(*e->seg->d, e->c, gen)) done.push_back({e->seg->d, e->c, gen});
+          if (segEvictBegin(*e->d, e->c, gen)) done.push_back({e->d, e->c, gen});
         }
       }
       // Queries on snapshots may still read the data: freed once those that started earlier finish.
@@ -279,7 +286,7 @@ void Engine::tierBalance() {
   int64_t room = limit == INT64_MAX ? INT64_MAX : limit / 4 * 3 - used, loaded = 0;
   for (auto& e : ents) {
     if (loaded >= (256ll << 20) || e.bytes > room - loaded) break;
-    segLoad(*e.seg->d, e.c);
+    segLoad(*e.d, e.c);
     loaded += e.bytes;
   }
 }
@@ -314,20 +321,21 @@ void Engine::vramBalance(int64_t shed) {
     std::shared_lock<FairSharedMutex> lk(t->mu);
     for (auto& sp : t->segs) {
       Segment& sg = *sp;
-      if (sg.uses.size() != sg.dev.size()) continue;  // GPU-built temp segments: not cacheable
-      for (size_t c = 0; c < sg.dev.size(); ++c) {
-        if (segCold(*sg.d, (int)c)) continue;  // (disk tier: tierBalance)
-        const std::vector<uint8_t>& h = sg.enc[c] ? sg.encHost[c] : sg.host[c];
-        if (!sg.dev[c] || h.empty()) continue;
-        const uint32_t u = __atomic_exchange_n(&sg.uses[c], 0u, __ATOMIC_RELAXED);
-        sg.heat[c] = sg.heat[c] * 0.9f + (float)u;
+      if (!sg.full()) continue;  // GPU-built temp segments: not cacheable
+      for (size_t c = 0; c < sg.d->dev.size(); ++c) {
+        SegData& D = sg.cd(c);
+        if (segCold(D, (int)c)) continue;  // (disk tier: tierBalance)
+        const std::vector<uint8_t>& h = D.enc[c] ? D.encHost[c] : D.host[c];
+        if (!D.dev[c] || h.empty()) continue;
+        const uint32_t u = __atomic_exchange_n(&D.uses[c], 0u, __ATOMIC_RELAXED);
+        D.heat[c] = D.heat[c] * 0.9f + (float)u;
         int hint = t->vramHint((int)c);
         for (auto& ix : t->indexes)  // a CAGRA graph refers to the column's VRAM: it must stay there
           if (ix.vec && ix.algo == 1 && ix.cols[0] == (int)c) hint = 1;
-        anyMapped |= sg.mapped[c] != 0;
-        neverResident |= hint == 2 && !sg.mapped[c];
-        if (!sg.mapped[c]) resident += (int64_t)h.size();
-        ents.push_back({t, &sg, (int)c, h.size(), !sg.mapped[c], hint == 1 ? 1e30f : hint == 2 ? -1.f : sg.heat[c], hint});
+        anyMapped |= D.mapped[c] != 0;
+        neverResident |= hint == 2 && !D.mapped[c];
+        if (!D.mapped[c]) resident += (int64_t)h.size();
+        ents.push_back({t, &sg, (int)c, h.size(), !D.mapped[c], hint == 1 ? 1e30f : hint == 2 ? -1.f : D.heat[c], hint});
       }
     }
   }
@@ -381,7 +389,10 @@ void Engine::vramBalance(int64_t shed) {
   };
   std::map<Table*, std::vector<Move>> moves;
   int64_t freed = 0;
-  auto hostOf = [](Segment& sg, int c) -> std::vector<uint8_t>& { return sg.enc[c] ? sg.encHost[c] : sg.host[c]; };
+  auto hostOf = [](Segment& sg, int c) -> std::vector<uint8_t>& {
+    SegData& D = sg.cd(c);
+    return D.enc[c] ? D.encHost[c] : D.host[c];
+  };
   auto alive = [](Table& t, const Segment* sg) {
     for (auto& sp : t.segs)
       if (sp.get() == sg) return true;
@@ -410,8 +421,8 @@ void Engine::vramBalance(int64_t shed) {
             if (toVram) vramRelease(m.nptr, m.e->bytes);
             continue;
           }
-          Segment& sg = *m.e->seg;
-          std::vector<uint8_t>& h = hostOf(sg, m.e->c);
+          SegData& sg = m.e->seg->cd(m.e->c);
+          std::vector<uint8_t>& h = hostOf(*m.e->seg, m.e->c);
           if ((sg.mapped[m.e->c] != 0) == !toVram) {  // already moved: undo
             if (toVram) vramRelease(m.nptr, m.e->bytes);
             else hostUnmap(h.data());
@@ -763,12 +774,13 @@ void Engine::recover() {
             const int vc = ix.cols[0];
             for (auto& sp : t->segs) {
               Segment& sg = *sp;
-              if (segCold(*sg.d, vc)) segLoad(*sg.d, vc);  // (graph columns stay in memory)
-              if (sg.n < 2048 || !sg.dev[vc] || sg.mapped[vc]) continue;
+              SegData& D = sg.cd(vc);
+              if (segCold(D, vc)) segLoad(D, vc);  // (graph columns stay in memory)
+              if (sg.n < 2048 || !D.dev[vc] || D.mapped[vc]) continue;
               std::lock_guard<std::mutex> g(ix.cagra->mu);
               if (ix.cagra->graphs.count(sg.id) || ix.cagra->failed.count(sg.id)) continue;
               std::string err;
-              auto gr = cagraBuild((const float*)sg.dev[vc], sg.n, ix.dim, ix.metric == 0, ix.graphDegree, err);
+              auto gr = cagraBuild((const float*)D.dev[vc], sg.n, ix.dim, ix.metric == 0, ix.graphDegree, err);
               if (gr) ix.cagra->graphs[sg.id] = gr;
               else ix.cagra->failed.insert(sg.id);
             }
@@ -2577,10 +2589,11 @@ ResultSet Engine::doShowMisc(Stmt& s) {
       for (size_t c = 0; c < t->cols.size(); ++c) {
         double vram = 0, host = 0, heat = 0;
         for (auto& sp : t->segs) {
-          if (c >= sp->dev.size() || !sp->dev[c] || segCold(*sp->d, (int)c)) continue;
-          const double mb = (double)(sp->enc[c] ? sp->encHost[c].size() : sp->host[c].size()) / 1048576.0;
-          (sp->mapped[c] ? host : vram) += mb;
-          if (c < sp->heat.size()) heat += sp->heat[c];
+          SegData& D = sp->cd(c);
+          if (c >= D.dev.size() || !D.dev[c] || segCold(D, (int)c)) continue;
+          const double mb = (double)(D.enc[c] ? D.encHost[c].size() : D.host[c].size()) / 1048576.0;
+          (D.mapped[c] ? host : vram) += mb;
+          if (c < D.heat.size()) heat += D.heat[c];
         }
         const int h = t->vramHint((int)c);
         auto f2 = [](double x) { char b[32]; snprintf(b, sizeof b, "%.2f", x); return std::string(b); };
@@ -3311,7 +3324,7 @@ static double dictUse(const Table& t, int c) {
       if (!del.test(r) && v[r] >= 0 && (size_t)v[r] < n) used[v[r]] = 1;
   };
   std::vector<uint8_t> tmp;
-  for (auto& sg : t.segs) mark(segRawColumn(*sg->d, c, tmp), sg->n, *sg->del);
+  for (auto& sg : t.segs) mark(segRawColumn(sg->cd(c), c, tmp), sg->n, *sg->del);
   for (auto& b : t.bufs) mark(b->cols[c].data(), b->n, *b->del);
   size_t k = 0;
   for (uint8_t u : used) k += u;
@@ -3420,13 +3433,17 @@ ResultSet Engine::doShowSegments(Stmt& s) {
     for (size_t i = 0; i < t->segs.size(); ++i) {
       auto& sg = *t->segs[i];
       if (sg.part != p) continue;
-      bool host = std::any_of(sg.mapped.begin(), sg.mapped.end(), [](uint8_t m) { return m != 0; });
-      bool disk = std::any_of(sg.d->cold.begin(), sg.d->cold.end(), [](uint8_t m) { return m != 0; });
+      bool host = false, disk = false;
+      for (size_t c = 0; c < t->cols.size(); ++c) {
+        const SegData& D = sg.cd(c);
+        host = host || (c < D.mapped.size() && D.mapped[c]);
+        disk = disk || segCold(D, (int)c);
+      }
       r.rows.push_back({std::to_string(p), std::to_string(i), disk ? "disk-columnstore" : host ? "host-columnstore (PCIe)" : "gpu-columnstore",
                         std::to_string(sg.n), std::to_string(sg.ndel()),
                         std::to_string(sg.n * rowBytes + (sg.n + 31) / 32 * 4),
-                        t->sortKey >= 0 ? fmtKey(sg.mn[t->sortKey]) : kNullCell,
-                        t->sortKey >= 0 ? fmtKey(sg.mx[t->sortKey]) : kNullCell});
+                        t->sortKey >= 0 ? fmtKey(sg.d->mn[t->sortKey]) : kNullCell,
+                        t->sortKey >= 0 ? fmtKey(sg.d->mx[t->sortKey]) : kNullCell});
     }
     const WriteBuffer& b = *t->bufs[p];
     if (b.n > 0)

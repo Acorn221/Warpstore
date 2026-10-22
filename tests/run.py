@@ -103,6 +103,7 @@ TESTS = [
     ("autosnap", "autosnap.py", None, True),
     ("crashfuzz", "crashfuzz.py", None, True),
     ("dictgc", "dictgc.py", None, True),
+    ("colupdate", "colupdate.py", None, True),
     ("compact", "compact.py", None, True),
     ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),

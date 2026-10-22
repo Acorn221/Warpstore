@@ -1521,7 +1521,7 @@ struct Compiler {
     // Codegen hint: generate the decoding branch only for columns with compressed segments (each
     // such branch makes NVRTC version the loop; many of them blow up compile time).
     for (auto& sg : tb.segs)
-      if ((int)sg->enc.size() > bc && sg->enc[bc]) { env.cols[s].enc = sg->enc[bc]; break; }
+      if (const SegData& D = sg->cd(bc); (int)D.enc.size() > bc && D.enc[bc]) { env.cols[s].enc = D.enc[bc]; break; }
     return s;
   }
   std::vector<const uint32_t*> extSets;  // bitmaps already in VRAM (join filters), by set index
@@ -3856,7 +3856,7 @@ inline bool segMayMatch(const Segment& s, const std::vector<ExprP>& preds, bool 
     std::string op;
     double v;
     if (!simplePred(p, bt, bc, op, v)) continue;
-    double mn = s.mn[bc], mx = s.mx[bc];
+    double mn = s.cd(bc).mn[bc], mx = s.cd(bc).mx[bc];
     if ((op == "=" && (v < mn || v > mx)) || (op == "<" && mn >= v) || (op == "<=" && mn > v) ||
         (op == ">" && mx <= v) || (op == ">=" && mx < v))
       return false;
@@ -4054,13 +4054,14 @@ struct BatchRef {
 
 // Column view of column c of a batch, for a slot whose type fields are already set.
 inline void bindView(ColView& v, const BatchRef& b, int c) {
-  if (b.seg && (size_t)c < b.seg->uses.size()) __atomic_fetch_add(&b.seg->uses[c], 1u, __ATOMIC_RELAXED);
+  SegData* D = b.seg ? &b.seg->cd(c) : nullptr;
+  if (D && (size_t)c < D->uses.size()) __atomic_fetch_add(&D->uses[c], 1u, __ATOMIC_RELAXED);
   v.p = (*b.dev)[c];
   v.enc = b.enc ? (*b.enc)[c] : 0;
   v.off = v.enc ? b.off : 0;
-  if (!v.p && b.seg && (size_t)c < b.seg->d->cold.size()) {  // a cold column (disk tier): read it
+  if (!v.p && D && (size_t)c < D->cold.size()) {  // a cold column (disk tier): read it
     int64_t encOff = 0;
-    v.p = segScanColumn(*b.seg->d, c, b.off, b.n, encOff);
+    v.p = segScanColumn(*D, c, b.off, b.n, encOff);
     if (v.enc) v.off = (int32_t)encOff;
   }
 }
@@ -4121,9 +4122,9 @@ inline void scanTable(Table& t, const std::vector<int>& parts, const std::vector
     for (auto& sp : t.segs) {
       if (sp->part != p || !segMayMatch(*sp, preds, !adjust.count((int32_t)(&sp - t.segs.data())))) continue;
       int64_t lo = 0, hi = sp->n;
-      if (!sortPreds.empty() && (int)sp->host.size() > t.sortKey && (segCold(*sp->d, t.sortKey) || !sp->host[t.sortKey].empty())) {
+      if (!sortPreds.empty() && (int)sp->d->host.size() > t.sortKey && (segCold(sp->cd(t.sortKey), t.sortKey) || !sp->cd(t.sortKey).host[t.sortKey].empty())) {
         const bool i64 = t.cols[t.sortKey].pt == PType::I64;
-        auto at = [&](int64_t r) { return (double)segRawInt(*sp->d, t.sortKey, r, i64); };
+        auto at = [&](int64_t r) { return (double)segRawInt(sp->cd(t.sortKey), t.sortKey, r, i64); };
         auto lowerB = [&](double v) {  // first row >= v
           int64_t a = 0, b = sp->n;
           while (a < b) { int64_t m = (a + b) / 2; if (at(m) < v) a = m + 1; else b = m; }
@@ -4150,7 +4151,7 @@ inline void scanTable(Table& t, const std::vector<int>& parts, const std::vector
   // Read-ahead of columns on disk follows this order (restored for an enclosing scan).
   std::vector<ScanAheadItem> ahead;
   for (auto& v : plan)
-    if (v.sp && v.sp->d->file) ahead.push_back({v.sp->d.get(), v.lo, v.hi - v.lo});
+    if (v.sp && v.sp->hasFile()) ahead.push_back({v.sp, v.lo, v.hi - v.lo});
   size_t aheadPos = 0;
   if (!dryRun) scanAheadExchange(ahead, aheadPos);
   struct Restore {
@@ -4168,7 +4169,8 @@ inline void scanTable(Table& t, const std::vector<int>& parts, const std::vector
     }
   } flush{!dryRun};
   size_t aheadAt = 0;
-  std::vector<void*> adj;
+  std::vector<void*> adj, devv;
+  std::vector<uint8_t> encv;
   for (auto& vis : plan) {
     const int p = vis.p;
     if (vis.sp) {
@@ -4178,17 +4180,20 @@ inline void scanTable(Table& t, const std::vector<int>& parts, const std::vector
       st.rowsScanned += hi - lo;
       st.segRows += sp->n;
       if (dryRun) continue;
-      if (sp->d->file) scanAheadAt(aheadAt++);
+      if (sp->hasFile()) scanAheadAt(aheadAt++);
       const uint32_t* segDel = viewDel(vis.si, *sp->del, sp->n);
+      // Columns with an UPDATE's version (Segment::ov): this batch's column pointers / encodings.
+      const std::vector<void*>* dv = &sp->devs(devv);
+      const std::vector<uint8_t>* ev = &sp->encs(encv);
       if (lo == 0 && hi == sp->n) {
-        if (!fn(BatchRef{p, sp->n, &sp->dev, segDel, &sp->enc, 0, sp})) return;
+        if (!fn(BatchRef{p, sp->n, dv, segDel, ev, 0, sp})) return;
         continue;
       }
       // Raw columns: shift the pointer; encoded ones (header first): pass the row offset.
-      adj.assign(sp->dev.size(), nullptr);
-      for (size_t c = 0; c < sp->dev.size(); ++c)
-        adj[c] = sp->dev[c] && !sp->enc[c] ? (void*)((char*)sp->dev[c] + lo * t.colBytes((int)c)) : sp->dev[c];
-      if (!fn(BatchRef{p, hi - lo, &adj, segDel ? segDel + lo / 32 : nullptr, &sp->enc, (int32_t)lo, sp})) return;
+      adj.assign(dv->size(), nullptr);
+      for (size_t c = 0; c < dv->size(); ++c)
+        adj[c] = (*dv)[c] && !(*ev)[c] ? (void*)((char*)(*dv)[c] + lo * t.colBytes((int)c)) : (*dv)[c];
+      if (!fn(BatchRef{p, hi - lo, &adj, segDel ? segDel + lo / 32 : nullptr, ev, (int32_t)lo, sp})) return;
       continue;
     }
     WriteBuffer& b = *t.bufs[p];
@@ -4233,7 +4238,7 @@ inline bool colRange(const Table& t, int bc, int64_t& lo, int64_t& hi) {
   }
   if (t.cols[bc].lt == LType::DOUBLE || t.cols[bc].lt == LType::DECIMAL) return false;
   double mn = INFINITY, mx = -INFINITY;
-  for (auto& sp : t.segs) mn = std::min(mn, sp->mn[bc]), mx = std::max(mx, sp->mx[bc]);
+  for (auto& sp : t.segs) mn = std::min(mn, sp->cd(bc).mn[bc]), mx = std::max(mx, sp->cd(bc).mx[bc]);
   for (int p = 0; p < t.nparts; ++p) {
     const WriteBuffer& wb = *t.bufs[p];
     BufData& b = *wb.data;  // (the cache is shared with the buffer's other snapshots)

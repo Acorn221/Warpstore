@@ -102,8 +102,37 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   const bool tr = envSetting("TRACE") != nullptr;
   auto ph = Clock::now();
   double tg = 0, ts = 0, ta = 0;
-  markDeleted(&t, matched);
+  const size_t nc = t.cols.size();
+  // Column-level UPDATE: rows in segments keep their places and only the SET columns of the segments
+  // they are in get new versions (Table::replaceColumns), when no SET column is a key, the sort key,
+  // indexed or AUTO_INCREMENT (their indexes / order would change). Rows in write buffers (and all
+  // rows otherwise) are deleted and re-inserted.
+  std::vector<int> setCols;  // (distinct, in order)
+  for (auto& [c, e] : sets)
+    if (std::find(setCols.begin(), setCols.end(), c) == setCols.end()) setCols.push_back(c);
+  bool colMode = !txnKey() && !t.segs.empty();
+  {
+    std::set<int> fixed{t.pk, t.sortKey, t.autoIncCol};
+    for (int k : t.shardKey) fixed.insert(k);
+    for (auto& ix : t.indexes)
+      for (int c : ix.cols) fixed.insert(c);
+    for (int c : setCols) colMode = colMode && !fixed.count(c) && t.cols[c].pt != PType::VEC;
+  }
+  auto inPlace = [&](const Loc& l) { return colMode && l.seg >= 0 && t.segs[l.seg]->full(); };
+  if (colMode) {
+    std::vector<Loc> moved;
+    for (const Loc& l : matched)
+      if (!inPlace(l)) moved.push_back(l);
+    markDeleted(&t, moved);
+  } else {
+    markDeleted(&t, matched);
+  }
   if (tr) fprintf(stderr, "[trace] update: markDeleted %.1f ms\n", msSince(ph));
+  // The new versions of the SET columns of segments with matched rows: per segment (patchAt) and
+  // SET column, a copy of the column with the new values written in; installed at the end.
+  std::map<int32_t, size_t> patchAt;
+  std::vector<int32_t> psegs;
+  std::vector<std::vector<std::vector<uint8_t>>> pdata;
   t.deferFlush = true;
   struct Flush {
     Table& t;
@@ -117,7 +146,6 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       }
     }
   } flush{t};
-  const size_t nc = t.cols.size();
   std::vector<Value> cur(nc), vals(sets.size());
   PostCtx pc;
   pc.row = &cur;
@@ -153,8 +181,14 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     for (auto& [c, e] : sets)
       for (int k : t.shardKey) shardSet = shardSet || c == k;
     const bool copyRows = t.pk < 0 && t.indexes.empty() && !txnKey() && !shardSet;
-    std::vector<uint8_t> need(nc, copyRows ? 0 : 1);
-    if (copyRows) {
+    size_t nMoved = n;  // rows deleted and re-inserted
+    if (colMode) {
+      nMoved = 0;
+      for (size_t i = 0; i < n; ++i) nMoved += !inPlace(ls[i]);
+    }
+    const bool sparse = copyRows || nMoved == 0;  // only the columns the SETs read are gathered
+    std::vector<uint8_t> need(nc, sparse ? 0 : 1);
+    if (sparse) {
       std::set<std::pair<int, int>> used;
       for (auto& [c, e] : sets) colsOf(e, used);
       for (auto& [bt, bc] : used)
@@ -348,26 +382,92 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
       if (t.cols[fastC[j]].pt == PType::F64) dv[fastC[j]].swap(fd[j]);
       else iv[fastC[j]].swap(fi[j]);
     }
-    // Rows stay in their partition when no shard-key column is set (no re-hashing).
-    bool keepPart = true;
-    for (auto& [c, e] : sets)
-      for (int k : t.shardKey) keepPart = keepPart && c != k;
-    std::vector<int32_t> partOf;
-    if (keepPart && t.nparts > 1 && !t.shardKey.empty()) {
-      partOf.resize(n);
-      for (size_t i = 0; i < n; ++i) partOf[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
-    }
     ts += msSince(ph), ph = Clock::now();
-    if (copyRows) {
-      std::vector<int32_t> part(n);
-      for (size_t i = 0; i < n; ++i) part[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
-      std::vector<uint8_t> given(nc, 0);
-      for (auto& [c, e] : sets) given[c] = 1;
-      t.appendCopy(ls, n, part.data(), given, iv, dv);
-    } else {
+    // The rows deleted above, re-inserted with their new values (iv / dv: theirs, in order).
+    auto moveRest = [&](const Loc* ls, size_t n) {
+      if (copyRows) {
+        std::vector<int32_t> part(n);
+        for (size_t i = 0; i < n; ++i) part[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
+        std::vector<uint8_t> given(nc, 0);
+        for (auto& [c, e] : sets) given[c] = 1;
+        t.appendCopy(ls, n, part.data(), given, iv, dv);
+        return;
+      }
+      // Rows stay in their partition when no shard-key column is set (no re-hashing).
+      bool keepPart = true;
+      for (auto& [c, e] : sets)
+        for (int k : t.shardKey) keepPart = keepPart && c != k;
+      std::vector<int32_t> partOf;
+      if (keepPart && t.nparts > 1 && !t.shardKey.empty()) {
+        partOf.resize(n);
+        for (size_t i = 0; i < n; ++i) partOf[i] = ls[i].seg >= 0 ? t.segs[ls[i].seg]->part : -1 - ls[i].seg;
+      }
       t.appendColumns(iv, dv, (int64_t)n, partOf.empty() ? nullptr : partOf.data());
+    };
+    if (nMoved < n) {
+      // Rows in segments: their new values go into the segments' new column versions.
+      std::vector<size_t> fresh;
+      for (size_t i = 0; i < n; ++i)
+        if (inPlace(ls[i]) && patchAt.emplace(ls[i].seg, psegs.size()).second) {
+          psegs.push_back(ls[i].seg);
+          pdata.emplace_back(setCols.size());
+          fresh.push_back(psegs.size() - 1);
+        }
+      for (size_t s : fresh)  // (cold columns loaded here: a pool task must not wait for the I/O pool)
+        for (int c : setCols) t.colData(Loc{psegs[s], 0}, c);
+      ioParallel(fresh.size() * setCols.size(), [&](size_t i) {
+        const size_t s = fresh[i / setCols.size()], k = i % setCols.size();
+        pdata[s][k] = t.colData(Loc{psegs[s], 0}, setCols[k]);
+      }, true);
+      ioParallel(setCols.size(), [&](size_t k) {
+        const int c = setCols[k];
+        const PType pt = t.cols[c].pt;
+        size_t s = 0;
+        int32_t sseg = INT32_MIN;
+        for (size_t i = 0; i < n; ++i) {
+          const Loc l = ls[i];
+          if (!inPlace(l)) continue;
+          if (l.seg != sseg) s = patchAt[l.seg], sseg = l.seg;
+          uint8_t* col = pdata[s][k].data();
+          switch (pt) {
+            case PType::I32: ((int32_t*)col)[l.row] = (int32_t)iv[c][i]; break;
+            case PType::I64: ((int64_t*)col)[l.row] = iv[c][i]; break;
+            default: ((double*)col)[l.row] = dv[c][i]; break;
+          }
+        }
+      }, true);
+      if (nMoved == 0) {
+        ta += msSince(ph);
+        continue;
+      }
+      // The rest (write buffer rows) moves: the chunk is narrowed to them.
+      std::vector<Loc> keep;
+      keep.reserve(nMoved);
+      size_t o = 0;
+      for (size_t i = 0; i < n; ++i) {
+        if (inPlace(ls[i])) continue;
+        keep.push_back(ls[i]);
+        for (size_t c = 0; c < nc; ++c) {
+          if (iv[c].size() == n) iv[c][o] = iv[c][i];
+          if (dv[c].size() == n) dv[c][o] = dv[c][i];
+        }
+        ++o;
+      }
+      for (size_t c = 0; c < nc; ++c) {
+        if (iv[c].size() == n) iv[c].resize(o);
+        if (dv[c].size() == n) dv[c].resize(o);
+      }
+      moveRest(keep.data(), o);
+      ta += msSince(ph);
+      continue;
     }
+    moveRest(ls, n);
     ta += msSince(ph);
+  }
+  if (!psegs.empty()) {
+    ph = Clock::now();
+    t.replaceColumns(psegs, setCols, pdata);
+    if (tr) fprintf(stderr, "[trace] update: %zu segments' columns replaced in %.1f ms\n", psegs.size(), msSince(ph));
   }
   if (tr) fprintf(stderr, "[trace] update: gather %.1f ms, set %.1f ms, append %.1f ms\n", tg, ts, ta);
   return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
@@ -458,7 +558,9 @@ ResultSet Engine::doModify(Stmt& s) {
       Segment& sg = *t->segs[si];
       if (!inParts[sg.part] || !segMayMatch(sg, conj)) continue;
       const uint32_t* sdel = sg.delDev();
-      const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
+      std::vector<void*> dvt;
+      std::vector<uint8_t> evt;
+      const BatchRef br{sg.part, sg.n, &sg.devs(dvt), sdel, &sg.encs(evt), 0, &sg};
       struct Temps { ~Temps() { releaseScanTemps(); } } temps;
       for (size_t k = 0; k < comp.slotCols.size(); ++k) bindView(comp.env.cols[k], br, comp.slotCols[k].second);
       scanFlush();

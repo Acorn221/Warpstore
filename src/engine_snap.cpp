@@ -333,7 +333,7 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
         if (keep((int32_t)si, r, sg->del->test(r))) live[si].push_back((int32_t)r);
       nlive[si] = (int64_t)live[si].size();
     }
-    byRef[si] = refs && tierEnabled() && sg->uses.size() == sg->dev.size() && sg->n > 0 && nlive[si] * 2 >= sg->n;
+    byRef[si] = refs && tierEnabled() && sg->full() && sg->n > 0 && nlive[si] * 2 >= sg->n;
     if (plain && !byRef[si])
       for (int64_t r = 0; r < sg->n; ++r)
         if (!sg->del->test(r)) live[si].push_back((int32_t)r);
@@ -345,15 +345,27 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
     putU64(f, rs.size());
     for (size_t si : rs) {
       Segment& sg = *t.segs[si];
-      auto file = segFileEnsure(*sg.d, sg.n, t.sortKey);
-      segFileSync(*file);
-      refs->push_back(file->id);
+      // Format 6: the files of the segment's data (d first, then column-level UPDATE versions) and,
+      // when there are several, which one holds each column.
+      std::vector<const SegData*> datas;
+      sg.eachData([&](const SegData& x) { datas.push_back(&x); });
+      std::vector<uint64_t> ids;
+      for (const SegData* x : datas) {
+        auto file = segFileEnsure(const_cast<SegData&>(*x), sg.n, t.sortKey);
+        segFileSync(*file);
+        refs->push_back(file->id);
+        ids.push_back(file->id);
+      }
       putU64(f, (uint64_t)sg.part);
       putU64(f, (uint64_t)sg.n);
-      putU64(f, file->id);
+      putU64(f, ids[0]);
+      putU64(f, ids.size() - 1);
+      for (size_t k = 1; k < ids.size(); ++k) putU64(f, ids[k]);
+      if (ids.size() > 1)
+        for (size_t c = 0; c < nc; ++c) putU64(f, (uint64_t)(std::find(datas.begin(), datas.end(), &sg.cd(c)) - datas.begin()));
       for (size_t c = 0; c < nc; ++c) {
-        putDbl(f, sg.mn[c]);
-        putDbl(f, sg.mx[c]);
+        putDbl(f, sg.cd(c).mn[c]);
+        putDbl(f, sg.cd(c).mx[c]);
       }
       std::vector<uint32_t> bits((size_t)(sg.n + 31) / 32, ~0u);  // deleted unless live
       if (plain) {
@@ -394,14 +406,14 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
         }
         for (int32_t r : rows) memcpy(out.data() + o, src + (size_t)r * sz, sz), o += sz;
       };
-      for (auto& [sg, lv] : parts) copy(segRawColumn(*sg->d, (int)c, tmp), *lv, sg->n);
+      for (auto& [sg, lv] : parts) copy(segRawColumn(sg->cd(c), (int)c, tmp), *lv, sg->n);
       copy(b.cols[c].data(), blive, b.n);
       fwrite(out.data(), 1, out.size(), f);
     }
   }
 }
 
-void readColumnar(FILE* f, Table& t, bool refs = false, const std::string* dictDir = nullptr) {
+void readColumnar(FILE* f, Table& t, bool refs = false, const std::string* dictDir = nullptr, int ver = 0) {
   const size_t nc = t.cols.size();
   uint64_t np, v;
   getU64(f, np);
@@ -472,39 +484,62 @@ void readColumnar(FILE* f, Table& t, bool refs = false, const std::string* dictD
       getU64(f, part);
       getU64(f, n);
       getU64(f, id);
+      std::vector<uint64_t> ids{id}, at(nc, 0);  // the files; per column, the one holding it
+      if (ver >= 6) {
+        uint64_t k;
+        getU64(f, k);
+        if (k > nc) throw SqlError("bad snapshot", 1105);
+        for (uint64_t j = 0; j < k; ++j) getU64(f, id), ids.push_back(id);
+        if (k)
+          for (size_t c = 0; c < nc; ++c) {
+            getU64(f, at[c]);
+            if (at[c] >= ids.size()) throw SqlError("bad snapshot", 1105);
+          }
+      }
       auto seg = std::make_unique<Segment>();
       seg->id = nextSegmentId();
       seg->part = t.nparts == 1 ? 0 : (int)part;
       seg->n = (int64_t)n;
-      seg->host.resize(nc);
-      seg->dev.assign(nc, nullptr);
-      seg->mapped.assign(nc, 0);
-      seg->uses.assign(nc, 0);
-      seg->heat.assign(nc, 0.f);
-      seg->mn.resize(nc);
-      seg->mx.resize(nc);
-      seg->encHost.resize(nc);
+      std::vector<double> mn(nc), mx(nc);
       for (size_t c = 0; c < nc; ++c) {
-        seg->mn[c] = getDbl(f);
-        seg->mx[c] = getDbl(f);
+        mn[c] = getDbl(f);
+        mx[c] = getDbl(f);
       }
       std::vector<uint32_t> bits((size_t)(n + 31) / 32);
       if (fread(bits.data(), 4, bits.size(), f) != bits.size()) throw SqlError("truncated snapshot", 1105);
-      seg->d->file = segFileOpen(id, nc, (int64_t)n);
-      seg->enc.resize(nc);
-      for (size_t c = 0; c < nc; ++c) {
-        seg->enc[c] = seg->d->file->cols[c].enc;
-        if (seg->d->file->cols[c].width != (uint32_t)t.colBytes((int)c)) throw SqlError("segment file does not match the table", 1105);
+      std::vector<std::shared_ptr<SegData>> datas;
+      for (size_t k = 0; k < ids.size(); ++k) {
+        auto d = k ? std::make_shared<SegData>() : seg->d;
+        d->host.resize(nc);
+        d->dev.assign(nc, nullptr);
+        d->mapped.assign(nc, 0);
+        d->uses.assign(nc, 0);
+        d->heat.assign(nc, 0.f);
+        d->mn = mn;
+        d->mx = mx;
+        d->encHost.resize(nc);
+        d->file = segFileOpen(ids[k], nc, (int64_t)n);
+        d->enc.resize(nc);
+        for (size_t c = 0; c < nc; ++c) {
+          d->enc[c] = d->file->cols[c].enc;
+          if (at[c] == k && d->file->cols[c].width != (uint32_t)t.colBytes((int)c)) throw SqlError("segment file does not match the table", 1105);
+        }
+        segAccount(*d);
+        d->cold.assign(nc, 1);
+        datas.push_back(d);
       }
-      segAccount(*seg->d);
-      seg->d->cold.assign(nc, 1);
+      if (ids.size() > 1) {
+        seg->ov.resize(nc);
+        for (size_t c = 0; c < nc; ++c)
+          if (at[c]) seg->ov[c] = datas[at[c]];
+      }
       int64_t ndel = 0;
       for (uint32_t w : bits) ndel += __builtin_popcount(w);
       if (!samePlacement) {  // rows go to their new partitions through the write buffers
         std::vector<std::vector<uint8_t>> colsIn(nc);
         std::vector<uint8_t> tmp;
         for (size_t c = 0; c < nc; ++c) {
-          const uint8_t* raw = segRawColumn(*seg->d, (int)c, tmp);
+          const uint8_t* raw = segRawColumn(seg->cd(c), (int)c, tmp);
           colsIn[c].assign(raw, raw + n * t.colBytes((int)c));
         }
         std::vector<int64_t> keepRows;
@@ -518,7 +553,7 @@ void readColumnar(FILE* f, Table& t, bool refs = false, const std::string* dictD
       const int32_t segId = (int32_t)t.segs.size();
       if (t.pk >= 0) {
         std::vector<uint8_t> tmp;
-        const uint8_t* raw = segRawColumn(*seg->d, t.pk, tmp);
+        const uint8_t* raw = segRawColumn(seg->cd(t.pk), t.pk, tmp);
         const PType pt = t.cols[t.pk].pt;
         for (int64_t r = 0; r < (int64_t)n; ++r) {
           if (seg->del->test(r)) continue;
@@ -640,6 +675,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       if (onlyDb.empty() || k.rfind(lower(onlyDb) + ".", 0) == 0) views[k] = v;
   }
   std::lock_guard<std::mutex> snapGuard(snapMu_);
+  RcuGuard rcu;  // (column versions replaced meanwhile stay readable)
   const bool v4 = outPath.empty() && tierEnabled();  // snapshot.bin: segments by reference (their files)
   std::vector<uint64_t> refs;
   const std::string dictDir = dir_ + "/dicts";
@@ -659,9 +695,9 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       {
         std::shared_lock<FairSharedMutex> lk(t->mu);
         for (auto& sp : t->segs)
-          if (sp->uses.size() == sp->dev.size() && sp->n > 0 && sp->ndel() * 2 <= sp->n) segs.push_back(sp);
+          if (sp->full() && sp->n > 0 && sp->ndel() * 2 <= sp->n) segs.push_back(sp);
       }
-      for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n, t->sortKey));
+      for (auto& sp : segs) sp->eachData([&](const SegData& x) { segFileSync(*segFileEnsure(const_cast<SegData&>(x), sp->n, t->sortKey)); });
     }
   if (v4)  // dictionaries: the strings added since the last snapshot go to their files (no pause)
     for (auto& t : tabs) {
@@ -692,8 +728,9 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   const std::string fin = outPath.empty() ? dir_ + "/snapshot.bin" : outPath, tmp = fin + ".tmp";
   FILE* f = fopen(tmp.c_str(), "wb");
   if (!f) throw SqlError("cannot write " + tmp, 1105);
-  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables; 4: + segment files; 5: + dictionary files
-  fwrite(v4 ? "GDBSNAP5" : "GDBSNAP3", 1, 8, f);
+  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables; 4: + segment files; 5: + dictionary
+  // files; 6: + column-level UPDATE versions of segments
+  fwrite(v4 ? "GDBSNAP6" : "GDBSNAP3", 1, 8, f);
   f = zstdWriter(f);
   putU64(f, dbs.size());
   for (auto& d : dbs) putStr(f, cat_.syncDbs.count(d) ? d + "\x1fSYNC" : d);  // (cat_.mu not needed: dbs only grow under writes, quiesced here)
@@ -1342,7 +1379,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
   auto t0 = Clock::now();
   const std::string savedDb = currentDb();
   char magic[8];
-  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '5') {
+  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '6') {
     fclose(f);
     throw SqlError("bad snapshot file " + path, 1105);
   }
@@ -1428,7 +1465,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     std::vector<Value> row(t->cols.size());
     const std::string dictDir = dir_ + "/dicts";
     const auto tt0 = Clock::now();
-    if (columnar) readColumnar(f, *t, magic[7] >= '4', magic[7] >= '5' ? &dictDir : nullptr), rows = 0;  // (rows: counted below from the table)
+    if (columnar) readColumnar(f, *t, magic[7] >= '4', magic[7] >= '5' ? &dictDir : nullptr, magic[7] - '0'), rows = 0;  // (rows: counted below from the table)
     if (envSetting("TRACE")) fprintf(stderr, "[trace] snapshot: table %s in %.0f ms\n", t->name.c_str(), msSince(tt0));
     for (uint64_t r = 0; r < rows; ++r) {
       for (auto& v : row) getVal(f, v);

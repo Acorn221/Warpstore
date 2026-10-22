@@ -139,19 +139,19 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
     auto seg = std::make_unique<Segment>();
     seg->part = 0;
     seg->n = n;
-    seg->host.resize(nc);  // (filled on demand: Table::colData)
-    seg->dev.resize(nc, nullptr);
-    seg->mapped.assign(nc, 0);
-    seg->enc.assign(nc, 0);
-    seg->encHost.resize(nc);
-    seg->mn.resize(nc);
-    seg->mx.resize(nc);
+    seg->d->host.resize(nc);  // (filled on demand: Table::colData)
+    seg->d->dev.resize(nc, nullptr);
+    seg->d->mapped.assign(nc, 0);
+    seg->d->enc.assign(nc, 0);
+    seg->d->encHost.resize(nc);
+    seg->d->mn.resize(nc);
+    seg->d->mx.resize(nc);
     for (size_t c = 0; c < nc; ++c) {
-      seg->dev[c] = r.devCols[c]->p;
+      seg->d->dev[c] = r.devCols[c]->p;
       r.devCols[c]->p = nullptr;
-      seg->mn[c] = r.devCols[c]->mn;
-      seg->mx[c] = r.devCols[c]->mx;
-      seg->devBytes += n * t->colBytes((int)c);
+      seg->d->mn[c] = r.devCols[c]->mn;
+      seg->d->mx[c] = r.devCols[c]->mx;
+      seg->d->devBytes += n * t->colBytes((int)c);
       if (cols[c].lt == LType::VARCHAR) t->dicts[c] = r.colDicts[c];  // (shared: temp tables add no strings)
       t->hasNull[c] = 1;
     }

@@ -416,14 +416,15 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         Segment& sg = *t.segs[si];
         if (sg.n == 0 || sg.ndel() == sg.n) continue;
         std::shared_ptr<CagraGraph> g;
-        if (segCold(*sg.d, vc)) segLoad(*sg.d, vc);  // (graph columns stay in memory)
-        if (sg.n >= 2048 && sg.dev[vc] && !sg.mapped[vc]) {
+        SegData& VD = sg.cd(vc);
+        if (segCold(VD, vc)) segLoad(VD, vc);  // (graph columns stay in memory)
+        if (sg.n >= 2048 && VD.dev[vc] && !VD.mapped[vc]) {
           std::lock_guard<std::mutex> lk(vix->cagra->mu);
           auto it = vix->cagra->graphs.find(sg.id);
           if (it != vix->cagra->graphs.end()) g = it->second;
           else if (!vix->cagra->failed.count(sg.id)) {
             std::string err;
-            g = cagraBuild((const float*)sg.dev[vc], sg.n, d, dot, vix->graphDegree, err);
+            g = cagraBuild((const float*)VD.dev[vc], sg.n, d, dot, vix->graphDegree, err);
             if (g) vix->cagra->graphs[sg.id] = g, ++built;
             else {
               vix->cagra->failed.insert(sg.id);
@@ -437,7 +438,9 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         }
         if (gpuWhere) {  // rows passing WHERE (and not deleted) -> keep-bitset
           const uint32_t* sdel = sg.delDev();
-          const BatchRef br{sg.part, sg.n, &sg.dev, sdel, &sg.enc, 0, &sg};
+          std::vector<void*> dvt;
+          std::vector<uint8_t> evt;
+          const BatchRef br{sg.part, sg.n, &sg.devs(dvt), sdel, &sg.encs(evt), 0, &sg};
           struct Temps { ~Temps() { releaseScanTemps(); } } temps;
           for (size_t kk = 0; kk < wcomp.slotCols.size(); ++kk) bindView(wcomp.env.cols[kk], br, wcomp.slotCols[kk].second);
           scanFlush();
@@ -1138,7 +1141,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       Table& gt = *ctx.tabs[g->bt];
       if (g->ty == LType::VARCHAR) { bound *= std::max<size_t>(gt.dicts[g->bc]->strs.size(), 1); continue; }
       double mn = INFINITY, mx = -INFINITY;
-      for (auto& sp : gt.segs) mn = std::min(mn, sp->mn[g->bc]), mx = std::max(mx, sp->mx[g->bc]);
+      for (auto& sp : gt.segs) mn = std::min(mn, sp->cd(g->bc).mn[g->bc]), mx = std::max(mx, sp->cd(g->bc).mx[g->bc]);
       bound *= mx >= mn ? mx - mn + 1 : 1;
       bound += (double)gt.bufferTotal();
     }
@@ -1933,7 +1936,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     for (int c : needOf(0)) {
       if (early.count({0, c})) continue;
       deferred.insert(c);
-      for (auto& sp : t0.segs) cold = cold || segCold(*sp->d, c);
+      for (auto& sp : t0.segs) cold = cold || segCold(sp->cd(c), c);
     }
     if (!cold || deferred.size() == needOf(0).size()) deferred.clear();
   }
@@ -2087,7 +2090,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         std::vector<CellRead> cold;
         for (int64_t r = 0; r < cnt; ++r) {
           const Loc l = lateLocs[fi[r]];
-          if (l.seg >= 0 && segCold(*t0.segs[l.seg]->d, rc.bc)) cold.push_back({t0.segs[l.seg]->d.get(), rc.bc, l.row, h.data() + r * rc.esize});
+          if (l.seg >= 0 && segCold(t0.segs[l.seg]->cd(rc.bc), rc.bc)) cold.push_back({&t0.segs[l.seg]->cd(rc.bc), rc.bc, l.row, h.data() + r * rc.esize});
           else cellRaw(t0, l, rc.bc, h.data() + r * rc.esize);
         }
         lateReads.insert(lateReads.end(), cold.begin(), cold.end());
