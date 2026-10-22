@@ -463,6 +463,14 @@ def dml(name):
                 sets.append((f"{col} = {f}", f"{col} = {f}"))
         return (f"UPDATE {name} SET {', '.join(x for x, _ in sets)} WHERE {w.my}",
                 f"UPDATE {name} SET {', '.join(y for _, y in sets)} WHERE {w.dk}")
+    if r < 0.7:  # multi-table: MySQL's JOIN form here, the same rows through EXISTS in DuckDB
+        w2 = pred([("t2", "t2")])
+        if R.random() < 0.5:
+            k = R.randint(-3, 3)
+            return (f"UPDATE {name} JOIN t2 ON t2.t1_id = {name}.id SET {name}.a = {name}.a + {k} WHERE {w2.my}",
+                    f"UPDATE {name} SET a = a + {k} WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = {name}.id AND {w2.dk})")
+        return (f"DELETE {name} FROM {name} JOIN t2 ON t2.t1_id = {name}.id WHERE {w2.my}",
+                f"DELETE FROM {name} WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.t1_id = {name}.id AND {w2.dk})")
     if r < 0.85:
         return f"DELETE FROM {name} WHERE {w.my}", f"DELETE FROM {name} WHERE {w.dk}"
     off = nextId[name]
