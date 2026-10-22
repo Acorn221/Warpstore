@@ -1,4 +1,5 @@
 build/
+build-prof/
 data/
 .venv/
 warpstore-data/

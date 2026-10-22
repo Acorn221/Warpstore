@@ -208,7 +208,7 @@ void rleHybrid(const uint8_t* p, const uint8_t* e, int bw, size_t count, std::ve
     } else {  // run: (h >> 1) copies of one value
       uint32_t v = 0;
       for (int k = 0; k < bytes && p < e; ++k) v |= (uint32_t)*p++ << (8 * k);
-      for (uint64_t k = 0; k < (h >> 1) && out.size() < count; ++k) out.push_back(v);
+      out.insert(out.end(), std::min<size_t>((size_t)(h >> 1), count - out.size()), v);
     }
   }
   out.resize(count, 0);
@@ -1105,12 +1105,19 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
         out.d[r] = vd[k++];
       }
   } else {
-    out.s.assign(rows, std::string_view());
     const bool dict = onlyDict && dictPages == 1 && vc.size() == vs.size();
-    if (dict) {
-      out.dict = ds;
-      out.code.assign(rows, 0);
+    if (dict) out.dict = ds;
+    if (full && (int64_t)vs.size() >= rows) {  // (none missing: the values are the rows)
+      vs.resize((size_t)rows);
+      out.s.swap(vs);
+      if (dict) {
+        vc.resize((size_t)rows);
+        out.code.swap(vc);
+      }
+      return;
     }
+    out.s.assign(rows, std::string_view());
+    if (dict) out.code.assign(rows, 0);
     for (int64_t r = 0; r < rows; ++r)
       if (out.valid[r]) {
         if (k >= vs.size()) bad("fewer values than rows");

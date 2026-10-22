@@ -3086,8 +3086,11 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
           const bool exactD = p.kind == 2 && cm.lt == LType::DOUBLE;
           if ((exactI || exactD) && (int)c != t->autoIncCol && memchr(p.valid.data(), 0, (size_t)rows) == nullptr) {
             bool fits = true;
-            if (exactI && cm.pt == PType::I32)
-              for (int64_t r = 0; r < rows && fits; ++r) fits = p.i[r] > INT32_MIN && p.i[r] <= INT32_MAX;
+            if (exactI && cm.pt == PType::I32) {  // (min / max: a loop that vectorizes)
+              int64_t lo = INT64_MAX, hi = INT64_MIN;
+              for (int64_t r = 0; r < rows; ++r) lo = std::min(lo, p.i[r]), hi = std::max(hi, p.i[r]);
+              fits = rows == 0 || (lo > INT32_MIN && hi <= INT32_MAX);
+            }
             if (fits && exactD && (int64_t)p.d.size() >= rows) {
               in[c].d.resize((size_t)rows);
               dv[c].swap(in[c].d);

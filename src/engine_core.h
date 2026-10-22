@@ -269,7 +269,7 @@ inline std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<st
     uint64_t p = 0;
     for (size_t k = off; k < off + 8; ++k) {
       unsigned char ch = k < s.size() ? (unsigned char)s[k] : 0;
-      if (fold) ch = (unsigned char)tolower(ch);
+      if (fold && ch - 'A' < 26u) ch |= 0x20;  // (tolower in the C locale, inline)
       p = (p << 8) | ch;
     }
     return p;
@@ -472,7 +472,9 @@ inline int collCmp(std::string_view a, std::string_view b) {
   if (ciColl()) {  // (strcasecmp's order, without needing terminated strings)
     const size_t n = std::min(a.size(), b.size());
     for (size_t i = 0; i < n; ++i) {
-      const int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+      int x = (unsigned char)a[i], y = (unsigned char)b[i];  // (tolower in the C locale, inline)
+      if (x - 'A' < 26u) x |= 0x20;
+      if (y - 'A' < 26u) y |= 0x20;
       if (x != y) return x < y ? -1 : 1;
     }
     return a.size() < b.size() ? -1 : a.size() > b.size() ? 1 : 0;

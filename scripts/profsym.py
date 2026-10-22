@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Summarizes a WARPSTORE_PROFILE file: the functions with the most samples, as the leaf (self) and
 # anywhere on the stack (total). Usage: scripts/profsym.py <profile> [binary] [--top N] [--callers FUNC]
+# [--lines] (hottest source lines; needs a build with -g1, e.g. cmake -B build-prof -DCMAKE_CXX_FLAGS=-g1)
 import collections, os, subprocess, sys
 
 args, i = [], 1
@@ -94,3 +95,18 @@ if callers:
     print(f"-- callers of {callers}")
     for n, c in cc.most_common(top):
         print(f"{100 * c / total:5.1f}%  {n}")
+if "--lines" in sys.argv:  # (a build with line tables: -g1) the hottest leaf addresses as file:line
+    leaf = collections.Counter()
+    for c, st in stacks:
+        if st and st[0].startswith(own + "+"):
+            leaf[st[0].split("+", 1)[1]] += c
+    byLine = collections.Counter()
+    hot = [o for o, _ in leaf.most_common(4000)]
+    out = subprocess.run(["addr2line", "-i", "-e", binary] + hot, capture_output=True, text=True).stdout.splitlines() if hot else []
+    # (-i: several lines per address when inlined; the first is the innermost)
+    res = subprocess.run(["addr2line", "-e", binary] + hot, capture_output=True, text=True).stdout.splitlines()
+    for o, ln in zip(hot, res):
+        byLine[ln.split(" (")[0].replace(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")) + "/", "")] += leaf[o]
+    print("-- hottest lines (self)")
+    for ln, c in byLine.most_common(top):
+        print(f"{100 * c / total:5.1f}%  {ln}")
