@@ -8089,6 +8089,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       Prog hp;
       std::vector<Prog> ops;
       bool topN = !orderBy.empty() && s.limit >= 0;
+      const bool firstN = orderBy.empty() && s.limit >= 0 && !s.distinct;
+      if (!having && !topN && !firstN) return false;
       try {
         if (having) hp = pc.compile(having);
         if (topN)
@@ -8139,6 +8141,16 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         cand = DevVec<int32_t>(std::max<int64_t>(mc, 1));
         if (having) gpuGather(sel.p, PType::I32, perm.p, mc, cand.p);
         else d2d(cand.p, perm.p, mc * 4);
+      } else if (firstN) {  // LIMIT without ORDER BY: any offset + limit groups do
+        mc = std::min<int64_t>(m, s.offset + s.limit);
+        if (having) {
+          cand = std::move(sel);
+        } else {
+          std::vector<int32_t> first((size_t)std::max<int64_t>(mc, 1));
+          for (int64_t i = 0; i < mc; ++i) first[i] = (int32_t)i;
+          cand = DevVec<int32_t>((int64_t)first.size());
+          h2d(cand.p, first.data(), first.size() * 4);
+        }
       } else {
         cand = std::move(sel);
       }
@@ -8273,7 +8285,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       }
       plan.naggs += 1;  // the result layout is plan2's: ordinary slots + the distinct count
       ProfStage ppost("post-aggregate");
-      if (!(plan.nkeys && (having || (!orderBy.empty() && s.limit >= 0)) && gpuPostAggregate(*agg2, keys, accs, groups)))
+      if (!(plan.nkeys && (having || s.limit >= 0) && gpuPostAggregate(*agg2, keys, accs, groups)))
         groups = agg2->fetch(keys, accs);
       sumBits = agg2->sumBitsSlots();
       sumHi = agg2->sumHigh();
@@ -8383,7 +8395,7 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           return res;
         }
       }
-      if (!(plan.nkeys && !anyBits && (having || (!orderBy.empty() && s.limit >= 0)) &&
+      if (!(plan.nkeys && !anyBits && (having || s.limit >= 0) &&
             gpuPostAggregate(agg, keys, accs, groups)))
         groups = agg.fetch(keys, accs);
       sumBits = agg.sumBitsSlots();
