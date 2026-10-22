@@ -94,6 +94,49 @@ for compress in ("--no-compress", "--compress"):
     cur = srv.cursor("d")
     c.eq(f"{tag}: after kill -9", q(cur, "SELECT COUNT(*) FROM t"), [(N - 1000 + 1,)])
     c.eq(f"{tag}: row from the WAL", q(cur, "SELECT s FROM t WHERE id = -5"), [("neg",)])
+    # A flipped byte in a segment file: queries fail with "corrupt segment file" instead of returning
+    # wrong results (CRC32C per block); with the byte back, all is well.
+    q(cur, "SNAPSHOT")
+    srv.stop()
+    victim = max((os.path.join(segdir, f) for f in os.listdir(segdir)), key=os.path.getsize)
+
+    def block_byte(path):  # the middle of the first block of a compressed column (format 3 index)
+        import struct
+        with open(path, "rb") as fh:
+            hdr = fh.read(40)
+            nc, _, ix_off, ix_len = struct.unpack("<4Q", hdr[8:40])
+            fh.seek(ix_off)
+            ix = struct.unpack(f"<{ix_len // 8}Q", fh.read(ix_len))
+        k = 0
+        for _ in range(nc):
+            block_rows, nb = ix[k + 2], ix[k + 6]
+            blocks = ix[k + 7:k + 7 + nb]
+            k += 7 + nb + 1 + max(nb - 1, 0)
+            if block_rows and nb > 1:
+                return (blocks[0] + blocks[1]) // 2
+        raise AssertionError("no compressed column")
+
+    at = block_byte(victim)
+    with open(victim, "r+b") as fh:
+        fh.seek(at)
+        orig = fh.read(1)
+        fh.seek(at)
+        fh.write(bytes([orig[0] ^ 0x5A]))
+    srv.start()
+    cur = srv.cursor("d")
+    full = "SELECT COUNT(*), SUM(id), SUM(g), SUM(v), COUNT(DISTINCT s) FROM t"
+    try:
+        q(cur, full)
+        c.check(f"{tag}: corrupt segment file detected", False, "query succeeded")
+    except Exception as e:
+        c.check(f"{tag}: corrupt segment file detected", "corrupt segment file" in str(e), str(e))
+    srv.stop()
+    with open(victim, "r+b") as fh:
+        fh.seek(at)
+        fh.write(orig)
+    srv.start()
+    cur = srv.cursor("d")
+    c.eq(f"{tag}: readable again with the byte restored", q(cur, "SELECT COUNT(*) FROM t"), [(N - 1000 + 1,)])
     # DROP TABLE: its files go once a snapshot no longer refers to them
     q(cur, "DROP TABLE t")
     q(cur, "SNAPSHOT")

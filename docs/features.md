@@ -137,6 +137,9 @@ segments with columns on disk; `/metrics` has `warpstore_table_memory_bytes`.
 their rows deleted are still rewritten, which compacts them), so it only writes what changed, and a
 restart takes seconds: tables come back on disk and the cache fills up in the background. Files no
 snapshot or segment uses any more are deleted. `BACKUP` files stay self-contained.
+Segment files carry a CRC32C per block (and per column header, and for their index); every read
+checks it, so a damaged file makes queries fail with "corrupt segment file" instead of returning
+wrong rows (reads that go straight to VRAM through GPUDirect Storage are not checked).
 String dictionaries live in append-only files too (`<data dir>/dicts`, zstd frames with CRC32s):
 a snapshot appends the strings added since the last one before it pauses writes, and records how
 many strings it covers (a torn tail from a snapshot that was never installed is cut off on load).

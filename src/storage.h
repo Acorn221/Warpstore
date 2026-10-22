@@ -343,6 +343,10 @@ struct SegFile {
     uint32_t blockRows = 0;
     uint64_t prefix = 0;
     std::vector<uint64_t> blocks;
+    // Format 3: CRC32C of each block's stored bytes, and of the prefix (blocked) or of the whole
+    // column (stored as is: checked when it is read whole). Empty: format 1 / 2, not checked.
+    std::vector<uint32_t> crcs;
+    uint32_t crc = 0;
   };
   std::vector<Col> cols;
   std::mutex gdsMu;

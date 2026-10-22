@@ -29,7 +29,7 @@ add_executable(warpstore
   src/engine.cu
   src/storage.cu
   src/tier.cu
-  src/gpuio.cu
+  src/gpuio.cu src/crc32c.cpp
   src/gpu.cu
   src/jit.cu
   src/proc.cpp

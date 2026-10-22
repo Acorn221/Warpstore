@@ -54,6 +54,7 @@ struct SqlError : std::runtime_error {
 };
 
 bool parseDate(const std::string& s, int32_t& out);
+uint32_t crc32c(const void* data, size_t n, uint32_t crc = 0);  // CRC32C (crc: of the bytes before, to continue)
 std::string formatDate(int64_t days);
 bool parseDateTime(const std::string& s, int64_t& us);  // 'YYYY-MM-DD[ HH:MM[:SS[.ffffff]]]' -> microseconds
 std::string formatDateTime(int64_t us);

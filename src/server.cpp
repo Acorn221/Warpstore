@@ -1481,7 +1481,13 @@ int main(int argc, char** argv) {
   }
   Engine engine(dataDir, sync, partitions);
   fprintf(stderr, "[warpstore] %d partitions per sharded table\n", partitions);
-  engine.recover();
+  try {
+    engine.recover();
+  } catch (std::exception& e) {  // (a corrupt or missing snapshot / segment / dictionary file)
+    fprintf(stderr, "[warpstore] cannot recover the data in %s: %s\n", dataDir.c_str(), e.what());
+    fflush(stderr);
+    _exit(1);
+  }
   if (rootPw.empty())
     if (const char* e = envSetting("ROOT_PASSWORD")) rootPw = e;
   if (!rootPw.empty()) {
