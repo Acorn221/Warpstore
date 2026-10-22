@@ -205,6 +205,14 @@ c.eq("Parquet: column list", q("SELECT COUNT(*), COUNT(a), COUNT(z), COUNT(s) FR
 # NOT NULL violated by a NULL in the file
 cur.execute("CREATE TABLE pq3 (i32 INT NOT NULL)")
 c.raises("Parquet: NULL into NOT NULL", lambda: cur.execute(f"LOAD DATA INFILE '{pqfiles[1]}' INTO TABLE pq3"), 1048)
+# plain integers (no date / timestamp type, as in ClickBench's hits files): Unix seconds into
+# DATETIME, days since 1970-01-01 into DATE
+epochs = path("epochs.parquet")
+pq.write_table(pa.table({"t": pa.array([1372796926, 0, None], pa.int64()), "d": pa.array([15888, 0, 1], pa.uint16())}), epochs)
+cur.execute("CREATE TABLE pqe (t DATETIME, d DATE)")
+cur.execute(f"LOAD DATA INFILE '{epochs}' INTO TABLE pqe")
+c.eq("Parquet: integer Unix seconds / days into DATETIME / DATE", q("SELECT t, d FROM pqe ORDER BY d"),
+     [(dt.datetime(1970, 1, 1), dt.date(1970, 1, 1)), (None, dt.date(1970, 1, 2)), (dt.datetime(2013, 7, 2, 20, 28, 46), dt.date(2013, 7, 2))])
 # nested: a list column loads as JSON text
 nested = path("nested.parquet")
 pq.write_table(pa.table({"k": pa.array([1, 2, 3]), "tags": pa.array([["a", "b"], [], None], pa.list_(pa.string()))}), nested)

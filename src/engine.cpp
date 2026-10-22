@@ -3150,6 +3150,21 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
             if (!p.valid[r]) null(r);
           return;
         }
+        if (p.kind == 1 && p.unit == 0 && cm.lt == LType::DATETIME) {
+          // a plain integer (no timestamp type) into DATETIME / TIMESTAMP: Unix seconds (as a plain
+          // integer into DATE is days since 1970-01-01)
+          for (int64_t r = 0; r < rows; ++r) {
+            if (!p.valid[r]) {
+              null(r);
+              continue;
+            }
+            int64_t us;
+            if (__builtin_mul_overflow(p.i[r], (int64_t)1000000, &us))
+              throw SqlError("Column '" + cm.name + "': " + std::to_string(p.i[r]) + " is out of range as Unix seconds", 1292);
+            iv[c][r] = us;
+          }
+          return;
+        }
         const bool intExact = p.kind == 1 && p.unit == 0 && (cm.lt == LType::INT || cm.lt == LType::BIGINT);
         const bool dblExact = p.kind == 2 && cm.lt == LType::DOUBLE;
         const bool dateExact = p.kind == 1 && p.unit == 1 && cm.lt == LType::DATE;
