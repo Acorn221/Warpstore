@@ -1157,6 +1157,10 @@ struct Table {
                   const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv);
   // Set while a statement holds row locations across appends: full write buffers are flushed after.
   bool deferFlush = false;
+  // LOAD DATA statements running on the table, and when the last one ended (warmDicts waits for a quiet
+  // moment: its seconds of sorting would compete with back-to-back loads).
+  std::atomic<int> bulkLoads{0};
+  std::atomic<int64_t> lastBulkUs{0};
   void deleteAt(Loc l);
   // A failed statement's rows: deletes the write-buffer rows appended since mark (per partition:
   // buffer row counts then; no flush meanwhile), their keys and index entries included.

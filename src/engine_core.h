@@ -366,6 +366,7 @@ inline void (*gFtsWarm)(const Dict& d) = nullptr;  // builds a FULLTEXT column's
 // run at nice 10.
 inline void lowPriority() { setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10); }
 
+inline int64_t nowUs();
 inline void warmDicts(const std::shared_ptr<Table>& t) {
   static std::mutex mu;
   static std::set<const Table*> busy;
@@ -375,6 +376,9 @@ inline void warmDicts(const std::shared_ptr<Table>& t) {
   }
   std::thread([t] {
     lowPriority();
+    // after the table's loads (a multi-file load runs one after another): 1.5 s without one first
+    for (int waited = 0; waited < 600 && (t->bulkLoads > 0 || nowUs() - t->lastBulkUs < 1500000); ++waited)
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
     try {
       // (the table lock only to take the dictionaries: they are safe to read and index without it, and
       // holding it through seconds of sorting kept writers waiting)

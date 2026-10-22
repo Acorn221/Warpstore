@@ -3466,6 +3466,14 @@ ResultSet Engine::doLoad(Stmt& s) {
   if (s.setValue != "FS" && !s.setValue.empty())
     throw SqlError("LOAD DATA " + s.setValue + " is not supported (use a local path / FS, S3, KAFKA or MYSQL)", 1235);
   auto t = cat_.get(s.table);
+  struct Loading {  // (the background dictionary sort waits for the table's loads: warmDicts)
+    Table& t;
+    explicit Loading(Table& x) : t(x) { ++t.bulkLoads; }
+    ~Loading() {
+      t.lastBulkUs = nowUs();
+      --t.bulkLoads;
+    }
+  } loading{*t};
   std::unique_lock<FairSharedMutex> lk(t->mu);
   waitTxnFree(*t, lk);  // another session's open transaction changed this table
   auto t0 = Clock::now();
