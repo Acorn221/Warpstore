@@ -11535,15 +11535,16 @@ int64_t Engine::ingest(const std::string& table, char delim, int64_t skip, const
   const bool parquet = data.size() >= 12 && data.compare(0, 4, "PAR1") == 0 && data.compare(data.size() - 4, 4, "PAR1") == 0;
   const bool avro = data.size() >= 4 && data.compare(0, 4, std::string("Obj\x01", 4)) == 0;
   const bool orc = data.size() >= 16 && data.compare(0, 3, "ORC") == 0;
-  if (parquet || avro || orc) {  // columnar / row binary formats: by column name
+  if (parquet) {  // staged as it is: LOAD DATA reads Parquet directly (doLoad -> loadParquet), by column name
+    delim = '\t';
+    skip = 0;
+  } else if (avro || orc) {  // row / columnar binary formats: as text, by column name
     std::vector<std::string> names = cols;
     if (names.empty()) {
       auto t = cat_.get(table);
       for (auto& c : t->cols) names.push_back(c.name);
     }
-    const auto tc = Clock::now();
-    body = parquet ? parquetToTsv(data, names) : avro ? avroToTsv(data, names) : orcToTsv(data, names);
-    if (envSetting("TRACE")) fprintf(stderr, "[trace] %s to text: %.0f ms (%zu MB)\n", parquet ? "Parquet" : avro ? "Avro" : "ORC", msSince(tc), body.size() >> 20);
+    body = avro ? avroToTsv(data, names) : orcToTsv(data, names);
     delim = '\t';
     skip = 0;
     escaped = true;
