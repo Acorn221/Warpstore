@@ -61,7 +61,12 @@ for sql in ("DELETE FROM t1 WHERE id % 17 = 3", "UPDATE t1 SET a = a + 1 WHERE i
             "UPDATE t1 SET d = d + INTERVAL 3 DAY, c = NULL WHERE id % 23 = 7",
             "UPDATE t1 SET b = CASE WHEN a IS NULL THEN -1 ELSE b - a END, s = CONCAT('z', s) WHERE id % 29 = 2 AND s IS NOT NULL",
             "UPDATE t1 SET a = NULL, m = m + 0.05 WHERE id % 31 = 1",
-            "UPDATE t2 SET x = x * 3, s2 = NULL WHERE id % 7 = 2"):
+            "UPDATE t2 SET x = x * 3, s2 = NULL WHERE id % 7 = 2",
+            # vectorized SET forms: constants, column copies (NULLs included), +/- constants on INT /
+            # BIGINT / DECIMAL / DOUBLE, all against the old row
+            "UPDATE t1 SET m = m - 1.25, c = c + 0.5, b = a, a = b WHERE id % 37 = 3",
+            "UPDATE t1 SET a = 7, m = 2.5, b = b - 10 WHERE id % 41 = 6",
+            "UPDATE t2 SET x = x + 1000000, t1_id = t1_id WHERE id % 5 = 1"):
     g.execute(sql)
     d.execute(sql)
 
