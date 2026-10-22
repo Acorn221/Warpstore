@@ -77,12 +77,14 @@ only = {int(x) for x in args.only.split(",")} if args.only else None
 
 
 def timed(fn):
-    best, out = None, None
+    best, out, first = None, None, None
     for _ in range(args.runs):
         t0 = time.perf_counter()
         out = fn()
         dt = time.perf_counter() - t0
+        first = dt if first is None else first
         best = dt if best is None else min(best, dt)
+    timed.first = first
     return best, out
 
 
@@ -99,30 +101,35 @@ for n in sorted(queries):
     q = queries[n].strip().rstrip(";")
     dt_d, want = timed(lambda: d.execute(q).fetchall())
     ordered = re.search(r"order\s+by", q, re.I) is not None
+    first_d = timed.first
     try:
         dt_w, got = timed(lambda: ws(q))
+        first_w = timed.first
     except Exception as e:
-        rows.append((n, None, dt_d, f"ERROR {str(e)[:150]}"))
+        rows.append((n, None, dt_d, None, None, f"ERROR {str(e)[:150]}"))
         fails += 1
         continue
     a, b = norm_rows(got, ordered=ordered, places=2), norm_rows(want, ordered=ordered, places=2)
     ok = a == b or rows_close(a, b, 1e-6, 1e-2)
     if not ok:
         fails += 1
-    rows.append((n, dt_w, dt_d, "ok" if ok else f"MISMATCH {len(a)} vs {len(b)} rows: {[(x, y) for x, y in zip(a, b) if x != y][:1]}"))
+    rows.append((n, dt_w, dt_d, first_w, first_d, "ok" if ok else f"MISMATCH {len(a)} vs {len(b)} rows: {[(x, y) for x, y in zip(a, b) if x != y][:1]}"))
 
-print(f"\nTPC-H SF{args.sf}, best of {args.runs} (seconds)")
-print(f"{'Q':>3} {'warpstore':>10} {'duckdb':>8} {'speedup':>8}  result")
-geo_w = geo_d = 0.0
+print(f"\nTPC-H SF{args.sf}, best of {args.runs} and first run (seconds)")
+print(f"{'Q':>3} {'warpstore':>10} {'duckdb':>8} {'speedup':>8} {'ws first':>9} {'dk first':>9}  result")
+geo = [0.0] * 4
 k = 0
 import math
-for n, w, dd, res in rows:
+for n, w, dd, fw, fd, res in rows:
     sp = f"{dd / w:.1f}x" if w else "-"
-    print(f"{n:>3} {w if w is None else round(w, 4):>10} {dd:>8.4f} {sp:>8}  {res}")
+    print(f"{n:>3} {w if w is None else round(w, 4):>10} {dd:>8.4f} {sp:>8} {fw if fw is None else round(fw, 4):>9} {fd if fd is None else round(fd, 4):>9}  {res}")
     if w:
-        geo_w += math.log(w); geo_d += math.log(dd); k += 1
+        for i, v in enumerate((w, dd, fw, fd)):
+            geo[i] += math.log(v)
+        k += 1
 if k:
-    print(f"geomean: warpstore {math.exp(geo_w / k) * 1000:.1f} ms, duckdb {math.exp(geo_d / k) * 1000:.1f} ms over {k} queries")
+    g = [math.exp(x / k) * 1000 for x in geo]
+    print(f"geomean hot: warpstore {g[0]:.1f} ms, duckdb {g[1]:.1f} ms; first run: warpstore {g[2]:.1f} ms, duckdb {g[3]:.1f} ms ({k} queries)")
 print(f"{fails} failing")
 if not os.environ.get("WARPSTORE_PORT"):
     srv.stop()

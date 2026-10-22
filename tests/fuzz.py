@@ -235,7 +235,7 @@ def pred(tabs, depth=0):
     if r < 0.88:
         s = col(tabs, "str")
         if s:
-            pat = R.choice(["a%", "%a%", "_o%", "%e", "b__", "%"])
+            pat = R.choice(["a%", "%a%", "_o%", "%e", "b__", "%", "%a%e%", "b%t", "%o%o%", "a%n%t", "%%x"])
             return Q(f"{s.my} LIKE '{pat}'", f"{s.dk} LIKE '{pat}'")
     if r < 0.94:
         s = col(tabs, "str")

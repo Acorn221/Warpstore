@@ -118,6 +118,34 @@ std::function<bool(std::string_view)> likeMatcher(const std::string& pat) {
       return [lit](std::string_view s) { return s == lit; };
     }
   }
+  if (!special) {  // only '%' wildcards: the pieces in order (memmem), the first / last anchored unless '%'
+    std::vector<std::string> seg;
+    size_t b = 0;
+    for (size_t i = 0; i <= pat.size(); ++i)
+      if (i == pat.size() || pat[i] == '%') {
+        seg.push_back(pat.substr(b, i - b));
+        b = i + 1;
+      }
+    // seg.front() / seg.back(): anchored at the start / end (empty when the pattern starts / ends with '%')
+    return [seg](std::string_view s) {
+      const std::string& head = seg.front();
+      const std::string& tail = seg.back();
+      if (s.size() < head.size() + tail.size()) return false;
+      if (memcmp(s.data(), head.data(), head.size()) != 0) return false;
+      if (memcmp(s.data() + s.size() - tail.size(), tail.data(), tail.size()) != 0) return false;
+      size_t at = head.size();
+      const size_t end = s.size() - tail.size();
+      for (size_t k = 1; k + 1 < seg.size(); ++k) {
+        const std::string& m = seg[k];
+        if (m.empty()) continue;
+        if (end - at < m.size()) return false;
+        const void* f = memmem(s.data() + at, end - at, m.data(), m.size());
+        if (!f) return false;
+        at = (const char*)f - s.data() + m.size();
+      }
+      return true;
+    };
+  }
   return [pat](std::string_view s) { return likeMatch(s, pat); };
 }
 
@@ -1636,10 +1664,18 @@ struct Compiler {
         if (e->args[0]->ty != LType::VARCHAR || !ctx->dict(*e->args[0]))
           throw SqlError("LIKE on this expression can't run on the GPU", 1235);
         const std::string pat = e->args[1]->lit.s;
-        const bool ci = ciColl();
+        bool letters = false;
+        for (char ch : pat) letters = letters || isalpha((unsigned char)ch);
+        const bool ci = ciColl() && letters;  // (no letters in the pattern: case can't matter)
         const std::string fp = ci ? foldCase(pat) : pat;
         const auto m = likeMatcher(fp);
-        int s = dictSet(*ctx->dict(*e->args[0]), [&](const std::string& v) { return ci ? m(foldCase(v)) : m(v); }, "LIKE|" + pat);
+        int s = dictSet(*ctx->dict(*e->args[0]), [&](const std::string& v) {
+          if (!ci) return m(v);
+          thread_local std::string buf;  // (folded without an allocation per string)
+          buf.assign(v);
+          for (auto& ch : buf) ch = (char)tolower((unsigned char)ch);
+          return m(buf);
+        }, "LIKE|" + pat);
         gen(e->args[0]);
         emit(OP_INSET, s, 0);
         if (e->neg) emit(OP_NOT, 0, 0);
