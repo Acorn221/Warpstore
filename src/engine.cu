@@ -582,6 +582,42 @@ int64_t nowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// The statement's clock and random numbers: NOW() / CURRENT_TIMESTAMP defaults read tStmtTimeUs, and
+// RAND() / UUID() draw from tStmtRng, seeded with tStmtSeed. Both are set when a statement starts
+// and written with it to the WAL ("/*ws <us> <seed>*/ " in front), so a replay (crash recovery,
+// replicas, point-in-time restores) computes the same values, as MySQL's binlog does.
+thread_local int64_t tStmtTimeUs = 0;
+thread_local uint64_t tStmtSeed = 0;
+thread_local std::mt19937_64 tStmtRng;
+int64_t stmtNowUs() { return tStmtTimeUs ? tStmtTimeUs : nowUs(); }
+static void beginStatementClock() {
+  static std::atomic<uint64_t> salt{std::random_device{}() ^ ((uint64_t)std::random_device{}() << 32)};
+  tStmtTimeUs = nowUs();
+  tStmtSeed = salt.fetch_add(0x9E3779B97F4A7C15ull) ^ (uint64_t)tStmtTimeUs;
+  tStmtRng.seed(tStmtSeed);
+}
+static std::string clockPrefix() {
+  char b[64];
+  snprintf(b, sizeof b, "/*ws %lld %llu*/ ", (long long)tStmtTimeUs, (unsigned long long)tStmtSeed);
+  return b;
+}
+// A logged statement's clock prefix (replay): taken off, and the statement's clock set from it.
+static std::string takeClockPrefix(const std::string& sql) {
+  if (sql.compare(0, 5, "/*ws ") != 0) return sql;
+  const size_t end = sql.find("*/");
+  if (end == std::string::npos) return sql;
+  long long t = 0;
+  unsigned long long seed = 0;
+  if (sscanf(sql.c_str() + 5, "%lld %llu", &t, &seed) == 2) {
+    tStmtTimeUs = t;
+    tStmtSeed = seed;
+    tStmtRng.seed(seed);
+  }
+  size_t from = end + 2;
+  while (from < sql.size() && sql[from] == ' ') ++from;
+  return sql.substr(from);
+}
+
 ExprP boundNode(Expr::Kind k, const std::string& op, std::vector<ExprP> args, LType ty) {
   auto e = std::make_shared<Expr>();
   e->kind = k;
@@ -669,13 +705,13 @@ void bindFunc(ExprP& e, BindCtx& c) {
   // Constants evaluated at bind time.
   if (f == "NOW" || f == "CURRENT_TIMESTAMP" || f == "SYSDATE" || f == "LOCALTIME" || f == "LOCALTIMESTAMP" ||
       f == "UTC_TIMESTAMP") {
-    e = boundLit(Value::Ts(nowUs() / 1000000 * 1000000));
+    e = boundLit(Value::Ts(stmtNowUs() / 1000000 * 1000000));
     return;
   }
-  if (f == "CURDATE" || f == "CURRENT_DATE" || f == "UTC_DATE") { e = boundLit(Value::Dt(floorDiv(nowUs(), kUsPerDay))); return; }
+  if (f == "CURDATE" || f == "CURRENT_DATE" || f == "UTC_DATE") { e = boundLit(Value::Dt(floorDiv(stmtNowUs(), kUsPerDay))); return; }
   if (f == "PI") { e = boundLit(Value::D(3.141592653589793)); return; }
   if (f == "LAST_INSERT_ID") { e = boundLit(Value::I(tLastInsertId)); return; }
-  if (f == "UNIX_TIMESTAMP" && e->args.empty()) { e = boundLit(Value::I(nowUs() / 1000000)); return; }
+  if (f == "UNIX_TIMESTAMP" && e->args.empty()) { e = boundLit(Value::I(stmtNowUs() / 1000000)); return; }
   for (auto& a : e->args) bind(a, c);
   auto& A = e->args;
   const size_t n = A.size();
@@ -2372,10 +2408,11 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
       if (!a[i].isNull() && cmpVal(a[0], a[i]) == 0) return Value::I((int64_t)i);
     return Value::I(0);
   }
-  if (f == "UUID") {
+  if (f == "UUID") {  // version 4 (random), from the statement's generator
+    const uint64_t hi = tStmtRng(), lo = tStmtRng();
     char b[40];
-    snprintf(b, sizeof b, "%08x-%04x-4%03x-%04x-%012llx", (unsigned)rand(), (unsigned)rand() & 0xffff, (unsigned)rand() & 0xfff,
-             ((unsigned)rand() & 0x3fff) | 0x8000, ((unsigned long long)rand() << 20) ^ (unsigned long long)rand());
+    snprintf(b, sizeof b, "%08llx-%04llx-4%03llx-%04llx-%012llx", (unsigned long long)(hi >> 32), (unsigned long long)((hi >> 16) & 0xffff),
+             (unsigned long long)(hi & 0xfff), (unsigned long long)(((lo >> 48) & 0x3fff) | 0x8000), (unsigned long long)(lo & 0xffffffffffffull));
     return Value::S(b);
   }
   if (f == "JSON_ARRAY" || f == "JSON_OBJECT") {  // e->name: per argument '1' = JSON-typed (embedded raw)
@@ -2670,12 +2707,12 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
   }
   if (f == "BIT_COUNT") return Value::I(__builtin_popcountll((unsigned long long)(int64_t)num(0)));
   if (f == "RAND") {
-    thread_local std::mt19937_64 rng(std::random_device{}());
     if (!a.empty() && !a[0].isNull()) {  // RAND(seed): deterministic
       std::mt19937_64 seeded((uint64_t)(int64_t)num(0));
       return Value::D(std::uniform_real_distribution<double>(0, 1)(seeded));
     }
-    return Value::D(std::uniform_real_distribution<double>(0, 1)(rng));
+    if (!tStmtSeed) beginStatementClock();  // (outside a statement)
+    return Value::D(std::uniform_real_distribution<double>(0, 1)(tStmtRng));
   }
   if (f == "CONVERT_TZ") {
     int64_t us = a[0].kind == Value::DATETIME || a[0].kind == Value::DATE ? (a[0].kind == Value::DATE ? a[0].i * kUsPerDay : a[0].i) : 0;
@@ -3952,7 +3989,7 @@ std::vector<Value> defaultRow(const Table& t) {
     const ColumnMeta& c = t.cols[i];
     if (!c.hasDefault) continue;
     if (c.def.kind == Value::STR && c.def.s == "CURRENT_TIMESTAMP")
-      vals[i] = c.lt == LType::DATE ? Value::Dt(floorDiv(nowUs(), kUsPerDay)) : Value::Ts(nowUs() / 1000000 * 1000000);
+      vals[i] = c.lt == LType::DATE ? Value::Dt(floorDiv(stmtNowUs(), kUsPerDay)) : Value::Ts(stmtNowUs() / 1000000 * 1000000);
     else
       vals[i] = c.def;
   }
@@ -5093,14 +5130,14 @@ void Engine::logWrite(const std::string& sql, const std::string& db) {
   if (replaying_) return;
   const bool sync = needsSync(db);
   if (tTxn.active) {  // held until COMMIT
-    tTxn.wal.push_back(currentDb() + "\x1f" + sql);
+    tTxn.wal.push_back(currentDb() + "\x1f" + clockPrefix() + sql);
     tTxn.needSync = tTxn.needSync || sync;
     return;
   }
   uint64_t myLsn;
   {
     std::lock_guard<std::mutex> g(walMu_);
-    const std::string rec = currentDb() + "\x1f" + sql;
+    const std::string rec = currentDb() + "\x1f" + clockPrefix() + sql;
     try {
       walAppendLocked(rec);
     } catch (SqlError& e) {  // the change is applied but not logged: refuse writes until a restart
@@ -5180,6 +5217,7 @@ static std::counting_semaphore<1024>& gpuSlots() {
 }
 
 ResultSet Engine::execute(const std::string& sql) {
+  if (tExecDepth == 0) beginStatementClock();
   const std::string fw = tExecDepth == 0 ? firstWord(sql) : std::string();
   const bool query = fw == "SELECT" || fw == "WITH" || fw == "EXPLAIN" || fw == "PROFILE" || fw == "(";
   try {
@@ -5220,7 +5258,8 @@ ResultSet Engine::execute(const std::string& sql) {
   }
 }
 
-ResultSet Engine::executeStmt(const std::string& sql) {
+ResultSet Engine::executeStmt(const std::string& sqlIn) {
+  const std::string sql = takeClockPrefix(sqlIn);  // (a logged statement: its clock)
   if (tExecDepth == 0) tTxnViews.clear();  // visibility bitmaps of the previous statement
   ++tExecDepth;
   struct Depth {

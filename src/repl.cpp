@@ -37,7 +37,7 @@ void Engine::replAppend(const std::string& rec) {  // walMu_ held
     replBytes_ -= replRing_.front().second.size();
     replRing_.pop_front();
   }
-  static const std::regex loadRe(R"(^[^\x1f]*\x1f\s*LOAD\s+DATA\s+INFILE\s+'([^']*)')", std::regex::icase);
+  static const std::regex loadRe(R"(^[^\x1f]*\x1f(?:/\*ws [^*]*\*/ )?\s*LOAD\s+DATA\s+INFILE\s+'([^']*)')", std::regex::icase);
   std::smatch m;
   if (rec.size() < 4096 && strcasestr(rec.c_str(), "INFILE") && std::regex_search(rec, m, loadRe)) {
     std::lock_guard<std::mutex> g(replMu_);
@@ -244,7 +244,7 @@ void Engine::startReplica(const std::string& url) {
           size_t sep = rec.find('\x1f');
           std::string sql = sep == std::string::npos ? rec : rec.substr(sep + 1);
           if (sep != std::string::npos) currentDb() = rec.substr(0, sep);
-          static const std::regex loadRe(R"(^(\s*LOAD\s+DATA\s+INFILE\s+')([^']*)('[\s\S]*)$)", std::regex::icase);
+          static const std::regex loadRe(R"(^((?:/\*ws [^*]*\*/ )?\s*LOAD\s+DATA\s+INFILE\s+')([^']*)('[\s\S]*)$)", std::regex::icase);
           std::smatch m;
           std::string local;
           if (std::regex_match(sql, m, loadRe)) {  // fetch the file the primary loaded
