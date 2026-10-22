@@ -548,6 +548,27 @@ for i in range(max(N // 8, 10)):
     a, b = norm_rows(got, places=4), norm_rows(want, places=4)
     c.check(f"window {i}", a == b or rows_close(a, b, 1e-6, 1.5e-4),
             f"\n  {my}\n  warpstore {len(a)} rows {[(x, y) for x, y in zip(a, b) if x != y][:2]}")
+def rows_match(a, b, rel, abs_tol):
+    """Unordered rows equal within the tolerance: each row of a paired with a close row of b that has
+    the same non-numeric fields (sorting can pair them wrongly when rounding puts close numbers on
+    opposite sides of a boundary)."""
+    if len(a) != len(b):
+        return False
+    key = lambda r: tuple(x for x in r if not isinstance(x, (int, float)) or isinstance(x, bool))
+    groups = {}
+    for y in b:
+        groups.setdefault(key(y), []).append(y)
+    for x in a:
+        cand = groups.get(key(x), [])
+        for j, y in enumerate(cand):
+            if rows_close([x], [y], rel, abs_tol):
+                cand.pop(j)
+                break
+        else:
+            return False
+    return True
+
+
 errors = {}
 t0 = time.time()
 for i in range(N):
@@ -569,7 +590,9 @@ for i in range(N):
         coarse = lambda r: tuple((x is None, str(type(x)), round(x, 2) if isinstance(x, float) else x if x is not None else 0) for x in r)
         a, b = sorted(a, key=coarse), sorted(b, key=coarse)
     # 1.5e-4: MySQL rounds DECIMAL division to 4 places, DuckDB keeps more digits
-    c.check(f"q{i}", a == b or rows_close(a, b, 1e-6, 1.5e-4), f"\n  {my}\n  warpstore {len(a)} rows {a[:4]}\n  duckdb {len(b)} rows {b[:4]}")
+    ok = a == b or rows_close(a, b, 1e-6, 1.5e-4) or rows_match(a, b, 1e-6, 1.5e-4)
+    c.check(f"q{i}", ok, f"\n  {my}\n  warpstore {len(a)} rows {a[:4]}\n  duckdb {len(b)} rows {b[:4]}"
+            f"\n  differing: {[(x, y) for x, y in zip(a, b) if not rows_close([x], [y], 1e-6, 1.5e-4)][:3]}")
 print(f"{N} queries in {time.time() - t0:.1f}s, seed {SEED}")
 for k, v in sorted(errors.items(), key=lambda kv: -kv[1]):
     print(f"  {v:4d} x {k}")
