@@ -107,6 +107,18 @@ def main():
     cur.execute("BEGIN")
     cur.execute("INSERT INTO t (id, ts, r, u) VALUES (20, NOW(), RAND(), UUID())")
     cur.execute("COMMIT")
+    # order-dependent statements: LIMIT without ORDER BY, AUTO_INCREMENT numbers from INSERT .. SELECT
+    cur.execute("CREATE TABLE o (id INT AUTO_INCREMENT PRIMARY KEY, g INT, s VARCHAR(10))")
+    cur.execute("CREATE TABLE src (g INT, s VARCHAR(10), SORT KEY (g))")
+    cur.execute("INSERT INTO src VALUES " + ",".join(f"({(i * 37) % 101}, 's{i % 7}')" for i in range(500)))
+    cur.execute("INSERT INTO o (g, s) SELECT g, s FROM src WHERE g < 80")
+    cur.execute("INSERT INTO o (g, s) SELECT * FROM src WHERE g >= 80")
+    cur.execute("DELETE FROM src WHERE g > 20 LIMIT 100")
+    cur.execute("UPDATE src SET s = 'upd' WHERE g < 50 LIMIT 30")
+    cur.execute("SELECT id, g, s FROM o ORDER BY id")
+    o_before = [tuple(r) for r in cur.fetchall()]
+    cur.execute("SELECT g, s, COUNT(*) FROM src GROUP BY g, s ORDER BY g, s")
+    src_before = [tuple(r) for r in cur.fetchall()]
     cur.execute("SELECT * FROM t ORDER BY id")
     before = [tuple(r) for r in cur.fetchall()]
     time.sleep(1.1)
@@ -116,6 +128,10 @@ def main():
     cur.execute("SELECT * FROM nd.t ORDER BY id")
     c.eq("NOW / RAND / UUID / CURRENT_TIMESTAMP after replay", [tuple(r) for r in cur.fetchall()], before)
     c.check("UUID format", all(len(r[3]) == 36 and r[3][14] == "4" for r in before), [r[3] for r in before])
+    cur.execute("SELECT id, g, s FROM nd.o ORDER BY id")
+    c.eq("AUTO_INCREMENT numbers from INSERT .. SELECT after replay", [tuple(r) for r in cur.fetchall()], o_before)
+    cur.execute("SELECT g, s, COUNT(*) FROM nd.src GROUP BY g, s ORDER BY g, s")
+    c.eq("DELETE / UPDATE .. LIMIT after replay", [tuple(r) for r in cur.fetchall()], src_before)
     srv.stop()
     c.done()
 

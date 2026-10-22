@@ -6558,6 +6558,13 @@ static std::vector<std::vector<Value>> columnsToRows(const ResultSet& r) {
   return rows;
 }
 
+static ExprP boundLitOrdinal(int64_t i) {  // an (unbound) integer literal: ORDER BY <ordinal>
+  auto e = std::make_shared<Expr>();
+  e->kind = Expr::LIT;
+  e->lit = Value::I(i);
+  return e;
+}
+
 // INSERT .. SELECT from a columnar result: each target column is converted on its own (strings
 // recoded once per distinct value, matching types copied, anything else through a Value), then the
 // rows are appended in bulk (Table::appendColumns). Caller holds the table's exclusive lock.
@@ -6675,6 +6682,26 @@ ResultSet Engine::doInsert(Stmt& s) {
     ResultSet r;
     // Plain inserts outside a transaction take the result as columns (no per-row values).
     tInsertCols = !undoLog() && !s.insertIgnore && !s.replaceInto && s.onDup.empty();
+    // Rows whose order matters (LIMIT without ORDER BY; AUTO_INCREMENT numbers): ordered by all their
+    // values, so a WAL replay (recovery, replicas), whatever its physical row order, gets the same.
+    if (!s.select->unionNext && s.select->orderBy.empty() && !s.select->items.empty()) {
+      bool numbered = false;
+      if (auto tt = cat_.find(Catalog::key(s.table)); tt && tt->autoIncCol >= 0) {
+        numbered = s.insertCols.empty();
+        for (auto& c : s.insertCols) numbered = numbered || strcasecmp(c.c_str(), tt->cols[tt->autoIncCol].name.c_str()) == 0;
+      }
+      bool star = false;
+      for (auto& it : s.select->items) star = star || it.e->kind == Expr::STAR;
+      std::shared_ptr<Table> src;
+      if (star && s.select->from.size() == 1 && !s.select->from[0].sub && s.select->joinConds.empty())
+        src = cat_.find(Catalog::key(s.select->from[0].name));
+      if ((s.select->limit >= 0 || numbered) && !star)
+        for (size_t i = 0; i < s.select->items.size(); ++i)
+          s.select->orderBy.push_back(OrderItem{boundLitOrdinal((int64_t)i + 1), false});
+      else if ((s.select->limit >= 0 || numbered) && src && s.select->items.size() == 1)  // SELECT *: by the table's columns
+        for (auto& c : src->cols)
+          if (c.pt != PType::VEC) s.select->orderBy.push_back(OrderItem{mkCol(s.select->from[0].alias.empty() ? s.select->from[0].name : s.select->from[0].alias, c.name), false});
+    }
     try {
       r = query(*s.select, q, false, true);
     } catch (...) {
@@ -7142,6 +7169,9 @@ ResultSet Engine::modifyViaSelect(Stmt& s) {
   sel.limit = s.limit;
   const std::string alias = s.targetAlias.empty() ? sel.from[0].alias : s.targetAlias;
   for (auto& c : t->cols) sel.items.push_back({mkCol(alias, c.name), "__c" + std::to_string(sel.items.size())});
+  if (s.limit >= 0 && sel.orderBy.empty())  // LIMIT without ORDER BY: rows chosen by value, so a WAL replay picks the same ones
+    for (auto& c : t->cols)
+      if (c.pt != PType::VEC) sel.orderBy.push_back(OrderItem{mkCol(alias, c.name), false});
   std::vector<int> setCols;
   for (auto& [name, e] : s.sets) {
     const int c = t->colIndex(name);
