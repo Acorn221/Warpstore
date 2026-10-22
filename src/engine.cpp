@@ -2164,6 +2164,27 @@ ResultSet Engine::doAlter(Stmt& s) {
         }
         cur->indexes.push_back(indexMetaOf(a.index, *cur, ic));
         cur->buildIndex(cur->indexes.back());
+        if (const IndexMeta& ix = cur->indexes.back(); ix.unique && !ix.vec) {  // the rows there must not repeat a key
+          for (auto& [k, locs] : ix.map) {
+            if (locs.size() < 2) continue;
+            std::set<std::vector<int64_t>> seen;
+            for (const Loc& l : locs) {
+              std::vector<int64_t> tup(ix.cols.size());
+              bool null = false;
+              for (size_t q = 0; q < ix.cols.size() && !null; ++q) null = !cur->rawKey(l, ix.cols[q], tup[q]);
+              if (!null && !seen.insert(tup).second) {
+                const std::string name = ix.name;
+                cur->indexes.pop_back();
+                throw SqlError("Duplicate entry for key '" + name + "'", 1062);
+              }
+            }
+          }
+        }
+        continue;
+      }
+      case Stmt::Alter::ADD_PK: {  // only the one it has (adding / changing a primary key: not supported)
+        const bool same = cur->pk >= 0 && a.index.cols.size() == 1 && strcasecmp(a.index.cols[0].c_str(), cur->cols[cur->pk].name.c_str()) == 0;
+        if (cur->pk >= 0 && !same) throw SqlError("Multiple primary key defined", 1068);
         continue;
       }
       case Stmt::Alter::DROP_INDEX: {

@@ -227,6 +227,15 @@ for sql in ["REPLACE INTO rp VALUES (1, 10, 1), (4, NULL, 4)", "INSERT INTO rp V
 cur.execute("REPLACE INTO rp VALUES (1, 10, 1), (4, 4, 4)")
 c.eq("REPLACE that succeeds", q("SELECT COUNT(*), SUM(id), SUM(v), SUM(w) FROM rp"), [(4, Decimal(10), Decimal(19), Decimal(10))])
 
+# ALTER TABLE .. ADD UNIQUE KEY over repeated values (NULLs may repeat), a second PRIMARY KEY
+cur.execute("CREATE TABLE ak (id INT PRIMARY KEY, v INT)")
+cur.execute("INSERT INTO ak VALUES (1, 1), (2, NULL), (3, 1), (4, NULL)")
+c.raises("ADD UNIQUE KEY over duplicates refused", lambda: cur.execute("ALTER TABLE ak ADD UNIQUE KEY (v)"), 1062)
+c.raises("a second PRIMARY KEY refused", lambda: cur.execute("ALTER TABLE ak ADD PRIMARY KEY (v)"), 1068)
+cur.execute("UPDATE ak SET v = 2 WHERE id = 3")
+cur.execute("ALTER TABLE ak ADD UNIQUE KEY (v)")
+c.raises("the UNIQUE key added is enforced", lambda: cur.execute("INSERT INTO ak VALUES (5, 2)"), 1062)
+
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
 out = {}

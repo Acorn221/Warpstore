@@ -1793,7 +1793,7 @@ struct Parser {
             if (cur().k == Tok::ID || cur().k == Tok::QID) a.index.name = ident();
             a.index.cols = parenIdents();
           }
-          else if (acceptKw("PRIMARY")) { expectKw("KEY"); parenIdents(); a.kind = Stmt::Alter::NOOP; }
+          else if (acceptKw("PRIMARY")) { expectKw("KEY"); a.index.cols = parenIdents(); a.kind = Stmt::Alter::ADD_PK; }
           else if (acceptKw("UNIQUE") || isKw("KEY") || isKw("INDEX") || isKw("VECTOR")) {
             bool uq = t[p - 1].v.size() && strcasecmp(t[p - 1].v.c_str(), "UNIQUE") == 0;
             a.index.vector = acceptKw("VECTOR");
