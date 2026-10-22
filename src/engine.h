@@ -127,6 +127,7 @@ class Engine {
   // VRAM cache: a background thread moves segment columns between VRAM and the host tier by heat.
   void vramBalance();
   void tierBalance();  // host memory vs the segment files (--memory-limit)
+  void compactTables();  // merges segments full of deleted rows, and small ones
   std::atomic<bool> vramStop_{false};
   std::thread vramTh_;
   // Maintenance: an automatic SNAPSHOT once the WAL passes gSnapshotTriggerBytes (after recovery).

@@ -4048,9 +4048,17 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
     }
   });
   maintTh_ = std::thread([this] {
-    while (!vramStop_) {
+    for (int tick = 1; !vramStop_; ++tick) {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      if (!recovered_ || dir_.empty() || isReplica_ || gSnapshotTriggerBytes <= 0) continue;
+      if (!recovered_) continue;
+      if (tick % 10 == 0 && !envSetting("NO_COMPACT")) {
+        try {
+          compactTables();
+        } catch (std::exception& e) {
+          fprintf(stderr, "[warpstore] compaction: %s\n", e.what());
+        }
+      }
+      if (dir_.empty() || isReplica_ || gSnapshotTriggerBytes <= 0) continue;
       int64_t w;
       {
         std::lock_guard<std::mutex> g(walMu_);
@@ -4081,6 +4089,42 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
       if (behind) walSyncNow();
     }
   });
+}
+
+// Merges segments full of deleted rows, or small ones (Table::compactPlan): one partition at a
+// time, built outside the table lock.
+void Engine::compactTables() {
+  std::vector<std::shared_ptr<Table>> tabs;
+  {
+    std::lock_guard<std::mutex> g(cat_.mu);
+    for (auto& [k, t] : cat_.tables)
+      if (t->db != "__tmp") tabs.push_back(t);
+  }
+  for (auto& t : tabs) {
+    std::vector<CompactJob> jobs;
+    {
+      std::shared_lock<FairSharedMutex> lk(t->mu);
+      jobs = t->compactPlan();
+    }
+    for (auto& j : jobs) {
+      if (vramStop_) return;
+      const auto t0 = Clock::now();
+      int64_t rows = 0, dead = 0;
+      for (size_t k = 0; k < j.olds.size(); ++k) {
+        rows += j.olds[k]->n;
+        for (uint32_t w : j.bits[k]) dead += __builtin_popcount(w);
+      }
+      t->compactBuild(j);
+      bool ok;
+      {
+        std::unique_lock<FairSharedMutex> lk(t->mu);
+        ok = t->compactInstall(j);
+      }
+      if (ok && envSetting("TRACE"))
+        fprintf(stderr, "[trace] compacted %s partition %d: %zu segments (%lld rows, %lld dead) -> %zu in %.0f ms\n", t->name.c_str(), j.part,
+                j.olds.size(), (long long)rows, (long long)dead, j.news.size(), msSince(t0));
+    }
+  }
 }
 
 // Host memory under --memory-limit (see SegFile): over 90% of the limit, the coldest column data is
@@ -4578,7 +4622,10 @@ void Engine::walDurable(bool wait) {
 }
 
 void Engine::recover() {
-  if (dir_.empty()) return;
+  if (dir_.empty()) {
+    recovered_ = true;
+    return;
+  }
   replaying_ = true;
   loadSnapshot(dir_ + "/snapshot.bin");
   replaying_ = false;

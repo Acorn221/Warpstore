@@ -532,6 +532,16 @@ struct Loc {
 inline Loc bufLoc(int part, int64_t row) { return Loc{-1 - part, (int32_t)row}; }
 inline int bufPart(Loc l) { return -1 - l.seg; }
 
+struct Segment;
+// One partition's compaction (Table::compactPlan / compactBuild / compactInstall).
+struct CompactJob {
+  int part = -1;
+  std::vector<std::shared_ptr<Segment>> olds;  // the segments merged
+  std::vector<std::vector<uint32_t>> bits;     // their deleted-row bits when planned
+  std::vector<std::shared_ptr<Segment>> news;  // the new segments
+  std::vector<std::vector<Loc>> where;         // per old segment and row: its place in news (seg -1: dead)
+};
+
 // CAGRA vector index state: one GPU graph per segment (by segment id), built when first searched.
 struct CagraGraph;
 struct CagraState {
@@ -722,6 +732,14 @@ struct Table {
   void gcPending();             // drops committed change sets no snapshot needs (caller holds the exclusive lock)
   void flush(bool force);  // all partitions' buffers -> sorted GPU segment(s)
   void flushPart(int part);
+  // A segment of partition `part` from n rows: row i is row idx[i] of the raw column bytes src(c)
+  // (stats, encoding and placement as in a flush; not added to segs).
+  std::shared_ptr<Segment> makeSegment(int part, size_t n, const std::function<const uint8_t*(int)>& src, const int32_t* idx) const;
+  // Compaction (see storage.cu): plan under the shared lock, build without a lock, install under the
+  // exclusive lock (false: the table changed shape meanwhile; try again later).
+  std::vector<struct CompactJob> compactPlan() const;
+  void compactBuild(struct CompactJob& j) const;
+  bool compactInstall(struct CompactJob& j);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
   // srcOf[c]: which field of each line feeds column c (-1: NULL / AUTO_INCREMENT); empty = in order.
   // yield: called every 256K rows with no row half-written (the caller may drop and retake its lock).
