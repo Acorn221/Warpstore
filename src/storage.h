@@ -822,14 +822,14 @@ struct WriteBuffer {
 
 // Deferred frees for memory a running query may still read (MVCC): rcuEnter/rcuExit bracket a
 // snapshot query; rcuDefer runs `fn` once every query that entered before the call has exited.
-uint64_t rcuEnter();
-void rcuExit(uint64_t ticket);
-void rcuDefer(std::function<void()> fn);
-struct RcuGuard {  // (a reader outside a query's snapshot scope: compaction, snapshot writing, the tier balancer)
-  uint64_t ticket = rcuEnter();
+uint64_t rcuEnter(bool background = false);
+void rcuExit(uint64_t ticket, bool background = false);
+void rcuDefer(std::function<void()> fn, bool waitBackground = false);  // waitBackground: also for RcuGuard holders
+struct RcuGuard {  // (a background reader of segment data: compaction, snapshot writing, the tier balancer)
+  uint64_t ticket = rcuEnter(true);
   RcuGuard() = default;
   RcuGuard(const RcuGuard&) = delete;
-  ~RcuGuard() { rcuExit(ticket); }
+  ~RcuGuard() { rcuExit(ticket, true); }
 };
 // Runs fn(i) for i in [0, n) on the I/O thread pool and waits (fn must not throw). Urgent work goes
 // ahead of what is queued.

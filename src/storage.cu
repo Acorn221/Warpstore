@@ -162,18 +162,27 @@ void WriteBuffer::reserveForAppend(int64_t rows) {
   }
 }
 
-// ---- RCU: a ticket per snapshot query; deferred frees wait for the queries older than them.
+// ---- RCU: a ticket per snapshot query; deferred frees wait for the queries older than them. Long
+// background readers (snapshot writing, compaction, the tier balancer: RcuGuard) hold tickets of
+// their own, which only the frees that ask for it (column versions an UPDATE replaced) wait for:
+// VRAM the cache gives up isn't held back for a snapshot that takes seconds.
 namespace {
 std::mutex rcuMu;
 uint64_t rcuNext = 1;
-std::multiset<uint64_t> rcuActive;
-std::vector<std::pair<uint64_t, std::function<void()>>> rcuPending;  // (ticket at deferral, free)
+std::multiset<uint64_t> rcuActive, rcuLong;
+struct RcuFree {
+  uint64_t ticket;
+  bool waitLong;
+  std::function<void()> fn;
+};
+std::vector<RcuFree> rcuPending;
 void rcuReclaim(std::unique_lock<std::mutex>& lk) {
   const uint64_t oldest = rcuActive.empty() ? UINT64_MAX : *rcuActive.begin();
+  const uint64_t oldestLong = rcuLong.empty() ? UINT64_MAX : *rcuLong.begin();
   std::vector<std::function<void()>> run;
   for (size_t i = 0; i < rcuPending.size();)
-    if (rcuPending[i].first <= oldest) {
-      run.push_back(std::move(rcuPending[i].second));
+    if (rcuPending[i].ticket <= oldest && (!rcuPending[i].waitLong || rcuPending[i].ticket <= oldestLong)) {
+      run.push_back(std::move(rcuPending[i].fn));
       rcuPending[i] = std::move(rcuPending.back());
       rcuPending.pop_back();
     } else {
@@ -185,23 +194,24 @@ void rcuReclaim(std::unique_lock<std::mutex>& lk) {
 }
 }  // namespace
 
-uint64_t rcuEnter() {
+uint64_t rcuEnter(bool background) {
   std::lock_guard<std::mutex> g(rcuMu);
   const uint64_t t = rcuNext++;
-  rcuActive.insert(t);
+  (background ? rcuLong : rcuActive).insert(t);
   return t;
 }
 
-void rcuExit(uint64_t ticket) {
+void rcuExit(uint64_t ticket, bool background) {
   std::unique_lock<std::mutex> lk(rcuMu);
-  rcuActive.erase(rcuActive.find(ticket));
+  auto& set = background ? rcuLong : rcuActive;
+  set.erase(set.find(ticket));
   if (!rcuPending.empty()) rcuReclaim(lk);
 }
 
-void rcuDefer(std::function<void()> fn) {
+void rcuDefer(std::function<void()> fn, bool waitBackground) {
   std::unique_lock<std::mutex> lk(rcuMu);
-  // queries that entered before now hold tickets < rcuNext: run once all of those have exited
-  rcuPending.push_back({rcuNext++, std::move(fn)});
+  // readers that entered before now hold tickets < rcuNext: run once all of those have exited
+  rcuPending.push_back({rcuNext++, waitBackground, std::move(fn)});
   rcuReclaim(lk);
 }
 
@@ -1307,7 +1317,7 @@ void Table::replaceColumns(const std::vector<int32_t>& sis, const std::vector<in
   // Snapshots of the table taken earlier still read the old versions: freed after them.
   rcuDefer([olds] {
     for (auto& [d, c] : olds) segDropColumn(*d, c);
-  });
+  }, true);
 }
 
 std::shared_ptr<Segment> Table::makeSegment(int part, size_t n, const std::function<const uint8_t*(int)>& src, const int32_t* idx) const {
