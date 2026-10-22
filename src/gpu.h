@@ -144,6 +144,8 @@ struct TempColSpec {
   double div = 1;   // DECIMAL raw sums: 10^scale
   double mul = 1;   // constant factor (an item like 0.5 * SUM(x)); not 1: a double result
 };
+// Bitmap (cudaMalloc'd, nbits bits; sawNull: any NULL) of the non-NULL values of an INT (out 0) / BIGINT (out 1) device column, offset by base.
+uint32_t* gpuBitsFromColumn(const void* col, int out, int64_t n, int64_t base, int64_t nbits, bool* sawNull);
 void* gpuTempColumn(const double* keys, int nk, const double* accs, int na, int64_t g, const TempColSpec& s, double& mn, double& mx);
 // out[j] = eval(prog, idx ? idx[j] : j)
 void gpuEvalAt(const ExprEnv& env, Prog prog, const int32_t* idx, int64_t m, double* out);

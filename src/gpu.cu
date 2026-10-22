@@ -833,6 +833,35 @@ __global__ void tempColKernel(const double* keys, int nk, const double* accs, in
     else ((int32_t*)out)[r] = nul ? kNullI32 : (int32_t)v;
   }
 }
+__global__ void bitsFromColKernel(const void* col, int out, int64_t n, long long base, long long nbits, uint32_t* bits, int* nul) {
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < n; i += (int64_t)gridDim.x * blockDim.x) {
+    long long v;
+    if (out == 1) {
+      v = ((const long long*)col)[i];
+      if (v == kNullI64) { *nul = 1; continue; }
+    } else {
+      const int32_t x = ((const int32_t*)col)[i];
+      if (x == kNullI32) { *nul = 1; continue; }
+      v = x;
+    }
+    const long long k = v - base;
+    if (k >= 0 && k < nbits) atomicOr(&bits[k >> 5], 1u << (k & 31));
+  }
+}
+uint32_t* gpuBitsFromColumn(const void* col, int out, int64_t n, int64_t base, int64_t nbits, bool* sawNull) {
+  uint32_t* bits = nullptr;
+  const size_t bytes = std::max<size_t>(4, (size_t)((nbits + 31) / 32) * 4);
+  CK(cudaMalloc(&bits, bytes));
+  CK(cudaMemset(bits, 0, bytes));
+  DevVec<int> nul(1);
+  CK(cudaMemset(nul.p, 0, 4));
+  if (n > 0) bitsFromColKernel<<<gridFor(n), 256>>>(col, out, n, base, nbits, bits, nul.p);
+  CK(cudaGetLastError());
+  int h = 0;
+  d2h(&h, nul.p, 4);
+  *sawNull = h != 0;
+  return bits;
+}
 void* gpuTempColumn(const double* keys, int nk, const double* accs, int na, int64_t g, const TempColSpec& s, double& mn, double& mx) {
   const size_t w = s.out == 0 ? 4 : 8;
   void* out = nullptr;

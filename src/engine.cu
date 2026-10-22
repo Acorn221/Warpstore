@@ -567,6 +567,22 @@ int64_t addInterval(int64_t days, int64_t n, const std::string& unit) {
 }
 
 thread_local int64_t tLastInsertId = 0;  // per connection, like MySQL
+// "#INBITS": an IN (SELECT ..) value set as a device bitmap (bit k: value base + k), host copy on demand.
+struct DevBits {
+  uint32_t* p = nullptr;
+  int64_t nbits = 0, base = 0;
+  std::once_flag once;
+  std::vector<uint32_t> host;
+  ~DevBits() { if (p) devFree(p); }
+  bool test(int64_t v) {
+    std::call_once(once, [&] {
+      host.resize((size_t)(nbits + 31) / 32);
+      if (!host.empty()) d2h(host.data(), p, host.size() * 4);
+    });
+    const int64_t k = v - base;
+    return k >= 0 && k < nbits && (host[(size_t)k >> 5] >> (k & 31) & 1u);
+  }
+};
 thread_local int64_t tFoundRows = 0;     // FOUND_ROWS(): rows of the last SELECT (without its LIMIT if SQL_CALC_FOUND_ROWS)
 thread_local std::vector<std::string> tTempTables;  // CREATE TEMPORARY TABLE: dropped when the connection ends
 std::string dbOf(const std::string& name) {
@@ -739,7 +755,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
     e = r;
     if (allLits(e) && !isNullLit(e) && e->kind != Expr::LIT) e = boundLit(evalConst(e));
   };
-  if (f == "ISNULL" || f == "ISNOTNULL" || f == "#INSORTED") { argc(1, 1); e->ty = LType::INT; e->bound = true; return; }
+  if (f == "ISNULL" || f == "ISNOTNULL" || f == "#INSORTED" || f == "#INBITS") { argc(1, 1); e->ty = LType::INT; e->bound = true; return; }
   if (f == "ISTRUE" || f == "ISFALSE") {
     argc(1, 1);
     ExprP one = boundLit(Value::I(1)), zero = boundLit(Value::I(0));
@@ -1662,6 +1678,12 @@ struct Compiler {
           emit(OP_COLRAW, slot(e->args[0]->bt, e->args[0]->bc), 1, !nullable(e->args[0], *ctx));
           return;
         }
+        if (e->op == "#INBITS") {  // arg: x - base; bit test in the device bitmap
+          auto* b = (DevBits*)e->devAux.get();
+          gen(e->args[0]);
+          emit(OP_INSET, addDeviceSet(b->p, (int)b->nbits), 0);
+          return;
+        }
         if (e->op == "#MAP" || e->op == "#INSORTED") {
           gen(e->args[0]);
           emit(e->op == "#MAP" ? OP_DICTMAP : OP_INSORTED, addMap(e->aux.get()), 0);
@@ -1900,6 +1922,12 @@ Value evalPost(const ExprP& e, const PostCtx& c) {
           acc += e->op == "#VDOT" ? v[i] * q : (v[i] - q) * (v[i] - q);
         }
         return Value::D(e->op == "#VDOT" ? acc : std::sqrt(acc));
+      }
+      if (e->op == "#INBITS") {  // (args[0] is x - base)
+        Value x = evalPost(e->args[0], c);
+        if (x.isNull()) return x;
+        auto* b = (DevBits*)e->devAux.get();
+        return Value::I(b->test((int64_t)std::llround(numOf(x)) + b->base));
       }
       if (e->op == "#INSORTED") {
         Value x = evalPost(e->args[0], c);
@@ -9748,6 +9776,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
           rankOf[k] = sortedDict(*ctx.dict(*oe)).second;
         }
     }
+    ProfStage psub("  finalize: setup");
+    psub.done();
     if (!identity) {
       const size_t nchunks = std::max<size_t>(1, std::min<size_t>(64, (size_t)groups / 16384));
       std::vector<std::vector<int64_t>> keepC(nchunks);
@@ -9804,6 +9834,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
       }
     }
     const size_t nkeep = identity ? (size_t)groups : keep.size();
+    psub.stage = "  finalize: filter + sort keys";
+    psub.done(nkeep);
     // A VARCHAR GROUP BY key can be a column of dictionary codes in the columnar result (its dictionary,
     // when small, is copied into the temp table).
     auto codeKey = [&](const ExprP& e) {
@@ -9826,15 +9858,66 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     size_t want = s.limit < 0 ? nkeep : std::min<size_t>(nkeep, (size_t)(s.offset + s.limit));
     if (!orderBy.empty()) {
+      // All-numeric keys (numbers, dates, string ranks): compared as one flat array of doubles.
+      // String keys: their distinct values sorted once (collation order), compared by rank.
+      const size_t K = orderBy.size();
+      bool flat = true;
+      std::vector<std::unordered_map<std::string, double>> strRank(K);
+      for (size_t k = 0; k < K && flat; ++k) {
+        bool str = false, num = false;
+        for (auto& sk : sortKeys) {
+          const Value& v = sk[k];
+          if (v.isNull()) continue;
+          if (v.kind == Value::STR) str = true;
+          else num = true;
+          if (v.kind != Value::DBL && v.kind != Value::STR && std::llabs(v.i) > (1ll << 53)) flat = false;
+        }
+        if (str && num) flat = false;
+        if (!str || !flat) continue;
+        std::vector<const Value*> u;
+        for (auto& sk : sortKeys)
+          if (!sk[k].isNull() && strRank[k].emplace(sk[k].s, 0).second) u.push_back(&sk[k]);
+        std::sort(u.begin(), u.end(), [](const Value* a, const Value* b) { return cmpVal(*a, *b) < 0; });
+        double r = 0;
+        for (size_t i = 0; i < u.size(); ++i) {
+          if (i && cmpVal(*u[i - 1], *u[i]) != 0) ++r;  // (equal under the collation: same rank)
+          strRank[k][u[i]->s] = r;
+        }
+      }
+      std::vector<double> fk;
+      if (flat) {
+        fk.resize(sortKeys.size() * K);
+        for (size_t i = 0; i < sortKeys.size(); ++i)
+          for (size_t k = 0; k < K; ++k) {
+            const Value& v = sortKeys[i][k];
+            fk[i * K + k] = v.isNull() ? NAN : v.kind == Value::STR ? strRank[k][v.s] : v.num();
+          }
+      }
       auto less = [&](size_t a, size_t b) {
-        for (size_t k = 0; k < orderBy.size(); ++k) {
+        if (flat) {
+          const double* x = &fk[a * K];
+          const double* y = &fk[b * K];
+          for (size_t k = 0; k < K; ++k) {
+            const bool nx = x[k] != x[k], ny = y[k] != y[k];
+            const int c = nx || ny ? (nx == ny ? 0 : nx ? -1 : 1) : (x[k] < y[k] ? -1 : x[k] > y[k] ? 1 : 0);  // (NULLs first)
+            if (c) return orderBy[k].desc ? c > 0 : c < 0;
+          }
+          return a < b;
+        }
+        for (size_t k = 0; k < K; ++k) {
           int c = cmpVal(sortKeys[a][k], sortKeys[b][k]);
           if (c) return orderBy[k].desc ? c > 0 : c < 0;
         }
         return a < b;
       };
-      std::partial_sort(order.begin(), order.begin() + want, order.end(), less);
+      if (want * 4 >= order.size()) {
+        std::sort(order.begin(), order.end(), less);
+      } else {
+        std::partial_sort(order.begin(), order.begin() + want, order.end(), less);
+      }
     }
+    psub.stage = "  finalize: sort";
+    psub.done();
     std::vector<std::vector<Value>> rows, noKeys;
     bool allNumeric = tColumnar && orderBy.empty() && !having && s.limit < 0 && s.offset == 0;
     for (auto& it : items) allNumeric = allNumeric && (it.e->ty != LType::VARCHAR || codeKey(it.e)) && it.e->ty != LType::VECTOR;
@@ -10997,6 +11080,22 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
     }
     if (e->kind == Expr::INLIST && e->sub) {
       Stmt sub = cloneStmt(*e->sub);
+      // x [NOT] IN (set): membership f; with a NULL in the set, "not found" is NULL (IF(f, 1, NULL)).
+      auto setTest = [&](ExprP f, bool hasNull) {
+        if (hasNull) {
+          auto i = std::make_shared<Expr>();
+          i->kind = Expr::FUNC;
+          i->op = "IF";
+          i->args = {f, mkLit(Value::I(1)), mkLit(Value::Null())};
+          f = i;
+        }
+        if (!e->neg) return f;
+        auto n = std::make_shared<Expr>();
+        n->kind = Expr::UNARY;
+        n->op = "NOT";
+        n->args = {f};
+        return ExprP(n);
+      };
       if (correlated(sub)) {
         // x IN (SELECT c .. WHERE w) -> EXISTS (SELECT 1 .. WHERE w AND c = x); NOT IN ->
         // NOT EXISTS (.. AND (c = x OR c IS NULL OR x IS NULL)) (true only when nothing could match).
@@ -11048,21 +11147,75 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
         fix(e);
         return;
       }
-      // Only the set of values matters: numbers come back as one raw array (no row objects).
-      tRawNumber = true;
-      ResultSet r;
-      try {
-        r = query(sub, q, false, true);
-      } catch (...) {
-        tRawNumber = false;
-        throw;
+      // Integer values: the distinct values computed on the GPU stay there, as a bitmap the filter
+      // tests (no host round trip), when their range is compact.
+      std::shared_ptr<std::vector<double>> pre;  // else: the distinct numbers, if they came back to the host
+      {
+        bool plain = sub.items.size() == 1 && sub.groupBy.empty() && !sub.having && sub.limit < 0 && !sub.unionNext;
+        for (auto& it : sub.items) plain = plain && !hasAgg(it.e) && !it.e->window;
+        if (plain) {
+          Stmt ds = cloneStmt(sub);
+          ds.distinct = true;
+          ds.orderBy.clear();
+          tColumnar = true;
+          ResultSet r;
+          try {
+            r = query(ds, q, false, true);
+          } catch (...) {
+            tColumnar = false;
+            throw;
+          }
+          tColumnar = false;
+          const bool intTy = !r.types.empty() && (r.types[0] == LType::INT || r.types[0] == LType::BIGINT || r.types[0] == LType::DATE);
+          if (r.devCols.size() == 1 && intTy) {
+            const auto& dc = r.devCols[0];
+            const bool neg = e->neg;
+            if (r.devRows == 0) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+            if (!(dc->mn <= dc->mx)) {  // only NULL: never true; NULL unless x is .. (x IN (NULL) is NULL)
+              e = setTest(mkLit(Value::I(0)), true);
+              return;
+            }
+            const double span = dc->mx - dc->mn + 1;
+            if (span <= (double)(1 << 28) && span <= 64.0 * (double)std::max<int64_t>(r.devRows, 1 << 16)) {
+              auto b = std::make_shared<DevBits>();
+              b->base = (int64_t)dc->mn;
+              b->nbits = (int64_t)span;
+              bool hasNull = false;
+              b->p = gpuBitsFromColumn(dc->p, r.types[0] == LType::BIGINT ? 1 : 0, r.devRows, b->base, b->nbits, &hasNull);
+              auto f = std::make_shared<Expr>();
+              f->kind = Expr::FUNC;
+              f->op = "#INBITS";
+              f->args = {mkBin("-", e->args[0], mkLit(Value::I(b->base)))};
+              f->devAux = b;
+              e = setTest(f, hasNull);
+              return;
+            }
+          }
+          if (r.numCols.size() == 1 && !r.types.empty() && r.types[0] != LType::VARCHAR && r.devCols.empty())
+            pre = std::make_shared<std::vector<double>>(std::move(r.numCols[0]));
+        }
       }
-      tRawNumber = false;
+      // Only the set of values matters: numbers come back as one raw array (no row objects).
+      ResultSet r;
+      if (pre) {
+        r.numCol = pre;
+      } else {
+        tRawNumber = true;
+        try {
+          r = query(sub, q, false, true);
+        } catch (...) {
+          tRawNumber = false;
+          throw;
+        }
+        tRawNumber = false;
+      }
       if (r.numCol) {
         auto vals = r.numCol;
+        const size_t before = vals->size();
         vals->erase(std::remove_if(vals->begin(), vals->end(), [](double v) { return v != v; }), vals->end());
-        const bool neg = e->neg;
-        if (vals->empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+        const bool neg = e->neg, hasNull = vals->size() != before;
+        if (before == 0) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+        if (vals->empty()) { e = setTest(mkLit(Value::I(0)), true); return; }
         // Sorted distinct values: integers in a compact range through a bitmap (no sort), else a sort.
         double lo = (*vals)[0], hi = lo;
         bool integral = true;
@@ -11089,34 +11242,31 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
         f->op = "#INSORTED";
         f->args = {e->args[0]};
         f->aux = vals;
-        if (neg) {
-          auto n = std::make_shared<Expr>();
-          n->kind = Expr::UNARY;
-          n->op = "NOT";
-          n->args = {f};
-          e = n;
-        } else {
-          e = f;
-        }
+        e = setTest(f, hasNull);
         return;
       }
       if (r.names.size() != 1) throw SqlError("Operand should contain 1 column(s)", 1241);
       const bool neg = e->neg;
       ExprP x = e->args[0];
+      bool hasNull = false;
+      for (auto& row : r.vals) hasNull = hasNull || row[0].isNull();
+      if (r.vals.empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
       if (r.types[0] == LType::VARCHAR) {
         std::set<std::string> vs;
         for (auto& row : r.vals)
           if (!row[0].isNull()) vs.insert(row[0].toString());
-        if (vs.empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
-        e->args = {x};
-        for (auto& v : vs) e->args.push_back(mkLit(Value::S(v)));
-        e->sub.reset();
+        if (vs.empty()) { e = setTest(mkLit(Value::I(0)), true); return; }
+        auto in = std::make_shared<Expr>();
+        in->kind = Expr::INLIST;
+        in->args = {x};
+        for (auto& v : vs) in->args.push_back(mkLit(Value::S(v)));
+        e = setTest(in, hasNull);
         return;
       }
       auto vals = std::make_shared<std::vector<double>>();
       for (auto& row : r.vals)
         if (!row[0].isNull()) vals->push_back(numOf(row[0]));
-      if (vals->empty()) { e = mkLit(Value::I(neg ? 1 : 0)); return; }
+      if (vals->empty()) { e = setTest(mkLit(Value::I(0)), true); return; }
       std::sort(vals->begin(), vals->end());
       vals->erase(std::unique(vals->begin(), vals->end()), vals->end());
       auto f = std::make_shared<Expr>();
@@ -11124,15 +11274,7 @@ void Engine::resolveSubqueries(Stmt& s, QueryCtx& q) {
       f->op = "#INSORTED";
       f->args = {x};
       f->aux = vals;
-      if (neg) {
-        auto n = std::make_shared<Expr>();
-        n->kind = Expr::UNARY;
-        n->op = "NOT";
-        n->args = {f};
-        e = n;
-      } else {
-        e = f;
-      }
+      e = setTest(f, hasNull);
     }
   };
   walkStmtExprs(s, fix);

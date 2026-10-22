@@ -25,6 +25,7 @@ struct Expr {
   int scale = -1;           // DECIMAL-typed expressions: digits after the point
   std::shared_ptr<Stmt> sub;  // SUBQUERY (scalar), INLIST (x IN (SELECT ..)), FUNC EXISTS
   std::shared_ptr<std::vector<double>> aux;  // "#MAP" code->value table, "#INSORTED" sorted values
+  std::shared_ptr<void> devAux;               // "#INBITS": device bitmap of IN (SELECT ..) values (engine.cu DevBits)
   // Window functions: f(..) OVER (PARTITION BY .. ORDER BY .. [ROWS BETWEEN lo AND hi])
   bool window = false;
   std::vector<ExprP> partBy;

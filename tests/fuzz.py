@@ -208,8 +208,15 @@ def pred(tabs, depth=0):
         return _between(a, lo)
     if r < 0.72:
         a = col(tabs, "int")
-        vals = ", ".join(str(R.randint(-10, 10)) for _ in range(R.randint(1, 5)))
         neg = "NOT " if R.random() < 0.3 else ""
+        if depth < 2 and R.random() < 0.3:  # uncorrelated IN (SELECT ..): integer sets (GPU bitmap path)
+            sc = R.choice(["z.x", "z.t1_id", "z.id", "z.x * 3"])
+            w = pred([("z", "t2")], depth + 1) if R.random() < 0.6 else None
+            nn = ""  # (NULLs in the set: "not found" is NULL, also under NOT)
+            my = f"{a.my} {neg}IN (SELECT {sc} FROM t2 z WHERE 1 = 1{' AND ' + w.my if w else ''}{nn})"
+            dk = f"{a.dk} {neg}IN (SELECT {sc} FROM t2 z WHERE 1 = 1{' AND ' + w.dk if w else ''}{nn})"
+            return Q(my, dk)
+        vals = ", ".join(str(R.randint(-10, 10)) for _ in range(R.randint(1, 5)))
         return Q(f"{a.my} {neg}IN ({vals})", f"{a.dk} {neg}IN ({vals})")
     if r < 0.8:
         a = R.choice([col(tabs, "num"), col(tabs, "str") or col(tabs, "num")])
