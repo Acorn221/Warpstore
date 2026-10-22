@@ -5481,15 +5481,23 @@ std::mutex gWaitMu;
 std::map<const void*, std::set<const void*>> gWaitsFor;  // waiting transaction -> transactions it waits for
 std::set<const void*> blockersOf(const Table& t, const std::vector<Loc>* rows) {
   std::set<const void*> out;
-  std::unordered_set<uint64_t> want;
-  if (rows)
-    for (const Loc& l : *rows) want.insert(TxnPending::key(l));
   for (auto& [k, v] : t.txnPending) {
     if (k == txnKey() || v.commitSeq || (v.hidden.empty() && v.ghosts.empty())) continue;
-    bool hit = !rows;
-    for (size_t i = 0; !hit && i < v.hidden.size(); ++i) hit = want.count(TxnPending::key(v.hidden[i])) > 0;
-    for (size_t i = 0; !hit && i < v.ghosts.size(); ++i) hit = want.count(TxnPending::key(v.ghosts[i])) > 0;
-    if (hit) out.insert(k);
+    if (!rows) {
+      out.insert(k);
+      continue;
+    }
+    // (the transaction's rows hashed, usually far fewer than the statement's: no set of a big
+    // UPDATE's matched rows when nothing is pending)
+    std::unordered_set<uint64_t> theirs;
+    theirs.reserve(v.hidden.size() + v.ghosts.size());
+    for (const Loc& l : v.hidden) theirs.insert(TxnPending::key(l));
+    for (const Loc& l : v.ghosts) theirs.insert(TxnPending::key(l));
+    for (const Loc& l : *rows)
+      if (theirs.count(TxnPending::key(l))) {
+        out.insert(k);
+        break;
+      }
   }
   return out;
 }
