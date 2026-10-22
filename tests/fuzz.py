@@ -94,7 +94,14 @@ for sql in (f"SELECT DISTINCT {ks} FROM t4 ORDER BY {ks}",
             f"SELECT {ks}, COUNT(*), SUM(v) FROM t4 GROUP BY {ks} HAVING COUNT(*) > 1 ORDER BY 11 DESC, {ks} LIMIT 50",
             f"SELECT k3 + k4, {ks}, MAX(v) FROM t4 WHERE k0 IS NOT NULL GROUP BY {ks} ORDER BY {ks} LIMIT 40",
             "SELECT COUNT(DISTINCT k1), COUNT(DISTINCT k2), COUNT(*), SUM(v), COUNT(DISTINCT k1 + k2) FROM t4 WHERE k0 > -5",
-            "SELECT COUNT(DISTINCT s), COUNT(DISTINCT a), COUNT(DISTINCT d) FROM t1"):
+            "SELECT COUNT(DISTINCT s), COUNT(DISTINCT a), COUNT(DISTINCT d) FROM t1",
+            # window functions over a GROUP BY (columnar window path)
+            "SELECT s, COUNT(*) c, RANK() OVER (ORDER BY COUNT(*) DESC, s), SUM(COUNT(*)) OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "
+            "LAG(COUNT(*)) OVER (ORDER BY s), ROW_NUMBER() OVER (PARTITION BY COUNT(*) % 3 ORDER BY s) FROM t1 WHERE s IS NOT NULL GROUP BY s ORDER BY s",
+            "SELECT a, SUM(b) sb, DENSE_RANK() OVER (PARTITION BY a % 4 ORDER BY SUM(b)), MAX(MAX(s)) OVER (PARTITION BY a % 4), "
+            "AVG(SUM(b)) OVER (PARTITION BY a % 4 ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), COUNT(*) OVER () FROM t1 WHERE a IS NOT NULL GROUP BY a ORDER BY a",
+            "SELECT id % 50 k, COUNT(*) c, NTILE(4) OVER (ORDER BY id % 50), FIRST_VALUE(COUNT(*)) OVER (ORDER BY id % 50 DESC), "
+            "MIN(MIN(m)) OVER (ORDER BY id % 50) FROM t1 GROUP BY id % 50 ORDER BY 1"):
     g.execute(sql)
     MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 for sql in ("SELECT DISTINCT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d FROM t1 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
@@ -338,7 +345,8 @@ def gen():
 c = Checker()
 c.eq("INSERT .. SELECT copies", *INSERT_CHECK)
 for sql, mine, theirs in MANY_KEYS:
-    c.check("many GROUP BY keys: " + sql[:60], norm_rows(mine) == norm_rows(theirs), f"{len(mine)} vs {len(theirs)} rows")
+    c.check("many GROUP BY keys: " + sql[:60], norm_rows(mine) == norm_rows(theirs),
+            f"{len(mine)} vs {len(theirs)} rows; first difference: " + str([(x, y) for x, y in zip(norm_rows(mine), norm_rows(theirs)) if x != y][:2]))
 errors = {}
 t0 = time.time()
 for i in range(N):

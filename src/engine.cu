@@ -577,6 +577,7 @@ std::string plainName(const std::string& name) {
   return d == std::string::npos ? name : name.substr(d + 1);
 }
 thread_local bool tWantVals = false;     // doSelect returns typed rows (for nested queries)
+thread_local bool tWinOuterCols = false;  // windows(): its final projection may come back as columns
 
 int64_t nowUs() {
   return std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -9907,8 +9908,48 @@ std::string Engine::makeTemp(const ResultSet& r, QueryCtx& q, const std::string&
     cols.push_back(m);
   }
   if (cols.empty()) throw SqlError("derived table has no columns", 1105);
+  if (r.insertCols)  // typed columns (a projection): DECIMAL scales from the result
+    for (size_t i = 0; i < cols.size() && i < r.colScales.size(); ++i)
+      if (r.types[i] == LType::DECIMAL) {
+        cols[i].lt = r.colScales[i] >= 0 ? LType::DECIMAL : LType::DOUBLE;
+        cols[i].scale = std::max(0, r.colScales[i]);
+        cols[i].pt = physOf(cols[i].lt);
+      }
   auto t = std::make_shared<Table>(name, cols, -1, -1, std::vector<int>{}, std::vector<int>{}, 1, false);
   t->db = "__tmp";  // (before the rows: temporary tables stay out of the session's transaction)
+  if (r.insertCols) {  // a projection's columns: appended as they are (strings keep their codes and dictionary)
+    const size_t nc = cols.size();
+    int64_t n = 0;
+    for (size_t i = 0; i < nc; ++i) n = std::max<int64_t>(n, !r.intCols[i].empty() ? (int64_t)r.intCols[i].size() : (int64_t)r.numCols[i].size());
+    std::vector<std::vector<int64_t>> iv(nc);
+    std::vector<std::vector<double>> dv(nc);
+    for (size_t i = 0; i < nc; ++i) {
+      const ColumnMeta& m = cols[i];
+      if (m.lt == LType::VARCHAR) t->dicts[i] = r.colDicts[i];
+      if (!r.intCols[i].empty()) {
+        iv[i] = r.intCols[i];
+        continue;
+      }
+      const std::vector<double>& x = r.numCols[i];
+      if (m.pt == PType::F64) {
+        dv[i] = x;
+        continue;
+      }
+      const int64_t nul = m.pt == PType::I64 ? kNullI64 : kNullI32;
+      const double mul = m.lt == LType::DECIMAL ? pow10i(m.scale) : 1.0;
+      iv[i].resize(x.size());
+      for (size_t k = 0; k < x.size(); ++k) iv[i][k] = x[k] != x[k] ? nul : std::llround(x[k] * mul);
+    }
+    for (size_t i = 0; i < nc; ++i) t->hasNull[i] = 1;
+    if (n > 0) {
+      t->appendColumns(iv, dv, n);
+      t->flush(true);
+    }
+    std::lock_guard<std::mutex> g(cat_.mu);
+    cat_.tables["__tmp." + lower(name)] = t;
+    q.temps.push_back("__tmp." + lower(name));
+    return "__tmp." + name;
+  }
   if (!r.devCols.empty()) {  // built on the GPU: the columns become the table's one segment (no host copy)
     const int64_t n = r.devRows;
     const size_t nc = cols.size();
@@ -11203,6 +11244,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     if (f.sub) {
       Stmt sub = cloneStmt(*f.sub);
       tColumnar = true;  // a numeric GROUP BY result may come back as columns (straight into the temp table)
+      tInsertCols = true;  // ... and a projection too
       struct DbSwitch {  // a view's tables resolve in the view's database
         std::string saved;
         bool on;
@@ -11211,7 +11253,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       } sw(viewDb);
       viewDb.clear();
       ResultSet r = query(sub, q, false, true);
-      tColumnar = false;
+      tColumnar = tInsertCols = false;
       f.name = makeTemp(r, q, f.alias);
       f.sub.reset();
     } else {
@@ -11232,7 +11274,10 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     };
     for (auto& it : s.items) find(it.e);
     for (auto& o : s.orderBy) find(o.e);
-    if (win) return windows(s, q, explain, typed);
+    if (win) {
+      tWinOuterCols = insertCols;  // (its final projection may come back as columns)
+      return windows(s, q, explain, typed);
+    }
   }
   {  // aggregates only the host computes (GROUP_CONCAT, JSON_ARRAYAGG, STDDEV, ..): host aggregation
     bool hostAgg = false;
@@ -11483,6 +11528,8 @@ void Engine::expandStars(Stmt& s) {
 // columns), compute the windows over the result on the host, then run the final projection,
 // ORDER BY and LIMIT over a temp table with the results.
 ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
+  const bool outerCols = tWinOuterCols;
+  tWinOuterCols = false;
   expandStars(s);
   Stmt inner = cloneStmt(s);
   inner.items.clear();
@@ -11516,8 +11563,13 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       } else {
         Win wn;
         wn.node = e;
-        for (auto& a : e->args)
-          if (a->kind != Expr::STAR) wn.args.push_back(hidden(a));
+        for (auto& a0 : e->args) {
+          if (a0->kind == Expr::STAR) continue;
+          // (MIN / MAX over a string bound before: its argument became the string's rank; the
+          // window needs the strings themselves)
+          const ExprP a = (e->op == "MIN" || e->op == "MAX") && a0->kind == Expr::FUNC && a0->op == "#MAP" && a0->args.size() == 1 ? a0->args[0] : a0;
+          wn.args.push_back(hidden(a));
+        }
         for (auto& p : e->partBy) wn.part.push_back(hidden(p));
         for (auto& [o, d] : e->winOrder) wn.ord.push_back({hidden(o), d});
         w = (int)wins.size();
@@ -11527,6 +11579,8 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       return mkCol("", "__w" + std::to_string(w));
     }
     if (e->kind == Expr::COL || (e->kind == Expr::FUNC && isAggName(e->op))) return mkCol("", "__c" + std::to_string(hidden(e)));
+    for (auto& g : inner.groupBy)  // a GROUP BY expression: as a whole (its columns alone are not grouped)
+      if (g->str() == e->str()) return mkCol("", "__c" + std::to_string(hidden(e)));
     auto y = std::make_shared<Expr>(*e);
     y->bound = false;
     for (auto& a : y->args) a = outerOf(a);
@@ -11546,8 +11600,291 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   outer.distinct = s.distinct;
   if (inner.items.empty()) inner.items.push_back({mkLit(Value::I(1)), "__c0"});
   const auto tW0 = Clock::now();
+  Stmt innerRows = cloneStmt(inner);  // (in case the result comes back as numbers only: run again for rows)
+  tColumnar = true;  // a GROUP BY inner query may come back built on the GPU (exact, typed columns)
   ResultSet r = query(inner, q, false, true);
+  tColumnar = false;
+  if (r.devCols.empty() && (!r.numCols.empty() || r.numCol)) r = query(innerRows, q, false, true);
+  if (!r.devCols.empty() && !explain) {
+    // Columnar: the inner result as a temp table; keys, sort and window values from its typed
+    // columns (64-bit integer keys, strings by collation rank); the output appended a column at a time.
+    const std::string srcName = makeTemp(r, q, "winsrc");
+    auto src = cat_.get(srcName);
+    const size_t nin = src->cols.size();
+    const size_t n = src->segs.empty() ? 0 : (size_t)src->segs[0]->n;
+    std::vector<const uint8_t*> raw(nin, nullptr);
+    if (n)
+      for (size_t c = 0; c < nin; ++c) raw[c] = src->colData(Loc{0, 0}, (int)c).data();
+    auto isF = [&](int c) { return src->cols[c].pt == PType::F64; };
+    auto rawI = [&](int c, size_t i) -> int64_t {
+      return src->cols[c].pt == PType::I32 ? (int64_t)((const int32_t*)raw[c])[i] : ((const int64_t*)raw[c])[i];
+    };
+    auto rawD = [&](int c, size_t i) { return ((const double*)raw[c])[i]; };
+    auto isNullAt = [&](int c, size_t i) {
+      if (isF(c)) return rawD(c, i) != rawD(c, i);
+      return rawI(c, i) == (src->cols[c].pt == PType::I32 ? (int64_t)kNullI32 : kNullI64);
+    };
+    struct KeyCol {
+      bool dbl = false;
+      std::vector<int64_t> i;
+      std::vector<double> d;
+    };
+    std::map<int, KeyCol> keys;
+    auto keyCol = [&](int col) -> const KeyCol& {
+      auto it = keys.find(col);
+      if (it != keys.end()) return it->second;
+      KeyCol k;
+      const ColumnMeta& cm = src->cols[col];
+      std::shared_ptr<std::vector<double>> rank;
+      if (cm.lt == LType::VARCHAR) rank = sortedDict(*src->dicts[col]).second;
+      if (isF(col)) {
+        k.dbl = true;
+        k.d.resize(n);
+        parallelFor(n, [&](size_t b, size_t e) {
+          for (size_t i = b; i < e; ++i) k.d[i] = isNullAt(col, i) ? -HUGE_VAL : rawD(col, i);
+        });
+      } else {
+        k.i.resize(n);
+        parallelFor(n, [&](size_t b, size_t e) {
+          for (size_t i = b; i < e; ++i) {
+            if (isNullAt(col, i)) k.i[i] = INT64_MIN;
+            else k.i[i] = rank ? (int64_t)(*rank)[(size_t)rawI(col, i)] : rawI(col, i);
+          }
+        });
+      }
+      return keys[col] = std::move(k);
+    };
+    std::vector<std::vector<int64_t>> outI;   // per window: integer / code results
+    std::vector<std::vector<double>> outD;    // per window: double results
+    std::vector<ColumnMeta> outMeta;
+    std::vector<std::shared_ptr<Dict>> outDict;
+    std::vector<size_t> lastOrderC;
+    for (size_t w = 0; w < wins.size(); ++w) {
+      const Win& wn = wins[w];
+      const std::string f = wn.node->op;
+      static const std::set<std::string> kFns = {"ROW_NUMBER", "RANK", "DENSE_RANK", "PERCENT_RANK", "CUME_DIST", "NTILE", "LAG", "LEAD",
+                                                 "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "SUM", "AVG", "COUNT", "MIN", "MAX"};
+      if (!kFns.count(f)) throw SqlError("window function " + f + " is not supported", 1235);
+      std::vector<const KeyCol*> pk;
+      std::vector<std::pair<const KeyCol*, bool>> ok;
+      for (int p : wn.part) pk.push_back(&keyCol(p));
+      for (auto& [o, d] : wn.ord) ok.push_back({&keyCol(o), d});
+      auto cmpK = [](const KeyCol& k, size_t a, size_t b) { return k.dbl ? (k.d[a] < k.d[b] ? -1 : k.d[a] > k.d[b]) : (k.i[a] < k.i[b] ? -1 : k.i[a] > k.i[b]); };
+      auto cmpKeys = [&](size_t a, size_t b, bool withOrder) {
+        for (auto* k : pk)
+          if (int c = cmpK(*k, a, b)) return c;
+        if (withOrder)
+          for (auto& [k, d] : ok)
+            if (int c = cmpK(*k, a, b)) return d ? -c : c;
+        return 0;
+      };
+      std::vector<size_t> idx(n);
+      for (size_t i = 0; i < n; ++i) idx[i] = i;
+      {  // stable sort on all cores: sorted chunks, then pairwise merges
+        auto less = [&](size_t a, size_t b) { return cmpKeys(a, b, true) < 0; };
+        const size_t nth = std::max<size_t>(1, std::min<size_t>(std::thread::hardware_concurrency(), n / 32768));
+        std::vector<size_t> bounds;
+        for (size_t t = 0; t <= nth; ++t) bounds.push_back(n * t / nth);
+        parallelFor(nth, [&](size_t b, size_t e) {
+          for (size_t t = b; t < e; ++t) std::stable_sort(idx.begin() + bounds[t], idx.begin() + bounds[t + 1], less);
+        }, 1);
+        for (size_t step = 1; step < nth; step *= 2) {
+          std::vector<size_t> starts;
+          for (size_t t = 0; t + step < nth; t += 2 * step) starts.push_back(t);
+          parallelFor(starts.size(), [&](size_t b, size_t e) {
+            for (size_t k = b; k < e; ++k) {
+              size_t t = starts[k];
+              std::inplace_merge(idx.begin() + bounds[t], idx.begin() + bounds[t + step], idx.begin() + bounds[std::min(nth, t + 2 * step)], less);
+            }
+          }, 1);
+        }
+      }
+      // Result type: ranks and counts BIGINT, ratios / AVG DOUBLE, SUM by its argument, value
+      // functions the argument's own type (strings: codes of its dictionary).
+      const int a0 = wn.args.empty() ? -1 : wn.args[0];
+      ColumnMeta om;
+      om.name = "__w" + std::to_string(w);
+      om.lt = LType::BIGINT;
+      std::shared_ptr<Dict> od;
+      if (f == "PERCENT_RANK" || f == "CUME_DIST" || f == "AVG") om.lt = LType::DOUBLE;
+      else if (f == "SUM") om.lt = a0 >= 0 && isF(a0) ? LType::DOUBLE : LType::BIGINT;
+      else if ((f == "MIN" || f == "MAX" || f == "LAG" || f == "LEAD" || f == "FIRST_VALUE" || f == "LAST_VALUE" || f == "NTH_VALUE") && a0 >= 0) {
+        om.lt = src->cols[a0].lt;
+        om.scale = src->cols[a0].scale;
+        if (om.lt == LType::VARCHAR) od = src->dicts[a0];
+      }
+      if (om.lt == LType::DECIMAL) om.lt = LType::DOUBLE;
+      om.pt = physOf(om.lt);
+      const bool fOut = om.pt == PType::F64;
+      std::vector<int64_t> oi(fOut ? 0 : n);
+      std::vector<double> od2(fOut ? n : 0);
+      const int64_t onul = om.pt == PType::I32 ? (int64_t)kNullI32 : kNullI64;
+      auto constArg = [&](size_t k, double def) {
+        if (k >= wn.node->args.size()) return def;
+        const ExprP& a = wn.node->args[k];
+        return a->kind == Expr::LIT ? numOf(a->lit) : def;
+      };
+      // a cell of the argument column into the output (same physical type, or converted)
+      auto putArg = [&](size_t row, int col, size_t at) {
+        if (col < 0 || isNullAt(col, at)) {
+          if (fOut) od2[row] = nullv();
+          else oi[row] = onul;
+          return;
+        }
+        if (fOut) od2[row] = isF(col) ? rawD(col, at) : (double)rawI(col, at);
+        else oi[row] = isF(col) ? (int64_t)std::llround(rawD(col, at)) : rawI(col, at);
+      };
+      const KeyCol* valKey = a0 >= 0 && (f == "MIN" || f == "MAX") ? &keyCol(a0) : nullptr;  // (strings: by rank)
+      std::vector<std::pair<size_t, size_t>> parts;
+      for (size_t a = 0; a < n;) {
+        size_t b = a + 1;
+        while (b < n && cmpKeys(idx[a], idx[b], false) == 0) ++b;
+        parts.push_back({a, b});
+        a = b;
+      }
+      parallelFor(parts.size(), [&](size_t pb, size_t pe) {
+        for (size_t pi = pb; pi < pe; ++pi) {
+          const size_t a = parts[pi].first, b = parts[pi].second, cnt = b - a;
+          std::vector<size_t> peerStart(cnt), peerEnd(cnt);
+          for (size_t i = 0; i < cnt;) {
+            size_t j = i + 1;
+            while (j < cnt && cmpKeys(idx[a + i], idx[a + j], true) == 0) ++j;
+            for (size_t k = i; k < j; ++k) peerStart[k] = i, peerEnd[k] = j;
+            i = j;
+          }
+          // running aggregates over frames that start at the partition (prefix sums), or per frame
+          double pAcc = 0;
+          int64_t pAccI = 0, pCnt = 0;
+          size_t pBest = SIZE_MAX, pUpTo = 0;
+          int64_t dense = 0;
+          for (size_t i = 0; i < cnt; ++i) {
+            const size_t row = idx[a + i];
+            if (i == 0 || peerStart[i] == i) ++dense;
+            size_t lo, hi;
+            if (wn.node->rowsFrame) {
+              int64_t L = wn.node->frameLo == INT64_MIN ? 0 : std::max<int64_t>(0, (int64_t)i + wn.node->frameLo);
+              int64_t H = wn.node->frameHi == INT64_MAX ? (int64_t)cnt : std::min<int64_t>((int64_t)cnt, (int64_t)i + wn.node->frameHi + 1);
+              lo = (size_t)L;
+              hi = (size_t)std::max<int64_t>(L, H);
+            } else if (wn.ord.empty()) {
+              lo = 0, hi = cnt;
+            } else {
+              lo = 0, hi = wn.node->frameHi == INT64_MAX ? cnt : peerEnd[i];
+            }
+            if (f == "ROW_NUMBER") oi[row] = (int64_t)i + 1;
+            else if (f == "RANK") oi[row] = (int64_t)peerStart[i] + 1;
+            else if (f == "DENSE_RANK") oi[row] = dense;
+            else if (f == "PERCENT_RANK") od2[row] = cnt > 1 ? (double)peerStart[i] / (double)(cnt - 1) : 0.0;
+            else if (f == "CUME_DIST") od2[row] = (double)peerEnd[i] / (double)cnt;
+            else if (f == "NTILE") {
+              int64_t k = std::max<int64_t>(1, (int64_t)constArg(0, 1)), sz = (int64_t)cnt / k, rem = (int64_t)cnt % k;
+              int64_t pos = (int64_t)i, bucket = pos < rem * (sz + 1) ? pos / (sz + 1) : rem + (pos - rem * (sz + 1)) / std::max<int64_t>(sz, 1);
+              oi[row] = bucket + 1;
+            } else if (f == "LAG" || f == "LEAD") {
+              int64_t off = (int64_t)constArg(1, 1), j = f == "LAG" ? (int64_t)i - off : (int64_t)i + off;
+              if (j >= 0 && j < (int64_t)cnt) putArg(row, a0, idx[a + j]);
+              else putArg(row, wn.args.size() > 2 ? wn.args[2] : -1, row);
+            } else if (f == "FIRST_VALUE") {
+              if (hi > lo) putArg(row, a0, idx[a + lo]);
+              else putArg(row, -1, row);
+            } else if (f == "LAST_VALUE") {
+              if (hi > lo) putArg(row, a0, idx[a + hi - 1]);
+              else putArg(row, -1, row);
+            } else if (f == "NTH_VALUE") {
+              size_t k = (size_t)std::max<double>(1, constArg(1, 1));
+              if (lo + k - 1 < hi) putArg(row, a0, idx[a + lo + k - 1]);
+              else putArg(row, -1, row);
+            } else {  // SUM / AVG / COUNT / MIN / MAX over [lo, hi)
+              const bool star = a0 < 0;
+              double acc = 0;
+              int64_t accI = 0, c = 0;
+              size_t best = SIZE_MAX;
+              auto take = [&](size_t at, double& sacc, int64_t& sI, int64_t& sc, size_t& sbest) {
+                if (star) { ++sc; return; }
+                if (isNullAt(a0, at)) return;
+                ++sc;
+                if (isF(a0)) sacc += rawD(a0, at);
+                else sI += rawI(a0, at), sacc += (double)rawI(a0, at);
+                if (valKey) {
+                  const int cmp = sbest == SIZE_MAX ? 1 : cmpK(*valKey, at, sbest);
+                  if (sbest == SIZE_MAX || (f == "MIN" ? cmp < 0 : cmp > 0)) sbest = at;
+                }
+              };
+              if (lo == 0) {  // a prefix of the partition: extend the running totals
+                for (; pUpTo < hi; ++pUpTo) take(idx[a + pUpTo], pAcc, pAccI, pCnt, pBest);
+                acc = pAcc, accI = pAccI, c = pCnt, best = pBest;
+              } else {
+                for (size_t j = lo; j < hi; ++j) take(idx[a + j], acc, accI, c, best);
+              }
+              if (f == "COUNT") oi[row] = c;
+              else if (c == 0) putArg(row, -1, row);
+              else if (f == "SUM") {
+                if (fOut) od2[row] = acc;
+                else oi[row] = accI;
+              } else if (f == "AVG") od2[row] = acc / (double)c;
+              else putArg(row, a0, best);
+            }
+          }
+        }
+      }, std::max<size_t>(1, parts.size() / (4 * std::thread::hardware_concurrency())));
+      if (w + 1 == wins.size() && s.orderBy.empty() && !s.distinct && (!wn.part.empty() || !wn.ord.empty())) lastOrderC = idx;
+      outI.push_back(std::move(oi));
+      outD.push_back(std::move(od2));
+      outMeta.push_back(om);
+      outDict.push_back(od);
+    }
+    // The output table: the inner columns, the window values (and the window order, without ORDER BY).
+    std::vector<ColumnMeta> cols = src->cols;
+    for (auto& m : outMeta) cols.push_back(m);
+    if (!lastOrderC.empty()) {
+      ColumnMeta m;
+      m.name = "__wpos";
+      m.lt = LType::BIGINT;
+      m.pt = PType::I64;
+      cols.push_back(m);
+    }
+    static std::atomic<int> wseq{0};
+    const std::string name = "__tmp" + std::to_string(++wseq) + "_wincol";
+    auto t = std::make_shared<Table>(name, cols, -1, -1, std::vector<int>{}, std::vector<int>{}, 1, false);
+    t->db = "__tmp";
+    std::vector<std::vector<int64_t>> iv(cols.size());
+    std::vector<std::vector<double>> dv(cols.size());
+    for (size_t c = 0; c < nin; ++c) {
+      if (src->cols[c].lt == LType::VARCHAR) t->dicts[c] = src->dicts[c];
+      if (isF((int)c)) dv[c].assign((const double*)raw[c], (const double*)raw[c] + n);
+      else {
+        iv[c].resize(n);
+        for (size_t i = 0; i < n; ++i) iv[c][i] = rawI((int)c, i);
+      }
+    }
+    for (size_t w = 0; w < outMeta.size(); ++w) {
+      const size_t c = nin + w;
+      if (outDict[w]) t->dicts[c] = outDict[w];
+      if (outMeta[w].pt == PType::F64) dv[c] = std::move(outD[w]);
+      else iv[c] = std::move(outI[w]);
+    }
+    if (!lastOrderC.empty()) {
+      auto& pos = iv[cols.size() - 1];
+      pos.resize(n);
+      for (size_t j = 0; j < n; ++j) pos[lastOrderC[j]] = (int64_t)j;
+      outer.orderBy.push_back({mkCol("__win", "__wpos"), false});
+    }
+    if (n) {
+      t->appendColumns(iv, dv, (int64_t)n);
+      t->flush(true);
+    }
+    {
+      std::lock_guard<std::mutex> g(cat_.mu);
+      cat_.tables["__tmp." + lower(name)] = t;
+      q.temps.push_back("__tmp." + lower(name));
+    }
+    if (envSetting("TRACE")) fprintf(stderr, "[trace] windows (columnar): %.1f ms, %zu rows\n", msSince(tW0), n);
+    outer.from = {TableRef{"__tmp." + name, "__win", nullptr, 0, nullptr}};
+    tInsertCols = outerCols;
+    return query(outer, q, explain, typed);
+  }
   const auto tW1 = Clock::now();
+
   const size_t n = r.vals.size(), base = r.names.size();
   std::vector<size_t> lastOrder;  // rows in the last window's (PARTITION BY, ORDER BY) order
   for (size_t w = 0; w < wins.size(); ++w) {
@@ -11703,7 +12040,7 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
         } else if (f == "SUM" || f == "AVG" || f == "COUNT" || f == "MIN" || f == "MAX") {
           double acc = 0;
           int64_t c = 0;
-          Value best;
+          Value best = Value::Null();  // (a default Value is the number 0, not NULL)
           bool star = wn.args.empty();
           for (size_t j = lo; j < hi; ++j) {
             if (star) { ++c; continue; }
