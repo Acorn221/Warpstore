@@ -131,6 +131,30 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
   const bool ci = ciColl();
   const std::string ckey = ci ? "sorted/ci" : "sorted";
   const size_t n = d.strs.size();
+  if (auto c = d.getDerived<E>(ckey))
+    if (c->n == n) return {c->order, c->rank};
+  // One sort per dictionary at a time: a query that needs the order while warmDicts (or another
+  // query) is sorting waits for that sort instead of repeating it.
+  static std::mutex inflightMu;
+  static std::map<std::pair<uint64_t, std::string>, std::shared_ptr<std::mutex>> inflight;
+  std::shared_ptr<std::mutex> m;
+  {
+    std::lock_guard<std::mutex> g(inflightMu);
+    auto& slot = inflight[{d.uid, ckey}];
+    if (!slot) slot = std::make_shared<std::mutex>();
+    m = slot;
+  }
+  std::lock_guard<std::mutex> sortLock(*m);
+  struct Forget {  // (the entry goes once nobody holds it)
+    std::shared_ptr<std::mutex>& m;
+    uint64_t uid;
+    const std::string& k;
+    ~Forget() {
+      std::lock_guard<std::mutex> g(inflightMu);
+      auto it = inflight.find({uid, k});
+      if (it != inflight.end() && it->second.use_count() <= 2) inflight.erase(it);
+    }
+  } forget{m, d.uid, ckey};
   std::shared_ptr<const std::vector<int32_t>> prev;  // order of an older (smaller) version
   if (auto c = d.getDerived<E>(ckey)) {
     if (c->n == n) return {c->order, c->rank};
@@ -11449,12 +11473,12 @@ ResultSet Engine::runStatementQuery(Stmt& s, bool explain) {
 namespace {
 void putU64(FILE* f, uint64_t v) { fwrite(&v, 8, 1, f); }
 void putStr(FILE* f, const std::string& s) { putU64(f, s.size()); fwrite(s.data(), 1, s.size(), f); }
-bool getU64(FILE* f, uint64_t& v) { return fread(&v, 8, 1, f) == 1; }
+bool getU64(FILE* f, uint64_t& v) { return fread_unlocked(&v, 8, 1, f) == 1; }
 bool getStr(FILE* f, std::string& s) {
   uint64_t n;
   if (!getU64(f, n) || n > (1ull << 32)) return false;
   s.resize(n);
-  return fread(s.data(), 1, n, f) == n;
+  return fread_unlocked(s.data(), 1, n, f) == n;
 }
 void putVal(FILE* f, const Value& v) {
   uint8_t k = v.isNull() ? 0 : v.kind == Value::INT ? 1 : v.kind == Value::DBL ? 2 : v.kind == Value::STR ? 3 : v.kind == Value::DATE ? 4 : 5;
@@ -11597,10 +11621,12 @@ void readColumnar(FILE* f, Table& t, bool refs = false) {
   getU64(f, np);
   for (size_t c = 0; c < nc; ++c) {
     getU64(f, v);
+    // (codes are positions: appended as they are, indexed when first looked up)
+    if (v && (!t.dicts[c] || t.dicts[c]->strs.size() != 0)) throw SqlError("snapshot: unexpected dictionary for " + t.cols[c].name, 1105);
     for (uint64_t i = 0; i < v; ++i) {
       std::string x;
       getStr(f, x);
-      t.dicts[c]->getOrAdd(x);
+      t.dicts[c]->appendUnique(std::move(x));
     }
     getU64(f, v);
     t.hasNull[c] = (uint8_t)v;
@@ -11797,7 +11823,9 @@ int zrClose(void* ck) {
 FILE* zstdReader(FILE* raw) {
   auto* z = new ZR{raw, ZSTD_createDCtx(), std::vector<char>(ZSTD_DStreamInSize())};
   cookie_io_functions_t io{zrRead, nullptr, nullptr, zrClose};
-  return fopencookie(z, "r", io);
+  FILE* f = fopencookie(z, "r", io);
+  if (f) setvbuf(f, nullptr, _IOFBF, 1 << 20);  // (millions of small reads: dictionary strings)
+  return f;
 }
 }  // namespace
 
