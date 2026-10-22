@@ -226,6 +226,21 @@ Q20 from 47 to 9 ms and Q17 from 18 to 3 ms. IN / EXISTS subqueries over integer
 a GPU bitmap (Q4: 100 to 22 ms). Q16's wall time (about 90 ms against DuckDB's 59) is mostly the Python
 MySQL client parsing its 18K result rows; the server side takes 28 ms.
 
+`bench/tpch_full.py` reruns all 22 against DuckDB on DuckDB's own dbgen data, loaded into both from
+the same Parquet files, and checks every result (geomean over the 22 queries, wall time through the
+Python MySQL client):
+
+| Scale | Warpstore hot | DuckDB hot | Warpstore first run | DuckDB first run | Results |
+|---|---:|---:|---:|---:|---|
+| SF1 (6M lineitem rows) | 5.8 ms | 37 ms | 12 ms | 45 ms | 22/22 match |
+| SF10 (60M lineitem rows, in host memory) | 38-51 ms | 206-260 ms | 71-108 ms | 225-330 ms | 22/22 match |
+
+At SF10 the cached table columns fill most of the 10 GB of VRAM; the joins of Q7, Q9, Q18 and Q21
+need more, so those queries first move the coldest cached columns to host memory and are retried
+(the cache refills afterwards). Loading SF10 from Parquet takes about 75 s (lineitem 45 s); SF10
+needs more than 6 GB of host memory, mostly for the comment-column dictionaries. A restart from the
+snapshot takes about 7 s.
+
 ### ClickBench against SingleStore itself
 
 The 43 ClickBench queries on the first 10M rows of `hits`, run on the same machine. warpstore runs on
