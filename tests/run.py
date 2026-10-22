@@ -106,6 +106,7 @@ TESTS = [
     ("colupdate", "colupdate.py", None, True),
     ("diskfull", "diskfull.py", None, True),
     ("strict", "strict.py", None, True),
+    ("updvram", "updvram.py", None, True),
     ("compact", "compact.py", None, True),
     ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),
