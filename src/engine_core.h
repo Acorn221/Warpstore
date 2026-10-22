@@ -1596,9 +1596,16 @@ struct Compiler {
 
   void strCompare(const std::string& op, const ExprP& col, const std::string& lit) {
     Dict& d = *ctx->dict(*col);
-    if ((op == "=" || op == "<>") && ciColl()) {  // every case variant of the literal
-      const std::string f = foldCase(lit);
-      int s = dictSet(d, [&](std::string_view v) { return foldCase(v) == f; });
+    bool letters = false;  // (a literal without letters: its case variants are itself)
+    for (char ch : lit) letters = letters || isalpha((unsigned char)ch);
+    if ((op == "=" || op == "<>") && ciColl() && letters) {  // every case variant of the literal
+      // (cached per dictionary version; compared without folding copies: same length, then per char)
+      int s = dictSet(d, [&](std::string_view v) {
+        if (v.size() != lit.size()) return false;
+        for (size_t i = 0; i < v.size(); ++i)
+          if (tolower((unsigned char)v[i]) != tolower((unsigned char)lit[i])) return false;
+        return true;
+      }, "CIEQ|" + lit);
       gen(col);
       emit(OP_INSET, s, 0);
       if (op == "<>") emit(OP_NOT, 0, 0);
@@ -1613,7 +1620,7 @@ struct Compiler {
     int s = dictSet(d, [&](std::string_view v) {
       int c = collCmp(v, lit);
       return op == "<" ? c < 0 : op == "<=" ? c <= 0 : op == ">" ? c > 0 : c >= 0;
-    });
+    }, "CMP|" + op + "|" + lit);  // (cached per dictionary version, like LIKE)
     gen(col);
     emit(OP_INSET, s, 0);
   }
@@ -3617,50 +3624,18 @@ inline void encodeStrings(ExprP& e, BindCtx& c) {
       }
     });
     const auto tAdd = std::chrono::steady_clock::now();
-    // Distinct results on all cores (hash-sharded), then only those enter the dictionary, in order of
-    // first occurrence (the codes are what a sequential pass would give).
-    auto tick = [t = std::chrono::steady_clock::now()]() mutable {
-      auto n = std::chrono::steady_clock::now();
-      double ms = std::chrono::duration<double, std::milli>(n - t).count();
-      t = n;
-      return ms;
-    };
-    constexpr size_t kShards = 64;
-    std::vector<uint8_t> shardOf(N);
-    parallelFor(N - from, [&, from](size_t b, size_t en) {
-      for (size_t i = b + from; i < en + from; ++i) shardOf[i] = (uint8_t)(std::hash<std::string_view>{}(res[i]) % kShards);
-    });
-    const double tHash = tick();
-    std::vector<std::vector<uint32_t>> byShard(kShards);
-    for (size_t i = from; i < N; ++i)
-      if (!nul[i]) byShard[shardOf[i]].push_back((uint32_t)i);
-    const double tBucket = tick();
-    std::vector<int64_t> code(N, -1);   // known code (already in the dictionary)
-    std::vector<uint32_t> first(N, 0);  // first index with the same result
-    parallelFor(kShards, [&](size_t b, size_t en) {
-      for (size_t sh = b; sh < en; ++sh) {
-        std::unordered_map<std::string_view, uint32_t> seen;
-        for (uint32_t i : byShard[sh]) {
-          const int32_t have = out->strs.empty() ? -1 : out->find(res[i]);
-          if (have >= 0) { code[i] = have; continue; }
-          first[i] = seen.emplace(std::string_view(res[i]), i).first->second;
-        }
-      }
-    }, 1);
-    const double tShard = tick();
+    // The results coded in one batch (Dict::getOrAddMany: hashing, lookups and the new strings on all
+    // cores, codes in order of first occurrence, as a sequential pass gives them).
     {
-      size_t fresh = 0;
-      for (size_t i = from; i < N; ++i) fresh += !nul[i] && code[i] < 0 && first[i] == i;
-      out->strs.reserve(out->strs.size() + fresh);
+      std::vector<std::string_view> sv(N - from);
+      for (size_t i = from; i < N; ++i)
+        if (!nul[i]) sv[i - from] = std::string_view(res[i].data() ? res[i].data() : "", res[i].size());
+      std::vector<int64_t> code(N - from);
+      out->getOrAddMany(sv.data(), N - from, code.data(), -1);
+      parallelFor(N - from, [&, from](size_t b, size_t en) {
+        for (size_t i = b + from; i < en + from; ++i) map[i] = nul[i] ? nullv() : (double)code[i - from];
+      });
     }
-    for (size_t i = from; i < N; ++i)
-      if (!nul[i] && code[i] < 0 && first[i] == i) code[i] = out->appendUnique(std::move(res[i]));
-    const double tIns = tick();
-    if (envSetting("TRACE"))
-      fprintf(stderr, "[trace]   dedupe: hash %.1f, bucket %.1f, shards %.1f, inserts %.1f ms\n", tHash, tBucket, tShard, tIns);
-    parallelFor(N - from, [&, from](size_t b, size_t en) {
-      for (size_t i = b + from; i < en + from; ++i) map[i] = nul[i] ? nullv() : (double)(code[i] >= 0 ? code[i] : code[first[i]]);
-    });
     if (envSetting("TRACE"))
       fprintf(stderr, "[trace]   evaluate %.1f ms, dictionary inserts %.1f ms (%zu distinct)\n",
               std::chrono::duration<double, std::milli>(tAdd - tEnc).count(),
