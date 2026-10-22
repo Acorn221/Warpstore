@@ -167,10 +167,16 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     std::vector<size_t> gcols;
     for (size_t c = 0; c < nc; ++c)
       if (need[c]) gcols.push_back(c);
-    if (n < 4096)  // (a few rows, e.g. by primary key: not worth a task per column)
+    if (n < 4096) {  // (a few rows, e.g. by primary key: not worth a task per column)
       for (size_t c : gcols) gather(c);
-    else
+    } else {
+      // cold columns (disk tier) loaded here first: a pool task must not wait for the I/O pool
+      std::set<int32_t> segsSeen;
+      for (size_t i = 0; i < n; ++i)
+        if (ls[i].seg >= 0 && segsSeen.insert(ls[i].seg).second)
+          for (size_t c : gcols) t.colData(ls[i], (int)c);
       ioParallel(gcols.size(), [&](size_t k) { gather(gcols[k]); }, true);
+    }
     tg += msSince(ph), ph = Clock::now();
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
     // row order, as a replay of the statement codes them).

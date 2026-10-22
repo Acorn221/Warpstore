@@ -803,6 +803,16 @@ void Table::appendCopy(const Loc* ls, size_t n, const int32_t* part, const std::
   }, true);
   std::vector<std::vector<uint32_t>> rowsOf(nparts);
   for (size_t i = 0; i < n; ++i) rowsOf[part[i]].push_back((uint32_t)i);
+  // Segment columns resolved here, on this thread: a cold column (disk tier) is loaded through the I/O
+  // pool, which a pool task must not wait for (every pool thread waiting: a deadlock).
+  std::map<int32_t, std::vector<const uint8_t*>> segCols;
+  for (size_t i = 0; i < n; ++i)
+    if (ls[i].seg >= 0 && !segCols.count(ls[i].seg)) {
+      auto& v = segCols[ls[i].seg];
+      v.assign(nc, nullptr);
+      for (size_t c = 0; c < nc; ++c)
+        if (!given[c]) v[c] = colData(ls[i], (int)c).data();
+    }
   for (int p = 0; p < nparts; ++p) {
     const std::vector<uint32_t>& list = rowsOf[p];
     for (size_t done = 0; done < list.size();) {
@@ -825,13 +835,16 @@ void Table::appendCopy(const Loc* ls, size_t n, const int32_t* part, const std::
           }
           return;
         }
+        auto src = [&](const Loc& l) -> const uint8_t* {  // (write buffers: after the resize above)
+          return l.seg >= 0 ? segCols.at(l.seg)[c] : bufs[-1 - l.seg]->cols[c].data();
+        };
         auto copy = [&](auto* out) {  // (typed by width: a load and a store per cell)
           using T = std::remove_pointer_t<decltype(out)>;
           const T* base = nullptr;
           int32_t baseSeg = INT32_MIN;
           for (size_t j = 0; j < k; ++j) {
             const Loc l = ls[idx[j]];
-            if (l.seg != baseSeg) base = (const T*)colData(l, (int)c).data(), baseSeg = l.seg;
+            if (l.seg != baseSeg) base = (const T*)src(l), baseSeg = l.seg;
             out[j] = base[l.row];
           }
         };
@@ -842,7 +855,7 @@ void Table::appendCopy(const Loc* ls, size_t n, const int32_t* part, const std::
           int32_t baseSeg = INT32_MIN;
           for (size_t j = 0; j < k; ++j) {
             const Loc l = ls[idx[j]];
-            if (l.seg != baseSeg) base = colData(l, (int)c).data(), baseSeg = l.seg;
+            if (l.seg != baseSeg) base = src(l), baseSeg = l.seg;
             memcpy(d + j * w, base + (size_t)l.row * w, w);
           }
         }

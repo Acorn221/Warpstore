@@ -68,6 +68,10 @@ for compress in ("--no-compress", "--compress"):
     cur = srv.cursor("d")
     q(cur, "CREATE TABLE t (id BIGINT PRIMARY KEY, g INT, v DOUBLE, s VARCHAR(16), SORT KEY(id))")
     q(cur, f"LOAD DATA INFILE '{path}' INTO TABLE t FIELDS TERMINATED BY '\\t'")
+    # no keys (UPDATE copies rows column by column), more columns than I/O pool threads
+    extra = ", ".join(f"x{i} INT" for i in range(100))
+    q(cur, f"CREATE TABLE h (id BIGINT, g INT, v DOUBLE, s VARCHAR(16), {extra})")
+    q(cur, "INSERT INTO h SELECT id, g, v, s, " + ", ".join("g" for i in range(100)) + " FROM t WHERE id < 300000")
     wait_evicted(srv, cur, tag)
     queries(cur, f"{tag} cold")
     queries(cur, f"{tag} again")
@@ -85,6 +89,16 @@ for compress in ("--no-compress", "--compress"):
     srv.restart()
     cur = srv.cursor("d")
     c.check(f"{tag}: restart: segments start on disk", "disk-columnstore" in tiers(cur), str(tiers(cur)))
+    # UPDATE copying rows out of cold segments (their columns loaded through the I/O pool): one row, and
+    # enough rows for the parallel gather (both deadlocked once: a pool task waiting for the pool)
+    q(cur, "UPDATE h SET g = g + 1000 WHERE id = 42")
+    q(cur, "UPDATE h SET v = 0 WHERE id < 20000")
+    c.eq(f"{tag}: UPDATE on cold segments", q(cur, "SELECT COUNT(*), SUM(g >= 1000), SUM(v = 0) FROM h WHERE id < 20000"), [(20000, 1, 20000)])
+    srv.kill()  # ... and replayed at startup, on the segments as they come from the files
+    srv.start(timeout=120)
+    cur = srv.cursor("d")
+    c.eq(f"{tag}: UPDATE on cold segments replayed", q(cur, "SELECT COUNT(*), SUM(g >= 1000), SUM(v = 0) FROM h WHERE id < 20000"), [(20000, 1, 20000)])
+    q(cur, "DROP TABLE h")
     queries(cur, f"{tag} after restart", deleted=True)
     c.eq(f"{tag}: restart keeps the snapshot's files", set(os.listdir(segdir)) >= files, True)
     # more rows, kill -9 (WAL replay on top of segments from files)
