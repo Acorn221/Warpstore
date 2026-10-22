@@ -11602,10 +11602,11 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   const auto tW0 = Clock::now();
   Stmt innerRows = cloneStmt(inner);  // (in case the result comes back as numbers only: run again for rows)
   tColumnar = true;  // a GROUP BY inner query may come back built on the GPU (exact, typed columns)
+  tInsertCols = true;  // ... and a projection as typed columns
   ResultSet r = query(inner, q, false, true);
-  tColumnar = false;
-  if (r.devCols.empty() && (!r.numCols.empty() || r.numCol)) r = query(innerRows, q, false, true);
-  if (!r.devCols.empty() && !explain) {
+  tColumnar = tInsertCols = false;
+  if (r.devCols.empty() && !r.insertCols && (!r.numCols.empty() || r.numCol)) r = query(innerRows, q, false, true);
+  if ((!r.devCols.empty() || r.insertCols) && !explain) {
     // Columnar: the inner result as a temp table; keys, sort and window values from its typed
     // columns (64-bit integer keys, strings by collation rank); the output appended a column at a time.
     const std::string srcName = makeTemp(r, q, "winsrc");
@@ -11706,14 +11707,17 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       om.name = "__w" + std::to_string(w);
       om.lt = LType::BIGINT;
       std::shared_ptr<Dict> od;
+      const bool decArg = a0 >= 0 && src->cols[a0].lt == LType::DECIMAL;
+      const double argUnit = decArg ? pow10i(src->cols[a0].scale) : 1.0;  // (DECIMAL cells are scaled integers)
       if (f == "PERCENT_RANK" || f == "CUME_DIST" || f == "AVG") om.lt = LType::DOUBLE;
-      else if (f == "SUM") om.lt = a0 >= 0 && isF(a0) ? LType::DOUBLE : LType::BIGINT;
-      else if ((f == "MIN" || f == "MAX" || f == "LAG" || f == "LEAD" || f == "FIRST_VALUE" || f == "LAST_VALUE" || f == "NTH_VALUE") && a0 >= 0) {
+      else if (f == "SUM") {
+        om.lt = a0 >= 0 && isF(a0) ? LType::DOUBLE : decArg ? LType::DECIMAL : LType::BIGINT;
+        if (decArg) om.scale = src->cols[a0].scale;
+      } else if ((f == "MIN" || f == "MAX" || f == "LAG" || f == "LEAD" || f == "FIRST_VALUE" || f == "LAST_VALUE" || f == "NTH_VALUE") && a0 >= 0) {
         om.lt = src->cols[a0].lt;
         om.scale = src->cols[a0].scale;
         if (om.lt == LType::VARCHAR) od = src->dicts[a0];
       }
-      if (om.lt == LType::DECIMAL) om.lt = LType::DOUBLE;
       om.pt = physOf(om.lt);
       const bool fOut = om.pt == PType::F64;
       std::vector<int64_t> oi(fOut ? 0 : n);
@@ -11820,8 +11824,8 @@ ResultSet Engine::windows(Stmt& s, QueryCtx& q, bool explain, bool typed) {
               else if (c == 0) putArg(row, -1, row);
               else if (f == "SUM") {
                 if (fOut) od2[row] = acc;
-                else oi[row] = accI;
-              } else if (f == "AVG") od2[row] = acc / (double)c;
+                else oi[row] = accI;  // (DECIMAL: the scaled sum, same scale)
+              } else if (f == "AVG") od2[row] = acc / (double)c / argUnit;
               else putArg(row, a0, best);
             }
           }

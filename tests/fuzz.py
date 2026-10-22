@@ -101,7 +101,15 @@ for sql in (f"SELECT DISTINCT {ks} FROM t4 ORDER BY {ks}",
             "SELECT a, SUM(b) sb, DENSE_RANK() OVER (PARTITION BY a % 4 ORDER BY SUM(b)), MAX(MAX(s)) OVER (PARTITION BY a % 4), "
             "AVG(SUM(b)) OVER (PARTITION BY a % 4 ORDER BY a ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), COUNT(*) OVER () FROM t1 WHERE a IS NOT NULL GROUP BY a ORDER BY a",
             "SELECT id % 50 k, COUNT(*) c, NTILE(4) OVER (ORDER BY id % 50), FIRST_VALUE(COUNT(*)) OVER (ORDER BY id % 50 DESC), "
-            "MIN(MIN(m)) OVER (ORDER BY id % 50) FROM t1 GROUP BY id % 50 ORDER BY 1"):
+            "MIN(MIN(m)) OVER (ORDER BY id % 50) FROM t1 GROUP BY id % 50 ORDER BY 1",
+            # window functions over plain rows (columnar window path from a projection)
+            "SELECT id, s, ROW_NUMBER() OVER (PARTITION BY a ORDER BY id), SUM(b) OVER (PARTITION BY a ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "
+            "LEAD(s, 2) OVER (ORDER BY id), MAX(s) OVER (PARTITION BY a), LAST_VALUE(m) OVER (PARTITION BY a ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) "
+            "FROM t1 WHERE id % 7 = 3 ORDER BY id",
+            "SELECT id, PERCENT_RANK() OVER (ORDER BY b, id), CUME_DIST() OVER (PARTITION BY a % 3 ORDER BY c), COUNT(c) OVER (PARTITION BY a % 3 ORDER BY id ROWS BETWEEN 2 PRECEDING AND 2 FOLLOWING) "
+            "FROM t1 WHERE id % 5 = 1 ORDER BY id",
+            "SELECT id, SUM(m) OVER (PARTITION BY a % 3 ORDER BY id), AVG(m) OVER (PARTITION BY a % 3), MIN(m) OVER (ORDER BY id ROWS BETWEEN 3 PRECEDING AND CURRENT ROW) "
+            "FROM t1 WHERE id % 9 = 2 ORDER BY id"):
     g.execute(sql)
     MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 for sql in ("SELECT DISTINCT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d FROM t1 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9",
