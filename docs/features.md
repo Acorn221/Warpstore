@@ -143,8 +143,11 @@ wrong rows (reads that go straight to VRAM through GPUDirect Storage are not che
 String dictionaries live in append-only files too (`<data dir>/dicts`, zstd frames with CRC32s):
 a snapshot appends the strings added since the last one before it pauses writes, and records how
 many strings it covers (a torn tail from a snapshot that was never installed is cut off on load).
-ClickBench 10M rows: writes pause about 50 ms per snapshot (3.8 s when the dictionaries were part of
-the snapshot), and a restart takes 1.6 s.
+Collation orders of large dictionaries (what MIN / MAX / ORDER BY on strings use) are saved next
+to them, so a restart reads them back when first needed instead of sorting millions of strings
+again. ClickBench 10M rows: writes pause about 50 ms per snapshot (3.8 s when the dictionaries were
+part of the snapshot), a restart takes 1.5 s, and the first run of all 43 queries after it 3.9 s
+(8.5 s before).
 
 Still in memory, whatever the limit: write buffers (up to 1M rows per partition), primary-key and
 secondary indexes, string dictionaries, deleted-row bitmaps. `ALTER TABLE` rebuilds, `BACKUP` and

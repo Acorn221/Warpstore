@@ -38,6 +38,30 @@ c.eq("rows after kill -9", [tuple(r) for r in cur.fetchall()], want)
 cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u")
 c.eq("second table after kill -9", [tuple(r) for r in cur.fetchall()], want_u)
 
+# Saved collation orders: string order after a restart (read from the order files) is the same.
+def orders():
+    out = []
+    for coll in ("utf8mb4_bin", "utf8mb4_general_ci"):
+        cur.execute(f"SET collation_connection = {coll}")
+        cur.execute("SELECT MIN(s), MAX(s) FROM t")
+        out.append(tuple(cur.fetchall()[0]))
+        cur.execute("SELECT s FROM t ORDER BY s DESC, id LIMIT 3")
+        out.append(tuple(r[0] for r in cur.fetchall()))
+    return out
+
+
+cur.execute("INSERT INTO t VALUES (-1, 'Zebra', 0), (-2, 'apple', 0), (-3, 'zz top', 0)")
+want_orders = orders()
+cur.execute("SNAPSHOT")
+srv.stop()
+srv.start()
+cur = srv.cursor()
+cur.execute("USE a")
+c.eq("string order after a restart (saved orders)", orders(), want_orders)
+c.check("saved order files", any(f.endswith(".o0") for f in os.listdir(os.path.join(srv.data_dir, "dicts"))))
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t WHERE id >= 0")
+c.eq("rows after a restart", [tuple(r) for r in cur.fetchall()], want)
+
 # Dictionary files: a tail left by a snapshot that was never installed is cut off at load, and the
 # strings the WAL replays after it are appended in the right place.
 cur.execute("SNAPSHOT")
@@ -57,7 +81,7 @@ cur = srv.cursor()
 cur.execute("USE a")
 cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u WHERE s LIKE 'tail%'")
 c.eq("strings after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], [(300, 300)])
-cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t")
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t WHERE id >= 0")
 c.eq("rows after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], want)
 srv.stop()
 c.done()

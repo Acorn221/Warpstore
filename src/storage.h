@@ -11,6 +11,7 @@
 #pragma once
 #include <memory>
 #include <map>
+#include <thread>
 #include <functional>
 #include <atomic>
 #include <mutex>
@@ -142,6 +143,8 @@ struct Dict {
   std::string fileName;
   size_t fileStrs = 0;
   uint64_t fileBytes = 0;
+  mutable size_t orderFileStrs[2] = {0, 0};  // strings covered by the saved binary / case-insensitive order
+  mutable std::string orderFile[2];   // a saved order to read when first needed (loaded dictionaries)
   // string -> code: an open-addressing table of (32-bit hash << 32 | code + 1) slots; the strings
   // themselves are compared in strs. Strings added with appendUnique() are indexed lazily, on the
   // first lookup (derived dictionaries are often only ever read by code).
@@ -225,13 +228,18 @@ struct Dict {
     std::lock_guard<std::mutex> g(lazyMu);
     if (!lazy.load(std::memory_order_relaxed)) return;
     std::unique_lock<std::shared_mutex> lk(mapMu);
-    const size_t n = strs.size();
+    const size_t n = strs.size(), from = indexed_;
     grow(n);
-    for (size_t i = indexed_; i < n; ++i) {  // (a repeated string keeps its first code)
-      const std::string& x = strs[i];
-      const uint32_t h = hash32(x);
-      if (lookup(x, h) < 0) place(h, (uint32_t)i);
-    }
+    std::vector<uint32_t> hs(n - from);  // hashes first, on several threads (long strings: most of the work)
+    const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), hs.size() / 65536 + 1);
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < nth; ++t)
+      th.emplace_back([&, t] {
+        for (size_t i = from + (n - from) * t / nth; i < from + (n - from) * (t + 1) / nth; ++i) hs[i - from] = hash32(strs[i]);
+      });
+    for (auto& x : th) x.join();
+    for (size_t i = from; i < n; ++i)  // (a repeated string keeps its first code)
+      if (lookup(strs[i], hs[i - from]) < 0) place(hs[i - from], (uint32_t)i);
     indexed_ = n;
     lazy.store(false, std::memory_order_release);
   }

@@ -11,6 +11,8 @@
 #include <openssl/sha.h>
 #include <random>
 #include <zlib.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <regex>
 #include <thread>
@@ -122,12 +124,27 @@ int collCmp(const std::string& a, const std::string& b);
 void derivShareMap(const std::shared_ptr<std::vector<double>>& m);
 // Sorted order of a dictionary (collation-aware): (rank -> code, code -> rank). Dictionaries only
 // grow, so (dictionary, size, collation) identifies a version: cached, built with a parallel sort.
+std::shared_ptr<std::vector<int32_t>> loadOrderFile(const std::string& path, size_t n);
+struct SortedOrder {  // a dictionary's strings in collation order (Dict::getDerived "sorted", "sorted/ci")
+  size_t n;
+  std::shared_ptr<const std::vector<int32_t>> order;
+  std::shared_ptr<std::vector<double>> rank;
+};
+// The cached order of the first n strings under binary (ci = false) or case-insensitive collation.
+std::shared_ptr<const std::vector<int32_t>> sortedOrderCached(const Dict& d, bool ci, size_t n) {
+  auto c = d.getDerived<SortedOrder>(ci ? "sorted/ci" : "sorted");
+  return c && c->n == n ? c->order : nullptr;
+}
+// An order read back from a dictionary file's side file (snapshot load).
+void sortedOrderInstall(const Dict& d, bool ci, std::shared_ptr<const std::vector<int32_t>> order) {
+  auto rank = std::make_shared<std::vector<double>>(order->size());
+  for (size_t r = 0; r < order->size(); ++r) (*rank)[(*order)[r]] = (double)r;
+  d.setDerived(ci ? "sorted/ci" : "sorted", std::make_shared<SortedOrder>(SortedOrder{order->size(), order, rank}));
+  derivShareMap(rank);
+}
+
 std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vector<double>>> sortedDict(const Dict& d) {
-  struct E {
-    size_t n;
-    std::shared_ptr<const std::vector<int32_t>> order;
-    std::shared_ptr<std::vector<double>> rank;
-  };
+  using E = SortedOrder;
   const bool ci = ciColl();
   const std::string ckey = ci ? "sorted/ci" : "sorted";
   const size_t n = d.strs.size();
@@ -159,6 +176,18 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
   if (auto c = d.getDerived<E>(ckey)) {
     if (c->n == n) return {c->order, c->rank};
     if (c->n < n && n - c->n <= n / 8) prev = c->order;
+  }
+  if (!d.orderFile[ci].empty()) {  // saved by the snapshot this dictionary was loaded from
+    const std::string path = d.orderFile[ci];
+    d.orderFile[ci].clear();
+    if (auto o = loadOrderFile(path, d.fileStrs)) {
+      d.orderFileStrs[ci] = d.fileStrs;
+      sortedOrderInstall(d, ci, o);
+      if (auto c = d.getDerived<E>(ckey)) {
+        if (c->n == n) return {c->order, c->rank};
+        if (c->n < n && n - c->n <= n / 8) prev = c->order;  // (strings added since: merged in below)
+      }
+    }
   }
   const auto tStart = std::chrono::steady_clock::now();
   if (prev) {  // the dictionary grew a little: binary-search the new strings into the old order
@@ -294,6 +323,10 @@ std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<std::vect
 // a time, under the read lock), so the first ORDER BY / MIN / MAX / comparison on a string column
 // does not pay for the sort.
 void (*gFtsWarm)(const Dict& d) = nullptr;  // builds a FULLTEXT column's inverted index (set by the full-text code)
+// Background dictionary warm-up yields the CPU to queries: the thread, and the threads it starts,
+// run at nice 10.
+static void lowPriority() { setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10); }
+
 void warmDicts(const std::shared_ptr<Table>& t) {
   static std::mutex mu;
   static std::set<const Table*> busy;
@@ -302,7 +335,13 @@ void warmDicts(const std::shared_ptr<Table>& t) {
     if (!busy.insert(t.get()).second) return;
   }
   std::thread([t] {
+    lowPriority();
     try {
+      {  // string -> code indexes first (dictionaries loaded from a snapshot are indexed lazily)
+        std::shared_lock<FairSharedMutex> lk(t->mu);
+        for (auto& d : t->dicts)
+          if (d) d->index();
+      }
       for (int ci : {0, 1}) {  // binary collation first (no per-table collation is stored)
         tCi = ci;
         std::shared_lock<FairSharedMutex> lk(t->mu);
@@ -11855,8 +11894,12 @@ static bool writeAt(int fd, const char* p, size_t len, uint64_t off) {
   }
   return true;
 }
+static void dictOrders(Dict& d, size_t upto, const std::string& dir);
 static void dictPersist(Dict& d, size_t upto, const std::string& dir) {
-  if (!d.fileName.empty() && upto <= d.fileStrs) return;
+  if (!d.fileName.empty() && upto <= d.fileStrs) {
+    dictOrders(d, d.fileStrs, dir);
+    return;
+  }
   if (d.fileName.empty()) {
     mkdir(dir.c_str(), 0755);
     for (int tries = 0; d.fileName.empty(); ++tries) {
@@ -11918,6 +11961,46 @@ static void dictPersist(Dict& d, size_t upto, const std::string& dir) {
   if (!ok) throw SqlError("cannot write " + path, 1105);
   d.fileBytes = off;
   d.fileStrs = upto;
+  dictOrders(d, upto, dir);
+}
+
+// Side files with the collation orders (when cached for exactly the strings in the file), so a
+// restart doesn't sort the dictionary again: "WORD0001", u64 strings, u32 CRC32C of the rest,
+// zstd(order).
+static void dictOrders(Dict& d, size_t upto, const std::string& dir) {
+  for (int ci : {0, 1}) {
+    if (d.orderFileStrs[ci] == upto) continue;
+    auto order = sortedOrderCached(d, ci, upto);
+    if (!order) continue;
+    std::string z(ZSTD_compressBound(order->size() * 4), '\0');
+    const size_t k = ZSTD_compress(z.data(), z.size(), order->data(), order->size() * 4, 1);
+    if (ZSTD_isError(k)) continue;
+    z.resize(k);
+    std::string out = "WORD0001";
+    const uint64_t nn = upto;
+    const uint32_t crc = crc32c(z.data(), z.size());
+    out.append((const char*)&nn, 8).append((const char*)&crc, 4).append(z);
+    const std::string op = dir + "/" + d.fileName + ".o" + std::to_string(ci), tmp = op + ".tmp";
+    const int ofd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (ofd < 0) continue;
+    const bool wrote = writeAt(ofd, out.data(), out.size(), 0) && fdatasync(ofd) == 0;
+    ::close(ofd);
+    if (wrote && rename(tmp.c_str(), op.c_str()) == 0) d.orderFileStrs[ci] = upto;
+    else unlink(tmp.c_str());
+  }
+}
+
+static bool readFile(const std::string& path, std::string& out) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return false;
+  struct stat st;
+  bool ok = fstat(fd, &st) == 0;
+  if (ok) {
+    out.resize((size_t)st.st_size);
+    ok = pread(fd, out.data(), out.size(), 0) == (ssize_t)out.size();
+  }
+  ::close(fd);
+  return ok;
 }
 
 // The first n strings of a dictionary file (ending at byte `bytes`) into an empty dictionary.
@@ -11974,6 +12057,25 @@ static void dictLoad(Dict& d, const std::string& dir, const std::string& name, u
   d.fileName = name;
   d.fileStrs = n;
   d.fileBytes = bytes;
+  for (int ci : {0, 1}) {  // the collation orders: read when first needed (sortedDict)
+    const std::string op = dir + "/" + name + ".o" + std::to_string(ci);
+    if (access(op.c_str(), F_OK) == 0) d.orderFile[ci] = op;
+  }
+}
+
+// A saved collation order (dictOrders) of exactly the dictionary's strings, or null.
+std::shared_ptr<std::vector<int32_t>> loadOrderFile(const std::string& path, size_t n) {
+  std::string o;
+  if (!readFile(path, o) || o.size() < 20 || o.compare(0, 8, "WORD0001") != 0) return nullptr;
+  uint64_t on;
+  uint32_t crc;
+  memcpy(&on, o.data() + 8, 8);
+  memcpy(&crc, o.data() + 16, 4);
+  if (on != n || crc32c(o.data() + 20, o.size() - 20) != crc) return nullptr;
+  auto order = std::make_shared<std::vector<int32_t>>(n);
+  const size_t k = ZSTD_decompress(order->data(), n * 4, o.data() + 20, o.size() - 20);
+  if (ZSTD_isError(k) || k != n * 4) return nullptr;
+  return order;
 }
 
 // After a snapshot is installed: dictionary files it doesn't refer to go.
@@ -11983,7 +12085,8 @@ static void dictFilesInstalled(const std::string& dir, const std::set<std::strin
   std::vector<std::string> gone;
   while (dirent* e = readdir(dp)) {
     std::string n = e->d_name;
-    if (n.size() > 6 && n.compare(n.size() - 6, 6, ".wdict") == 0 && !used.count(n.substr(0, n.size() - 6))) gone.push_back(n);
+    const size_t dot = n.find('.');
+    if (dot != std::string::npos && dot == 16 && !used.count(n.substr(0, dot))) gone.push_back(n);  // (<name>.wdict / .o0 / .o1)
   }
   closedir(dp);
   for (auto& n : gone) unlink((dir + "/" + n).c_str());
