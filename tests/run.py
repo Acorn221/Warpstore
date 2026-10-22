@@ -202,6 +202,7 @@ def main():
     print(f"{len(results) - len(failed)}/{len(results)} passed or skipped; data and logs in {lib.TMP}")
     if not failed:
         shutil.rmtree(lib.TMP, ignore_errors=True)
+    lib._failed = bool(failed)  # (lib's exit cleanup keeps the data of a failed run)
     sys.exit(1 if failed else 0)
 
 

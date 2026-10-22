@@ -7,6 +7,25 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("WARPSTORE_BIN", os.path.join(ROOT, "build", "warpstore"))
 TMP = os.environ.get("WARPSTORE_TEST_TMP") or tempfile.mkdtemp(prefix="warpstore-test-")
 os.makedirs(TMP, exist_ok=True)
+# A temp dir made here (a script run on its own) is removed at exit, unless something failed (a
+# Checker failure or an uncaught exception) or WARPSTORE_KEEP_TMP is set: data dirs are gigabytes.
+_failed = False
+_hook = sys.excepthook
+
+
+def _excepthook(*a):
+    global _failed
+    _failed = True
+    _hook(*a)
+
+
+sys.excepthook = _excepthook
+
+
+@atexit.register
+def _cleanup():  # (registered first: runs after the servers are killed)
+    if not os.environ.get("WARPSTORE_TEST_TMP") and not os.environ.get("WARPSTORE_KEEP_TMP") and not _failed:
+        shutil.rmtree(TMP, ignore_errors=True)
 
 
 def free_port():
@@ -150,6 +169,8 @@ class Checker:
         return self.check(name, False, "no error")
 
     def done(self):
+        global _failed
+        _failed = _failed or self.fails > 0
         print(f"{self.n - self.fails}/{self.n} checks passed")
         sys.exit(1 if self.fails else 0)
 
