@@ -9,6 +9,7 @@ Tests that need a shared server get WARPSTORE_PORT (one server, --no-wal, starte
 "own" start their own servers through tests/lib.py (crash, backup, replication, ...). A test is
 skipped when what it needs is missing (node, Docker containers, cuVS, the embedding model).
 """
+import concurrent.futures, threading
 import os, shutil, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -113,45 +114,90 @@ TESTS = [
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    if "--list" in sys.argv:
+    """run.py [names..] [-j N] [--quick] [--list]: the test groups (all by default; a name that matches a
+    group exactly selects only it, else every group containing it). Groups that start their own server
+    run N at a time (default 4), next to the groups that share one server; each group's output is
+    printed when it finishes. --quick: smoke, sql and a short fuzz run (for iterating)."""
+    argv = sys.argv[1:]
+    jobs = 4
+    if "-j" in argv:
+        jobs = max(1, int(argv[argv.index("-j") + 1]))
+        del argv[argv.index("-j"):argv.index("-j") + 2]
+    args = [a for a in argv if not a.startswith("-")]
+    if "--list" in argv:
         for t in TESTS:
             print(t[0])
         return
-    sel = [t for t in TESTS if not args or any(a in t[0] for a in args)]
+    if "--quick" in argv:
+        args = ["smoke", "sql", "fuzz"]
+        os.environ.setdefault("WARPSTORE_FUZZ_N", "150")
+    names = {t[0] for t in TESTS}
+    sel = [t for t in TESTS if not args or any(a == t[0] if a in names else a in t[0] for a in args)]
     sel = [t for t in sel if isinstance(t[1], str) is False or os.path.exists(os.path.join(HERE, t[1]))]
-    shared = None
-    results = []
+    results = {}
+    lock = threading.Lock()
+    shared_box = {"srv": None}
+
+    def report(name, status, secs, out):
+        with lock:
+            results[name] = (status, secs)
+            if out:
+                sys.stdout.write(out if out.endswith("\n") else out + "\n")
+            print(f"=== {name}: {status} ({secs:.1f}s)", flush=True)
+
+    def run_one(name, how, own):
+        t0 = time.time()
+        env = dict(os.environ, WARPSTORE_TEST_TMP=lib.TMP)
+        if callable(how):
+            try:
+                rc = how(shared_box["srv"].port)
+            except Exception as e:
+                print(f"{name}: {e}")
+                rc = 1
+            report(name, "PASS" if rc == 0 else "FAIL", time.time() - t0, "")
+            return
+        if not own:
+            env["WARPSTORE_PORT"] = str(shared_box["srv"].port)
+        p = subprocess.run([PY, os.path.join(HERE, how)] + ([str(shared_box["srv"].port)] if not own else []), env=env,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        rc = p.returncode
+        if not own and shared_box["srv"] and shared_box["srv"].proc.poll() is not None:
+            p.stdout += f"shared server died; log {shared_box['srv'].log}\n"
+            shared_box["srv"] = None
+            rc = rc or 1
+        report(name, "PASS" if rc == 0 else "FAIL", time.time() - t0, f"=== {name}\n" + p.stdout)
+
+    runnable = []
+    for name, how, req, own in sel:
+        if req and not req():
+            report(name, "SKIP", 0, "")
+            continue
+        runnable.append((name, how, own))
+    shared_tests = [t for t in runnable if not t[2]]
+    own_tests = [t for t in runnable if t[2]]
+
+    def shared_lane():
+        for name, how, own in shared_tests:
+            if shared_box["srv"] is None:
+                shared_box["srv"] = lib.Server(data_dir=None, http=False, name="shared").start()
+            run_one(name, how, own)
+
     try:
-        for name, how, req, own in sel:
-            if req and not req():
-                results.append((name, "SKIP", 0))
-                print(f"=== {name}: SKIP (requirement missing)")
-                continue
-            if not own and shared is None:
-                shared = lib.Server(data_dir=None, http=False, name="shared").start()
-            print(f"=== {name}", flush=True)
-            t0 = time.time()
-            env = dict(os.environ, WARPSTORE_TEST_TMP=lib.TMP)
-            if not own:
-                env["WARPSTORE_PORT"] = str(shared.port)
-            if callable(how):
-                rc = how(shared.port)
-            else:
-                rc = subprocess.run([PY, os.path.join(HERE, how)] + ([str(shared.port)] if not own else []), env=env).returncode
-            if shared and shared.proc.poll() is not None:
-                print(f"shared server died; log {shared.log}")
-                shared = None
-                rc = rc or 1
-            results.append((name, "PASS" if rc == 0 else "FAIL", time.time() - t0))
-            print(f"=== {name}: {results[-1][1]} ({results[-1][2]:.1f}s)", flush=True)
+        lane = threading.Thread(target=shared_lane)
+        lane.start()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, jobs - (1 if shared_tests else 0))) as ex:
+            list(ex.map(lambda t: run_one(*t), own_tests))
+        lane.join()
     finally:
-        if shared:
-            shared.stop()
+        if shared_box["srv"]:
+            shared_box["srv"].stop()
     print("\nsummary")
-    for n, r, t in results:
-        print(f"  {r:4s}  {n:16s} {t:6.1f}s")
-    failed = [n for n, r, _ in results if r == "FAIL"]
+    order = [t[0] for t in sel]
+    for n in order:
+        if n in results:
+            r, t = results[n]
+            print(f"  {r:4s}  {n:16s} {t:6.1f}s")
+    failed = [n for n, (r, _) in results.items() if r == "FAIL"]
     print(f"{len(results) - len(failed)}/{len(results)} passed or skipped; data and logs in {lib.TMP}")
     if not failed:
         shutil.rmtree(lib.TMP, ignore_errors=True)
