@@ -3030,6 +3030,29 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
   } failLog{copyTo, copying, n};
   std::vector<double> colMs(t->cols.size());
   double cbMs = 0, appMs = 0;
+  // A batch is appended on another thread while the next one is converted (the load keeps the table
+  // lock meanwhile); n counts the rows once their append is done.
+  std::future<void> appending;
+  int64_t pendingRows = 0;
+  auto finishAppend = [&] {
+    if (!appending.valid()) return;
+    appending.get();
+    n += pendingRows;
+    pendingRows = 0;
+  };
+  struct AppendWait {  // (unwinding: the append in flight finishes first, and its rows count)
+    std::future<void>& f;
+    int64_t& n;
+    int64_t& pending;
+    ~AppendWait() {
+      if (!f.valid()) return;
+      try {
+        f.get();
+        n += pending;
+      } catch (...) {
+      }
+    }
+  } appendWait{appending, n, pendingRows};
   const bool direct = !vec && parquetScan(data, wanted, [&](int64_t rows, std::vector<PqChunk>& in) {
     const auto cb0 = Clock::now();
     struct CbTime {
@@ -3085,7 +3108,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
             iv[c][r] = 0;  // (numbered below)
             return;
           }
-          if (cm.notNull || (int)c == t->pk) throw SqlError("Column '" + cm.name + "' cannot be null (row " + std::to_string(n + r + 1) + ")", 1048);
+          if (cm.notNull || (int)c == t->pk) throw SqlError("Column '" + cm.name + "' cannot be null (row " + std::to_string(n + pendingRows + r + 1) + ")", 1048);
           t->hasNull[c] = 1;
           if (f64) dv[c][r] = nullv();
           else iv[c][r] = nul;
@@ -3175,10 +3198,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
         else t->autoNext = std::max<int64_t>(t->autoNext, v + 1);
       }
     }
-    const auto ap0 = Clock::now();
-    t->appendColumns(iv, dv, rows, nullptr, true);  // (null() set hasNull while converting)
-    appMs += msSince(ap0);
-    n += rows;
+    finishAppend();  // (the previous batch's)
     checkKilled();
     lk.unlock();  // (readers get in between row groups)
     // Over --memory-limit: evict cold column data to the segment files now (the maintenance thread
@@ -3186,7 +3206,14 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     if (tierEnabled() && tierHostBytes() - tierPendingBytes() > tierMemLimit() / 10 * 9) tierBalance();
     std::this_thread::yield();
     lk.lock();
+    pendingRows = rows;
+    appending = std::async(std::launch::async, [tp = t.get(), iv = std::move(iv), dv = std::move(dv), rows, &appMs]() mutable {
+      const auto ap0 = Clock::now();
+      tp->appendColumns(iv, dv, rows, nullptr, true);  // (null() set hasNull while converting)
+      appMs += msSince(ap0);
+    });
   });
+  finishAppend();
   if (!direct) {  // nested columns etc.: as text, through the text loader
     std::vector<std::string> names;
     for (auto& w : wanted) names.push_back(w.empty() ? std::string("\x01") : w);

@@ -888,6 +888,9 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
   std::vector<std::string_view> ds;  // dictionary
   std::vector<uint8_t> valid;
   valid.reserve(rows);
+  if (out.kind == 1) vi.reserve(rows);
+  else if (out.kind == 2) vd.reserve(rows);
+  else vs.reserve(rows);
   auto toInt = [&](int64_t v) -> int64_t {  // physical integer -> its meaning (timestamps: microseconds)
     if (col.tsUnit == 1) return v * 1000;
     if (col.tsUnit == 3) return v / 1000;
@@ -905,6 +908,33 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
   // n PLAIN values from q into ints / doubles / views.
   auto plain = [&](const uint8_t*& q, const uint8_t* qe, size_t n, std::vector<int64_t>& oi, std::vector<double>& od,
                    std::vector<std::string_view>& os) {
+    // Fixed-width numbers: one loop per type (the common case, no per-value switch).
+    const size_t w = col.type == 1 || col.type == 4 ? 4 : col.type == 2 || col.type == 5 ? 8 : 0;
+    if (w && q + n * w > qe) bad("values past the page");
+    if (col.type == 1 || col.type == 2) {
+      const size_t o = oi.size();
+      oi.resize(o + n);
+      int64_t* d = oi.data() + o;
+      if (col.type == 1)
+        for (size_t k = 0; k < n; ++k) { int32_t v; memcpy(&v, q + 4 * k, 4); d[k] = v; }
+      else
+        memcpy(d, q, 8 * n);
+      if (col.tsUnit == 1 || col.tsUnit == 3)
+        for (size_t k = 0; k < n; ++k) d[k] = toInt(d[k]);
+      q += w * n;
+      return;
+    }
+    if (col.type == 4 || col.type == 5) {
+      const size_t o = od.size();
+      od.resize(o + n);
+      double* d = od.data() + o;
+      if (col.type == 4)
+        for (size_t k = 0; k < n; ++k) { float v; memcpy(&v, q + 4 * k, 4); d[k] = v; }
+      else
+        memcpy(d, q, 8 * n);
+      q += w * n;
+      return;
+    }
     for (size_t k = 0; k < n; ++k) {
       switch (col.type) {
         case 0: oi.push_back((q[k / 8] >> (k % 8)) & 1); break;
@@ -1005,11 +1035,11 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
     size_t present = n;
     if (col.maxDef) {
       present = 0;
-      for (size_t k = 0; k < n; ++k) {
-        const bool v = defs[k] == (uint32_t)col.maxDef;
-        valid.push_back(v);
-        present += v;
-      }
+      const size_t o = valid.size();
+      valid.resize(o + n);
+      uint8_t* vd8 = valid.data() + o;
+      const uint32_t md = (uint32_t)col.maxDef;
+      for (size_t k = 0; k < n; ++k) present += (vd8[k] = defs[k] == md);
     } else {
       valid.insert(valid.end(), n, 1);
     }
@@ -1019,18 +1049,23 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
     } else if (enc == 2 || enc == 8) {
       const int bw = q < qe ? *q : 0;
       rleHybrid(q + 1, qe, bw, present, idx);
-      for (uint32_t i : idx) {
-        if (out.kind == 1) {
-          if (i >= di.size()) bad("dictionary index out of range");
-          vi.push_back(di[i]);
-        } else if (out.kind == 2) {
-          if (i >= dd.size()) bad("dictionary index out of range");
-          vd.push_back(dd[i]);
-        } else {
-          if (i >= ds.size()) bad("dictionary index out of range");
-          vs.push_back(ds[i]);
-          vc.push_back(i);
-        }
+      const size_t dn = out.kind == 1 ? di.size() : out.kind == 2 ? dd.size() : ds.size();
+      for (uint32_t i : idx)
+        if (i >= dn) bad("dictionary index out of range");
+      const size_t m = idx.size();
+      if (out.kind == 1) {
+        const size_t o = vi.size();
+        vi.resize(o + m);
+        for (size_t k = 0; k < m; ++k) vi[o + k] = di[idx[k]];
+      } else if (out.kind == 2) {
+        const size_t o = vd.size();
+        vd.resize(o + m);
+        for (size_t k = 0; k < m; ++k) vd[o + k] = dd[idx[k]];
+      } else {
+        const size_t o = vs.size();
+        vs.resize(o + m);
+        for (size_t k = 0; k < m; ++k) vs[o + k] = ds[idx[k]];
+        vc.insert(vc.end(), idx.begin(), idx.end());
       }
     } else if (enc == 5 && out.kind == 1 && !col.isDecimal) {
       deltaBinaryPacked(q, qe, delta);
@@ -1041,8 +1076,19 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
     seen += (int64_t)n;
   }
   if ((int64_t)valid.size() < rows) valid.resize(rows, 0);
-  // Spread the present values over the rows.
+  // Spread the present values over the rows (none missing: they are the rows).
   out.valid.assign(valid.begin(), valid.begin() + rows);
+  const bool full = memchr(out.valid.data(), 0, (size_t)rows) == nullptr;
+  if (full && out.kind == 1 && (int64_t)vi.size() >= rows) {
+    vi.resize((size_t)rows);
+    out.i.swap(vi);
+    return;
+  }
+  if (full && out.kind == 2 && (int64_t)vd.size() >= rows) {
+    vd.resize((size_t)rows);
+    out.d.swap(vd);
+    return;
+  }
   size_t k = 0;
   if (out.kind == 1) {
     out.i.assign(rows, 0);

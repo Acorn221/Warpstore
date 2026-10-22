@@ -32,7 +32,7 @@ add_executable(warpstore
   src/gpuio.cu src/crc32c.cpp
   src/gpu.cu
   src/jit.cu
-  src/proc.cpp
+  src/proc.cpp src/prof.cpp
   src/sources.cpp
   src/monitor.cpp
   src/mysqlcdc.cpp
