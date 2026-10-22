@@ -35,4 +35,10 @@ c.eq("year()", q("SELECT YEAR(d) y, COUNT(*) FROM t GROUP BY y ORDER BY y"), [(2
 c.eq("in list", q("SELECT id FROM t WHERE name IN ('apple','date') ORDER BY id"), [(1,), (4,), (5,)])
 c.check("explain", len(q("EXPLAIN SELECT name, SUM(price) FROM t WHERE id > 2 GROUP BY name")) > 0)
 cur.execute("DROP DATABASE smoke")
+# String functions count characters, not bytes (UTF-8), and case-map beyond ASCII.
+c.eq("utf-8 substring / left / right", q("SELECT SUBSTRING('привет', 1, 3), SUBSTRING('привет', -2), LEFT('привет', 2), RIGHT('héllo', 3), MID('日本語テキスト', 3, 2)"),
+     [("при", "ет", "пр", "llo", "語テ")])
+c.eq("utf-8 case mapping / reverse", q("SELECT UPPER('привет мир'), LOWER('ПРИВЕТ Ünïcödé'), REVERSE('añb')"), [("ПРИВЕТ МИР", "привет ünïcödé", "bña")])
+c.eq("utf-8 pad / locate / lengths", q("SELECT LPAD('ж', 4, 'аб'), LOCATE('в', 'привет'), INSTR('日本語', '語'), CHAR_LENGTH('日本語'), LENGTH('日本語')"),
+     [("абаж", 4, 3, 3, 9)])
 c.done()

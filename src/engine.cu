@@ -2098,6 +2098,75 @@ size_t utf8Len(const std::string& s) {
   return n;
 }
 
+// Character (not byte) positions in UTF-8 text, as MySQL's string functions count them.
+static bool asciiOnly(const std::string& s) {
+  for (unsigned char ch : s)
+    if (ch & 0x80) return false;
+  return true;
+}
+// Byte offset of character k (clamped to the end).
+static size_t u8Off(const std::string& s, int64_t k) {
+  if (k <= 0) return 0;
+  size_t i = 0;
+  for (int64_t c = 0; i < s.size(); ++i)
+    if (((unsigned char)s[i] & 0xc0) != 0x80 && c++ == k) return i;
+  return s.size();
+}
+// Characters [from, from + n) (from 0-based).
+static std::string u8Sub(const std::string& s, int64_t from, int64_t n) {
+  if (asciiOnly(s)) return from >= (int64_t)s.size() || n <= 0 ? std::string() : s.substr(from, n);
+  const size_t b = u8Off(s, from), e = n >= (int64_t)s.size() ? s.size() : u8Off(s, from + n);
+  return b >= e ? std::string() : s.substr(b, e - b);
+}
+// Code points <-> UTF-8, for case mapping.
+static void u8Decode(const std::string& s, std::vector<uint32_t>& out) {
+  out.clear();
+  for (size_t i = 0; i < s.size();) {
+    const unsigned char c = s[i];
+    const int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 1;
+    uint32_t cp = len == 1 ? c : len == 2 ? c & 0x1f : len == 3 ? c & 0x0f : c & 0x07;
+    for (int k = 1; k < len && i + k < s.size(); ++k) cp = (cp << 6) | ((unsigned char)s[i + k] & 0x3f);
+    out.push_back(len == 1 && c >= 0x80 ? 0xFFFD : cp);
+    i += len;
+  }
+}
+static void u8Append(std::string& o, uint32_t cp) {
+  if (cp < 0x80) o += (char)cp;
+  else if (cp < 0x800) o += (char)(0xc0 | (cp >> 6)), o += (char)(0x80 | (cp & 0x3f));
+  else if (cp < 0x10000) o += (char)(0xe0 | (cp >> 12)), o += (char)(0x80 | ((cp >> 6) & 0x3f)), o += (char)(0x80 | (cp & 0x3f));
+  else o += (char)(0xf0 | (cp >> 18)), o += (char)(0x80 | ((cp >> 12) & 0x3f)), o += (char)(0x80 | ((cp >> 6) & 0x3f)), o += (char)(0x80 | (cp & 0x3f));
+}
+// Upper / lower case: ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic.
+static uint32_t cpUpper(uint32_t c) {
+  if (c < 0x80) return c >= 'a' && c <= 'z' ? c - 32 : c;
+  if ((c >= 0xE0 && c <= 0xFE && c != 0xF7)) return c - 0x20;
+  if (c == 0xFF) return 0x178;
+  if (c >= 0x100 && c <= 0x17F && c != 0x130 && c != 0x131 && c != 0x138 && c != 0x149 && c != 0x17F) {
+    const bool pairEven = (c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177);
+    if (pairEven) return (c & 1) ? c - 1 : c;
+    if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? c : c - 1;
+  }
+  if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) return c - 0x20;
+  if (c == 0x3C2) return 0x3A3;
+  if (c >= 0x430 && c <= 0x44F) return c - 0x20;
+  if (c >= 0x450 && c <= 0x45F) return c - 0x50;
+  return c;
+}
+static uint32_t cpLower(uint32_t c) {
+  if (c < 0x80) return c >= 'A' && c <= 'Z' ? c + 32 : c;
+  if (c >= 0xC0 && c <= 0xDE && c != 0xD7) return c + 0x20;
+  if (c == 0x178) return 0xFF;
+  if (c >= 0x100 && c <= 0x17F && c != 0x130 && c != 0x131 && c != 0x138 && c != 0x149 && c != 0x17F) {
+    const bool pairEven = (c >= 0x100 && c <= 0x137) || (c >= 0x14A && c <= 0x177);
+    if (pairEven) return (c & 1) ? c : c + 1;
+    if ((c >= 0x139 && c <= 0x148) || (c >= 0x179 && c <= 0x17E)) return (c & 1) ? c + 1 : c;
+  }
+  if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return c + 0x20;
+  if (c >= 0x410 && c <= 0x42F) return c + 0x20;
+  if (c >= 0x400 && c <= 0x40F) return c + 0x50;
+  return c;
+}
+
 // String (and other host-only) scalar functions: evaluated on the CPU, per dictionary entry when
 // the expression has a single string column (encoded execution), otherwise per result row.
 // EMBED: texts -> VECTOR literals through the GPU model, with a process-wide cache (embedding the
@@ -2450,25 +2519,35 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     return Value::S(r);
   }
   if (f == "UPPER" || f == "UCASE" || f == "LOWER" || f == "LCASE") {
+    const bool up = f == "UPPER" || f == "UCASE";
     std::string r = str(0);
-    for (auto& ch : r) ch = (char)(f == "UPPER" || f == "UCASE" ? toupper((unsigned char)ch) : tolower((unsigned char)ch));
-    return Value::S(r);
+    if (asciiOnly(r)) {
+      for (auto& ch : r) ch = (char)(up ? toupper((unsigned char)ch) : tolower((unsigned char)ch));
+      return Value::S(r);
+    }
+    std::vector<uint32_t> cps;
+    u8Decode(r, cps);
+    std::string o;
+    o.reserve(r.size());
+    for (uint32_t cp : cps) u8Append(o, up ? cpUpper(cp) : cpLower(cp));
+    return Value::S(o);
   }
   if (f == "LENGTH" || f == "OCTET_LENGTH") return Value::I((int64_t)str(0).size());
   if (f == "CHAR_LENGTH" || f == "CHARACTER_LENGTH") return Value::I((int64_t)utf8Len(str(0)));
-  if (f == "SUBSTRING" || f == "SUBSTR" || f == "MID") {
+  if (f == "SUBSTRING" || f == "SUBSTR" || f == "MID") {  // (characters, not bytes)
     std::string s0 = str(0);
-    int64_t pos = (int64_t)num(1), len = a.size() > 2 ? (int64_t)num(2) : (int64_t)s0.size();
-    int64_t n = (int64_t)s0.size();
+    const int64_t n = asciiOnly(s0) ? (int64_t)s0.size() : (int64_t)utf8Len(s0);
+    int64_t pos = (int64_t)num(1), len = a.size() > 2 ? (int64_t)num(2) : n;
     int64_t start = pos > 0 ? pos - 1 : pos < 0 ? n + pos : n;
     if (start < 0 || start >= n || len <= 0) return Value::S("");
-    return Value::S(s0.substr(start, len));
+    return Value::S(u8Sub(s0, start, len));
   }
-  if (f == "LEFT") { int64_t k = (int64_t)num(1); return Value::S(k <= 0 ? "" : str(0).substr(0, k)); }
+  if (f == "LEFT") { int64_t k = (int64_t)num(1); return Value::S(k <= 0 ? "" : u8Sub(str(0), 0, k)); }
   if (f == "RIGHT") {
     std::string s0 = str(0);
-    int64_t k = std::min<int64_t>((int64_t)num(1), (int64_t)s0.size());
-    return Value::S(k <= 0 ? "" : s0.substr(s0.size() - k));
+    const int64_t n = asciiOnly(s0) ? (int64_t)s0.size() : (int64_t)utf8Len(s0);
+    int64_t k = std::min<int64_t>((int64_t)num(1), n);
+    return Value::S(k <= 0 ? "" : u8Sub(s0, n - k, k));
   }
   if (f == "TRIM" || f == "LTRIM" || f == "RTRIM") {
     std::string s0 = str(0);
@@ -2489,15 +2568,29 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     }
     return Value::S(r);
   }
-  if (f == "REVERSE") { std::string r = str(0); std::reverse(r.begin(), r.end()); return Value::S(r); }
-  if (f == "LPAD" || f == "RPAD") {
+  if (f == "REVERSE") {
+    std::string r = str(0);
+    if (asciiOnly(r)) {
+      std::reverse(r.begin(), r.end());
+      return Value::S(r);
+    }
+    std::vector<uint32_t> cps;
+    u8Decode(r, cps);
+    std::string o;
+    for (auto it = cps.rbegin(); it != cps.rend(); ++it) u8Append(o, *it);
+    return Value::S(o);
+  }
+  if (f == "LPAD" || f == "RPAD") {  // (lengths in characters)
     std::string s0 = str(0), pad = a.size() > 2 ? str(2) : " ";
     int64_t n = (int64_t)num(1);
-    if (n <= (int64_t)s0.size()) return Value::S(s0.substr(0, std::max<int64_t>(n, 0)));
-    if (pad.empty()) return Value::Null();
+    const int64_t len0 = (int64_t)utf8Len(s0);
+    if (n <= len0) return Value::S(u8Sub(s0, 0, std::max<int64_t>(n, 0)));
+    if (pad.empty() || n > (1 << 24)) return Value::Null();
     std::string fill;
-    while ((int64_t)(fill.size() + s0.size()) < n) fill += pad;
-    fill = fill.substr(0, n - s0.size());
+    int64_t have = 0;
+    const int64_t padLen = (int64_t)utf8Len(pad);
+    while (have + padLen <= n - len0) fill += pad, have += padLen;
+    fill += u8Sub(pad, 0, n - len0 - have);
     return Value::S(f == "LPAD" ? fill + s0 : s0 + fill);
   }
   if (f == "REPEAT") {
@@ -2506,15 +2599,16 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     return Value::S(r);
   }
   if (f == "SPACE") return Value::S(std::string((size_t)std::max<double>(0, std::min<double>(num(0), 1 << 20)), ' '));
-  if (f == "LOCATE" || f == "POSITION") {
+  if (f == "LOCATE" || f == "POSITION") {  // (character positions)
     std::string sub = str(0), s0 = str(1);
-    size_t from = a.size() > 2 ? (size_t)std::max<double>(1, num(2)) - 1 : 0;
-    size_t j = s0.find(sub, from);
-    return Value::I(j == std::string::npos ? 0 : (int64_t)j + 1);
+    const int64_t from = a.size() > 2 ? (int64_t)std::max<double>(1, num(2)) - 1 : 0;
+    size_t j = s0.find(sub, u8Off(s0, from));
+    return Value::I(j == std::string::npos ? 0 : (int64_t)utf8Len(s0.substr(0, j)) + 1);
   }
   if (f == "INSTR") {
-    size_t j = str(0).find(str(1));
-    return Value::I(j == std::string::npos ? 0 : (int64_t)j + 1);
+    const std::string s0 = str(0);
+    size_t j = s0.find(str(1));
+    return Value::I(j == std::string::npos ? 0 : (int64_t)utf8Len(s0.substr(0, j)) + 1);
   }
   if (f == "ASCII") { std::string s0 = str(0); return Value::I(s0.empty() ? 0 : (unsigned char)s0[0]); }
   if (f == "STRCMP") { int r = str(0).compare(str(1)); return Value::I(r < 0 ? -1 : r > 0 ? 1 : 0); }
