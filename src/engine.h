@@ -146,7 +146,8 @@ class Engine {
   FILE* wal_ = nullptr;
   std::mutex walMu_;
   bool sync_;
-  std::atomic<bool> walBroken_{false};  // a WAL write failed: writes are refused until a restart
+  std::atomic<bool> walBroken_{false};
+  int64_t walReserved_ = 0;  // WAL bytes promised to write statements in flight (walMu_)  // a WAL write failed: writes are refused until a restart
   ResultSet executeStmt(const std::string& sql);
   // WAL (format 2: "GDBWAL2\n", then records of u32 length, u32 CRC32, payload). Group commit: a
   // committing writer waits until an fdatasync covers its record; one sync serves all waiters.
@@ -209,7 +210,10 @@ class Engine {
   const uint64_t replEpoch_ = std::random_device{}() * 4294967296ull + std::random_device{}();  // this primary incarnation (lsns restart with it)
   std::condition_variable ackCv_;
   void replWaitAck(uint64_t lsn);
-  void replWaitAckAfterGate(uint64_t lsn);  // replWaitAck now, or once the statement lets go of writeGate_
+  void replWaitAckAfterGate(uint64_t lsn);
+  void walExtendLocked(int64_t need);
+  int64_t walReserve(int64_t bytes);
+  void walUnreserve(int64_t bytes);  // replWaitAck now, or once the statement lets go of writeGate_
   std::atomic<int64_t> replCaughtUpUs_{0}, replLastContactUs_{0};  // replica side: lag / failover
   std::thread replThread_;
   ResultSet doPipeline(Stmt& s);

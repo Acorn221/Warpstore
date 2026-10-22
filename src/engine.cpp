@@ -10,13 +10,15 @@ namespace gdb {
 // WAL fsync counters (/metrics).
 static std::atomic<uint64_t> gWalSyncs{0}, gWalSyncUs{0}, gWalSyncMaxUs{0};
 static const int64_t gStartUs = nowUs();
-static void timedSync(int fd) {
+static std::atomic<bool> gDebugSyncFail{false};  // SET warpstore_debug_sync_fail = 1 (tests: fdatasync fails)
+static bool timedSync(int fd) {
   const auto t0 = Clock::now();
-  fdatasync(fd);
+  const bool ok = fdatasync(fd) == 0 && !gDebugSyncFail;
   const uint64_t us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count();
   ++gWalSyncs;
   gWalSyncUs += us;
   for (uint64_t m = gWalSyncMaxUs; us > m && !gWalSyncMaxUs.compare_exchange_weak(m, us);) {}
+  return ok;
 }
 
 // Prometheus metrics (GET /metrics on the HTTP port): the session / statement counters from the
@@ -158,7 +160,12 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
         std::lock_guard<std::mutex> g2(syncMu_);
         behind = wal_ && walWritten_ > walSynced_;
       }
-      if (behind) walSyncNow();
+      if (behind && !walBroken_) {
+        try {
+          walSyncNow();
+        } catch (std::exception&) {  // (fdatasync failed: walBroken_ is set, writes are refused)
+        }
+      }
     }
   });
 }
@@ -633,26 +640,52 @@ void Engine::walAppendLocked(const std::string& rec) {
   walWriteLocked(rec);
 }
 
+// Room for `need` more bytes after the records written and the space reserved for statements in
+// flight: the next chunk zeroed (and its size made durable) first. A full disk throws here.
+std::atomic<bool> gDebugWalFull{false};
+static thread_local int64_t tWalRoom = 0;  // this thread's statement's reservation (walReserve)
+void Engine::walExtendLocked(int64_t need) {
+  const int64_t others = walReserved_ - std::min(tWalRoom, walReserved_);
+  if (walOff_ + others + need <= walCap_ && !gDebugWalFull) return;
+  const int64_t chunk = std::max<int64_t>(64ll << 20, need + others);
+  static const std::vector<char> zeros(1 << 20, 0);
+  fseeko(wal_, walCap_, SEEK_SET);
+  bool ok = !gDebugWalFull;  // (SET warpstore_debug_wal_full = 1, tests: the disk is full)
+  if (!ok) errno = ENOSPC;
+  for (int64_t w = 0; w < chunk && ok; w += (int64_t)zeros.size()) {
+    const size_t k = (size_t)std::min<int64_t>(zeros.size(), chunk - w);
+    ok = fwrite(zeros.data(), 1, k, wal_) == k;
+  }
+  ok = ok && fflush(wal_) == 0 && fdatasync(fileno(wal_)) == 0;
+  if (!ok) {  // (a full disk shows here: records only ever go into space zeroed ahead)
+    const std::string why = strerror(errno);
+    clearerr(wal_);
+    throw SqlError("cannot extend the WAL: " + why + " (disk full?)", 1021);
+  }
+  walCap_ += chunk;
+}
+
+// Before an autocommit write statement changes anything: WAL room for its record, so a full disk
+// fails the statement cleanly (nothing applied) instead of leaving a change that isn't logged.
+int64_t Engine::walReserve(int64_t bytes) {
+  std::lock_guard<std::mutex> g(walMu_);
+  if (!wal_) return 0;
+  walExtendLocked(bytes);
+  walReserved_ += bytes;
+  tWalRoom += bytes;
+  return bytes;
+}
+void Engine::walUnreserve(int64_t bytes) {
+  if (!bytes) return;
+  std::lock_guard<std::mutex> g(walMu_);
+  walReserved_ -= bytes;
+  tWalRoom -= bytes;
+}
+
 void Engine::walWriteLocked(const std::string& rec) {
   const uint32_t len = (uint32_t)rec.size(), crc = (uint32_t)crc32(0, (const Bytef*)rec.data(), (uInt)rec.size());
   const int64_t need = 8 + (int64_t)rec.size();
-  if (walOff_ + need > walCap_) {  // zero the next chunk (and make its size durable) before using it
-    const int64_t chunk = std::max<int64_t>(64ll << 20, need);
-    static const std::vector<char> zeros(1 << 20, 0);
-    fseeko(wal_, walCap_, SEEK_SET);
-    bool ok = true;
-    for (int64_t w = 0; w < chunk && ok; w += (int64_t)zeros.size()) {
-      const size_t k = (size_t)std::min<int64_t>(zeros.size(), chunk - w);
-      ok = fwrite(zeros.data(), 1, k, wal_) == k;
-    }
-    ok = ok && fflush(wal_) == 0 && fdatasync(fileno(wal_)) == 0;
-    if (!ok) {  // (a full disk shows here: records only ever go into space zeroed ahead)
-      const std::string why = strerror(errno);
-      clearerr(wal_);
-      throw SqlError("cannot extend the WAL: " + why + " (disk full?)", 1021);
-    }
-    walCap_ += chunk;
-  }
+  walExtendLocked(need);
   fseeko(wal_, walOff_, SEEK_SET);
   const bool ok = fwrite(&len, 4, 1, wal_) == 1 && fwrite(&crc, 4, 1, wal_) == 1 && fwrite(rec.data(), 1, rec.size(), wal_) == rec.size() &&
                   fflush(wal_) == 0;
@@ -699,6 +732,10 @@ void Engine::walDurable(bool wait) {
   }
   std::unique_lock<std::mutex> lk(syncMu_);
   while (walSynced_ < mine) {
+    if (walBroken_) {  // (an earlier fdatasync failed: a retry would succeed without the lost writes)
+      if (wait) throw SqlError("the WAL could not be made durable (fdatasync failed); the server is read-only until it is restarted", 1021);
+      return;
+    }
     if (syncing_) {
       syncCv_.wait(lk);
       continue;
@@ -712,8 +749,20 @@ void Engine::walDurable(bool wait) {
       target = walWritten_;
       fd = wal_ ? fileno(wal_) : -1;
     }
-    if (fd >= 0) timedSync(fd);
+    // A failed fdatasync: what the page cache held may not reach the disk, and a retry can't tell
+    // (the kernel drops the error once reported). Nothing written since is acknowledged as durable,
+    // and writes are refused until a restart replays what the disk really has.
+    if (fd >= 0 && !timedSync(fd)) {
+      walBroken_ = true;
+      fprintf(stderr, "[warpstore] WAL fdatasync failed: writes are refused until a restart\n");
+    }
     lk.lock();
+    if (walBroken_) {
+      syncing_ = false;
+      syncCv_.notify_all();
+      if (wait) throw SqlError("the WAL could not be made durable (fdatasync failed); the server is read-only until it is restarted", 1021);
+      return;
+    }
     walSynced_ = std::max(walSynced_, target);
     syncing_ = false;
     syncCv_.notify_all();
@@ -1388,18 +1437,27 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
     ResultSet cr;
     if (clusterStatement(sql, s, cr)) return cr;
   }
-  if ((isReplica_ && !tApplying) || (walBroken_ && !replaying_)) {
-    switch (s.type) {
-      case Stmt::SELECT: if (s.outfile.empty()) break; [[fallthrough]];
-      case Stmt::INSERT: case Stmt::UPDATE: case Stmt::DELETE: case Stmt::LOAD: case Stmt::CREATE: case Stmt::DROP:
-      case Stmt::ALTER: case Stmt::TRUNCATE: case Stmt::RENAME: case Stmt::CREATE_DB: case Stmt::DROP_DB:
-      case Stmt::CREATE_VIEW: case Stmt::DROP_VIEW: case Stmt::PIPELINE: case Stmt::USER: case Stmt::BACKUP:
-        if (s.type == Stmt::CREATE && s.temporary) break;
-        if (isReplica_) throw SqlError("The server is a read-only replica (--replica-of); run writes on the primary or PROMOTE it", 1290);
-        throw SqlError("The server is read-only: a WAL write failed (disk full?); free space and restart it", 1290);
-      default: break;
-    }
+  bool writes = false;  // (a statement that changes data or the schema: logged)
+  switch (s.type) {
+    case Stmt::SELECT: writes = !s.outfile.empty(); break;
+    case Stmt::INSERT: case Stmt::UPDATE: case Stmt::DELETE: case Stmt::LOAD: case Stmt::CREATE: case Stmt::DROP:
+    case Stmt::ALTER: case Stmt::TRUNCATE: case Stmt::RENAME: case Stmt::CREATE_DB: case Stmt::DROP_DB:
+    case Stmt::CREATE_VIEW: case Stmt::DROP_VIEW: case Stmt::PIPELINE: case Stmt::USER: case Stmt::BACKUP:
+      writes = !(s.type == Stmt::CREATE && s.temporary);
+      break;
+    default: break;
   }
+  if (writes && ((isReplica_ && !tApplying) || (walBroken_ && !replaying_))) {
+    if (isReplica_) throw SqlError("The server is a read-only replica (--replica-of); run writes on the primary or PROMOTE it", 1290);
+    throw SqlError("The server is read-only: a WAL write failed (disk full?); free space and restart it", 1290);
+  }
+  // Autocommit writes: WAL room reserved first (a full disk fails the statement before it applies).
+  struct WalRoom {
+    Engine* e;
+    int64_t bytes = 0;
+    ~WalRoom() { e->walUnreserve(bytes); }
+  } walRoom{this};
+  if (writes && writeGate.owns_lock() && !tTxn.active && !replaying_) walRoom.bytes = walReserve((int64_t)sql.size() + 512);
   if (s.type == Stmt::SET && (s.setName == "TRANSACTION" || s.setName == "TRANSACTION_ISOLATION" || s.setName == "TX_ISOLATION")) {
     static const std::regex snapRe(R"(REPEATABLE[\s_-]+READ|SERIALIZABLE|SNAPSHOT)", std::regex::icase);
     static const std::regex rcRe(R"(READ[\s_-]+(COMMITTED|UNCOMMITTED))", std::regex::icase);
@@ -1534,6 +1592,8 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
       else if (s.setName == "WARPSTORE_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
       else if (s.setName == "WARPSTORE_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
       else if (s.setName == "WARPSTORE_DEBUG_SCAN_DELAY_MS") tScanDelayMs = std::atoi(s.setValue.c_str());
+      else if (s.setName == "WARPSTORE_DEBUG_WAL_FULL") gDebugWalFull = std::atoi(s.setValue.c_str()) != 0;
+      else if (s.setName == "WARPSTORE_DEBUG_SYNC_FAIL") gDebugSyncFail = std::atoi(s.setValue.c_str()) != 0;
       else if (s.setName == "WARPSTORE_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
       else if (s.setName == "WARPSTORE_SYNC_DURABILITY") tSyncDurability = s.setValue == "DEFAULT" ? -1 : on() ? 1 : 0;
       else if (s.setName == "LONG_QUERY_TIME" || s.setName == "SLOW_QUERY_LOG") {  // server-wide (SET GLOBAL)
