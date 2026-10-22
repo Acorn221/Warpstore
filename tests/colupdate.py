@@ -7,7 +7,7 @@
 import datetime, os, random, sys, threading, time
 from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from lib import Checker, Server
+from lib import TMP, Checker, Server
 
 N = 200_000
 R = random.Random(11)
@@ -301,6 +301,14 @@ for _ in range(5):
 cur.execute("OPTIMIZE TABLE t")
 cur.fetchall()
 c.eq("after OPTIMIZE", dump(), want())
+# BACKUP / RESTORE with column versions made on the GPU (copied back to the host for the backup)
+cur.execute("UPDATE t SET v = v + 1")
+for j in model:
+    setm(j, v=model[j][1] + 1)
+bdir = os.path.join(TMP, f"colupdate-backup-{os.getpid()}")
+q(f"BACKUP DATABASE u TO '{bdir}'")
+q(f"RESTORE DATABASE u AS u2 FROM '{bdir}'")
+c.eq("restored copy", q("SELECT id, k, v, d, s, f, ts FROM u2.t ORDER BY id"), want())
 srv.stop()
 
 # disk tier: UPDATE columns that are only in the segment files
