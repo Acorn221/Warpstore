@@ -2776,7 +2776,23 @@ ResultSet Engine::loadRemote(Stmt& s) {
       for (size_t i = 0; i < g.gl_pathc; ++i) files.push_back(g.gl_pathv[i]);
     globfree(&g);
     if (files.empty()) throw SqlError("File '" + s.path + "' not found", 29);
+    auto isParquet = [](const std::string& f) {
+      FILE* fp = fopen(f.c_str(), "rb");
+      if (!fp) return false;
+      char head[4] = {0}, tail[4] = {0};
+      const bool ok = fread(head, 1, 4, fp) == 4 && fseeko(fp, -4, SEEK_END) == 0 && fread(tail, 1, 4, fp) == 4;
+      fclose(fp);
+      return ok && memcmp(head, "PAR1", 4) == 0 && memcmp(tail, "PAR1", 4) == 0;
+    };
     for (auto& f : files) {
+      if (!json && isParquet(f)) {  // loaded in place, as LOAD DATA INFILE of the file (no staged copy)
+        std::string q, colList;
+        for (char ch : f) q += ch == '\'' ? std::string("''") : std::string(1, ch);
+        for (auto& c : s.insertCols) colList += (colList.empty() ? "" : ", ") + c;
+        total += execute("LOAD DATA INFILE '" + q + "' INTO TABLE " + table + (colList.empty() ? "" : " (" + colList + ")")).affected;
+        ++objects;
+        continue;
+      }
       FILE* fp = fopen(f.c_str(), "rb");
       if (!fp) throw SqlError("cannot read " + f, 29);
       std::string data;
