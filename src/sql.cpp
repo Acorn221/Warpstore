@@ -1227,11 +1227,17 @@ struct Parser {
       expectSym(")");
       txt += ")";
     }
-    while (acceptKw("UNSIGNED") || acceptKw("SIGNED") || acceptKw("ZEROFILL")) {}
+    bool uns = false;
+    for (;;) {
+      if (acceptKw("UNSIGNED")) uns = true;
+      else if (!acceptKw("SIGNED") && !acceptKw("ZEROFILL")) break;
+    }
+    if (uns) txt += " UNSIGNED";
     if (acceptKw("CHARACTER")) { expectKw("SET"); ident(); }
     if (acceptKw("CHARSET")) ident();
     if (acceptKw("COLLATE")) ident();
     if (text) *text = txt;
+    if (uns && (tn == "INT" || tn == "INTEGER" || tn == "MEDIUMINT")) return LType::BIGINT;  // (above 2^31: 64-bit)
     if (tn == "INT" || tn == "INTEGER" || tn == "SMALLINT" || tn == "TINYINT" || tn == "MEDIUMINT" || tn == "BOOL" ||
         tn == "BOOLEAN" || tn == "BIT" || tn == "YEAR")
       return LType::INT;

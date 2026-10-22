@@ -124,9 +124,12 @@ void ioParallel(size_t n, const std::function<void(size_t)>& fn, bool urgent) {
   std::mutex m;
   std::condition_variable cv;
   size_t left = n;
+  const bool strict = tStrictTypes;  // (the statement's strict SQL mode, on the pool threads too)
   for (size_t i = 0; i < n; ++i)
-    ioPool().submit([&, i] {
+    ioPool().submit([&, i, strict] {
+      tStrictTypes = strict;
       fn(i);
+      tStrictTypes = false;
       std::lock_guard<std::mutex> g(m);
       if (--left == 0) cv.notify_all();
     }, urgent);

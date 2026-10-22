@@ -92,12 +92,14 @@ inline void parallelFor(size_t n, const std::function<void(size_t, size_t)>& f, 
   size_t chunk = (n + nth - 1) / nth;
   if (minChunk >= 32) chunk = (chunk + 31) & ~(size_t)31;  // bitmap words never shared
   const int ci = tCi;
+  const bool strict = tStrictTypes;
   std::vector<std::thread> th;
   std::exception_ptr err;
   std::mutex errMu;
   for (size_t b = 0; b < n; b += chunk)
     th.emplace_back([&, b] {
       tCi = ci;
+      tStrictTypes = strict;
       try {
         f(b, std::min(n, b + chunk));
       } catch (...) {
@@ -629,6 +631,14 @@ struct DevBits {
 };
 inline thread_local int64_t tFoundRows = 0;
 inline thread_local bool tSnapTryOnly = false;  // automatic snapshots: skip the round rather than wait for writers
+// The session's sql_mode (SET sql_mode): STRICT_TRANS_TABLES / STRICT_ALL_TABLES / TRADITIONAL make
+// values that don't fit their column errors (the default, as MySQL 8); other modes keep them as given.
+inline const char* kDefaultSqlMode = "STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION";
+inline thread_local std::string tSqlMode = kDefaultSqlMode;
+inline bool sqlModeStrict() {
+  return tSqlMode.find("STRICT_TRANS_TABLES") != std::string::npos || tSqlMode.find("STRICT_ALL_TABLES") != std::string::npos ||
+         tSqlMode.find("TRADITIONAL") != std::string::npos;
+}
 inline thread_local bool tWriteGateHeld = false;  // this thread's statement holds Engine::writeGate_ (shared)
 inline thread_local uint64_t tAckLsn = 0;          // semi-sync: the replica acknowledgement to wait for once the gate is let go     // FOUND_ROWS(): rows of the last SELECT (without its LIMIT if SQL_CALC_FOUND_ROWS)
 inline thread_local std::vector<std::string> tTempTables;  // CREATE TEMPORARY TABLE: dropped when the connection ends

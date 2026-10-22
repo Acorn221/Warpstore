@@ -45,7 +45,19 @@ struct ColumnMeta {
   int scale = 0;           // DECIMAL(p, s): stored as int64 scaled by 10^s
   int vram = 0;            // VRAM hint: 0 AUTO, 1 PIN, 2 NEVER (0: the table's)
   std::string defText;     // DEFAULT (now()) as written; empty for plain defaults
+  // Strict mode limits, from typeText (Table's constructor, deriveLimits): integer range, DECIMAL
+  // precision, string length in characters / bytes, ENUM members.
+  bool ranged = false;
+  int64_t imin = 0, imax = 0;
+  int precision = 0;
+  int64_t maxChars = -1, maxBytes = -1;
+  std::vector<std::string> enumVals;
 };
+void deriveLimits(ColumnMeta& c);
+// Strict SQL mode (MySQL STRICT_TRANS_TABLES): a value that doesn't fit its column is an error.
+// Per statement: on for INSERT / UPDATE / REPLACE unless the session's sql_mode is not strict; off
+// for LOAD DATA (as MySQL's LOAD DATA LOCAL: kept as given) and WAL replay.
+extern thread_local bool tStrictTypes;
 
 // "[1, 2.5, -3]" -> floats (false if malformed)
 bool parseVector(const std::string& s, std::vector<float>& out);
@@ -1172,6 +1184,10 @@ struct Table {
   bool compactInstall(struct CompactJob& j);
   uint8_t encodeColumn(int c, const std::vector<uint8_t>& h, int64_t n, std::vector<uint8_t>& out) const;
   bool colStats(int c, const std::vector<uint8_t>& h, int64_t n, double& mn, double& mx) const;
+  // Strict mode (tStrictTypes): throw when a stored integer / DECIMAL or a string doesn't fit column c.
+  void checkFits(int c, int64_t raw) const;
+  void checkFitsStr(int c, std::string_view s) const;
+  void checkFitsColumn(int c, const std::vector<int64_t>& iv, size_t from, size_t n) const;  // (VARCHAR: codes)
   // srcOf[c]: which field of each line feeds column c (-1: NULL / AUTO_INCREMENT); empty = in order.
   // yield: called every 256K rows with no row half-written (the caller may drop and retake its lock).
   // copyTo: also writes the file there, zstd-compressed (for the WAL). A load that fails keeps the

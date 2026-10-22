@@ -258,6 +258,46 @@ uint64_t shardHashStr(std::string_view s) {
   return shardHashInt((int64_t)h);
 }
 
+thread_local bool tStrictTypes = false;
+
+void deriveLimits(ColumnMeta& c) {
+  std::string t;
+  for (char ch : c.typeText) t += (char)toupper((unsigned char)ch);
+  const bool uns = t.find(" UNSIGNED") != std::string::npos;
+  std::string base = t.substr(0, t.find_first_of("( "));
+  std::vector<std::string> args;  // inside the parentheses
+  if (size_t o = t.find('('); o != std::string::npos) {
+    const size_t e = t.rfind(')');
+    std::string in = c.typeText.substr(o + 1, e == std::string::npos ? std::string::npos : e - o - 1), cur;
+    bool q = false;
+    for (size_t i = 0; i < in.size(); ++i) {
+      const char ch = in[i];
+      if (ch == '\'' && (!q || i + 1 >= in.size() || in[i + 1] != '\'')) { q = !q; continue; }
+      if (ch == '\'' && q) { cur += ch; ++i; continue; }  // ('' inside quotes)
+      if (ch == ',' && !q) { args.push_back(cur); cur.clear(); continue; }
+      if (q || !isspace((unsigned char)ch)) cur += ch;
+    }
+    args.push_back(cur);
+  }
+  auto num = [&](size_t i, int64_t d) { return i < args.size() && !args[i].empty() && isdigit((unsigned char)args[i][0]) ? std::atoll(args[i].c_str()) : d; };
+  auto range = [&](int64_t lo, int64_t hi) { c.ranged = true, c.imin = lo, c.imax = hi; };
+  if (base == "TINYINT" || base == "BOOL" || base == "BOOLEAN") uns ? range(0, 255) : range(-128, 127);
+  else if (base == "SMALLINT") uns ? range(0, 65535) : range(-32768, 32767);
+  else if (base == "MEDIUMINT") uns ? range(0, 16777215) : range(-8388608, 8388607);
+  else if (base == "INT" || base == "INTEGER") uns ? range(0, 4294967295ll) : range(INT32_MIN + 1ll, INT32_MAX);  // (INT32_MIN: NULL)
+  else if (base == "BIGINT") uns ? range(0, INT64_MAX) : range(INT64_MIN + 1, INT64_MAX);
+  else if (base == "YEAR") range(0, 2155);
+  else if (base == "BIT") range(0, (int64_t)((1ull << std::min<int64_t>(num(0, 1), 63)) - 1));
+  else if (c.lt == LType::DECIMAL) c.precision = (int)num(0, 10);
+  else if (base == "VARCHAR" || base == "CHAR" || base == "NVARCHAR" || base == "NCHAR") c.maxChars = num(0, base == "CHAR" || base == "NCHAR" ? 1 : -1);
+  else if (base == "BINARY") c.maxBytes = num(0, 1);
+  else if (base == "VARBINARY") c.maxBytes = num(0, -1);
+  else if (base == "TINYTEXT" || base == "TINYBLOB") c.maxBytes = 255;
+  else if (base == "TEXT" || base == "BLOB") c.maxBytes = 65535;
+  else if (base == "MEDIUMTEXT" || base == "MEDIUMBLOB") c.maxBytes = 16777215;
+  else if (base == "ENUM") c.enumVals = args;
+}
+
 Table::Table(std::string n, std::vector<ColumnMeta> c, int pk_, int sk, std::vector<int> pkc, std::vector<int> shard,
              int np, bool ref)
     : name(std::move(n)), cols(std::move(c)), pk(pk_), sortKey(sk), pkCols(std::move(pkc)), shardKey(std::move(shard)),
@@ -266,6 +306,7 @@ Table::Table(std::string n, std::vector<ColumnMeta> c, int pk_, int sk, std::vec
   hasNull.assign(cols.size(), 0);
   curVec.resize(cols.size());
   for (size_t i = 0; i < cols.size(); ++i) {
+    deriveLimits(cols[i]);
     if (cols[i].lt == LType::VARCHAR) dicts[i] = std::make_unique<Dict>();
     if (cols[i].autoInc) autoIncCol = (int)i;
   }
@@ -637,6 +678,52 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
 }
 
 // A value as column c stores it (NULL checks, conversions, string -> code); VECTOR cells go to curVec.
+void Table::checkFits(int c, int64_t raw) const {
+  const ColumnMeta& cm = cols[c];
+  if (raw == (cm.pt == PType::I64 ? kNullI64 : (int64_t)kNullI32)) return;
+  bool bad = cm.ranged && (raw < cm.imin || raw > cm.imax);
+  if (cm.lt == LType::DECIMAL && cm.precision > 0 && cm.precision < 19) {
+    const int64_t lim = (int64_t)pow10i(cm.precision);
+    bad = raw >= lim || raw <= -lim;
+  }
+  if (cm.pt == PType::I32 && (raw > INT32_MAX || raw <= INT32_MIN)) bad = true;  // (storage)
+  if (bad) throw SqlError("Out of range value for column '" + cm.name + "'", 1264);
+}
+
+void Table::checkFitsColumn(int c, const std::vector<int64_t>& iv, size_t from, size_t n) const {
+  const ColumnMeta& cm = cols[c];
+  if (cm.lt == LType::VARCHAR) {
+    if (cm.maxChars < 0 && cm.maxBytes < 0 && cm.enumVals.empty()) return;
+    const Dict& d = *dicts[c];
+    std::vector<uint8_t> seen(d.strs.size(), 0);
+    for (size_t k = from; k < from + n; ++k) {
+      const int64_t code = iv[k];
+      if (code < 0 || (size_t)code >= seen.size() || seen[code]) continue;
+      seen[code] = 1;
+      checkFitsStr(c, d.strs[(size_t)code]);
+    }
+    return;
+  }
+  if (cm.pt == PType::F64 || cm.lt == LType::DATE || cm.lt == LType::DATETIME) return;
+  if (!cm.ranged && !(cm.lt == LType::DECIMAL && cm.precision > 0) && cm.pt != PType::I32) return;
+  for (size_t k = from; k < from + n; ++k) checkFits(c, iv[k]);
+}
+
+void Table::checkFitsStr(int c, std::string_view str) const {
+  const ColumnMeta& cm = cols[c];
+  if (cm.maxBytes >= 0 && (int64_t)str.size() > cm.maxBytes) throw SqlError("Data too long for column '" + cm.name + "'", 1406);
+  if (cm.maxChars >= 0 && (int64_t)str.size() > cm.maxChars) {  // (bytes <= limit: fits whatever the characters)
+    int64_t chars = 0;
+    for (unsigned char ch : str) chars += (ch & 0xC0) != 0x80;
+    if (chars > cm.maxChars) throw SqlError("Data too long for column '" + cm.name + "'", 1406);
+  }
+  if (!cm.enumVals.empty()) {
+    for (auto& e : cm.enumVals)
+      if (e.size() == str.size() && strncasecmp(e.data(), str.data(), str.size()) == 0) return;
+    throw SqlError("Data truncated for column '" + cm.name + "'", 1265);
+  }
+}
+
 void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
   if (v.isNull()) {
     if (cols[c].notNull || (int)c == pk) throw SqlError("Column '" + cols[c].name + "' cannot be null", 1048);
@@ -648,7 +735,26 @@ void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
   switch (cols[c].lt) {
     case LType::INT:
     case LType::BIGINT:
-      i = v.kind == Value::STR ? std::stoll(v.s) : v.kind == Value::DBL ? (int64_t)std::llround(v.d) : v.i;
+      if (v.kind == Value::STR) {  // (strict: the whole string a number; otherwise its leading number, as MySQL)
+        const char* b = v.s.c_str();
+        char* e = nullptr;
+        errno = 0;
+        const double dv = strtod(b, &e);
+        while (e && isspace((unsigned char)*e)) ++e;
+        const bool whole = e != b && e && *e == 0;
+        if (tStrictTypes && (!whole || errno == ERANGE || dv != dv))
+          throw SqlError("Incorrect integer value: '" + v.s + "' for column '" + cols[c].name + "'", 1366);
+        if (tStrictTypes && (dv >= 9.2233720368547758e18 || dv < -9.2233720368547758e18))
+          throw SqlError("Out of range value for column '" + cols[c].name + "'", 1264);
+        i = whole && v.s.find_first_of(".eE") == std::string::npos ? std::strtoll(b, nullptr, 10) : (int64_t)std::llround(dv);
+      } else if (v.kind == Value::DBL) {
+        if (tStrictTypes && !(v.d < 9.2233720368547758e18 && v.d >= -9.2233720368547758e18))
+          throw SqlError("Out of range value for column '" + cols[c].name + "'", 1264);
+        i = (int64_t)std::llround(v.d);
+      } else {
+        i = v.i;
+      }
+      if (tStrictTypes) checkFits(c, i);
       break;
     case LType::DOUBLE: d = v.kind == Value::STR ? std::stod(v.s) : v.num(); break;
     case LType::DECIMAL: {
@@ -662,6 +768,7 @@ void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
         raw = v.i * (int64_t)pow10i(cols[c].scale);
       }
       i = raw;
+      if (tStrictTypes) checkFits(c, i);
       break;
     }
     case LType::DATE: {
@@ -688,7 +795,15 @@ void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
       }
       break;
     }
-    case LType::VARCHAR: i = dicts[c]->getOrAdd(v.kind == Value::STR ? v.s : v.toString()); break;
+    case LType::VARCHAR: {
+      const std::string& str = v.kind == Value::STR ? v.s : v.toString();
+      if (tStrictTypes) checkFitsStr(c, str);
+      const std::string* put = &str;
+      for (auto& e : cols[c].enumVals)  // (an ENUM keeps the member's spelling)
+        if (e.size() == str.size() && strncasecmp(e.data(), str.data(), str.size()) == 0) put = &e;
+      i = dicts[c]->getOrAdd(*put);
+      break;
+    }
     case LType::VECTOR: {
       if (!parseVector(v.toString(), curVec[c]) || (int)curVec[c].size() != cols[c].vecDim)
         throw SqlError("Invalid VECTOR(" + std::to_string(cols[c].vecDim) + ") value for column '" + cols[c].name + "'", 1105);

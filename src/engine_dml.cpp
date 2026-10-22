@@ -322,7 +322,10 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         const uint8_t* src = f.src >= 0 ? t.colData(Loc{seg, 0}, f.src).data() : nullptr;  // (old values: present, loaded above)
         const bool notNull = cm.notNull || c == t.pk;
         const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
-        const int64_t lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
+        int64_t lo = cm.pt == PType::I64 ? INT64_MIN + 1 : INT32_MIN + 1, hi = cm.pt == PType::I64 ? INT64_MAX : INT32_MAX;
+        if (tStrictTypes && cm.ranged) lo = std::max(lo, cm.imin), hi = std::min(hi, cm.imax);  // (strict: the column's range)
+        if (tStrictTypes && cm.lt == LType::DECIMAL && cm.precision > 0 && cm.precision < 19)
+          lo = std::max(lo, 1 - (int64_t)pow10i(cm.precision)), hi = std::min(hi, (int64_t)pow10i(cm.precision) - 1);
         uint8_t* vals = p.vals[k].data() + ru.off * (size_t)t.colBytes(c);
         for (size_t i = ru.b; i < ru.e; ++i) {
           const int32_t r = matched[i].row;
@@ -346,10 +349,11 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
             else { int32_t x32; memcpy(&x32, src + (size_t)r * 4, 4); v = x32; }
             if (v == nul) {
               if (notNull) return (void)(fail = true);
-            } else if (f.kind == 2 && (__builtin_add_overflow(v, f.add, &v) || v < lo || v > hi)) {
+            } else if (f.kind == 2 && __builtin_add_overflow(v, f.add, &v)) {
               return (void)(fail = true);  // (out of range: the general path reports it)
             }
           }
+          if (v != nul && (v < lo || v > hi)) return (void)(fail = true);
           if (cm.pt == PType::I64) memcpy(col + (size_t)r * 8, &v, 8), memcpy(vals, &v, 8), vals += 8;
           else { const int32_t x32 = (int32_t)v; memcpy(col + (size_t)r * 4, &x32, 4), memcpy(vals, &x32, 4), vals += 4; }
         }
@@ -629,7 +633,10 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     for (size_t k = 0; k < setCols.size(); ++k) {
       const int c = setCols[k];
       if (t.cols[c].pt == PType::F64) setD[k].insert(setD[k].end(), dv[c].begin(), dv[c].begin() + n);
-      else setI[k].insert(setI[k].end(), iv[c].begin(), iv[c].begin() + n);
+      else {
+        if (tStrictTypes) t.checkFitsColumn(c, iv[c], 0, n);  // (strict: every new value fits, before any change)
+        setI[k].insert(setI[k].end(), iv[c].begin(), iv[c].begin() + n);
+      }
     }
     ts += msSince(ph);
     continue;

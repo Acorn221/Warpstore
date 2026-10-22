@@ -1437,6 +1437,12 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
     ResultSet cr;
     if (clusterStatement(sql, s, cr)) return cr;
   }
+  // Strict SQL mode for this statement (values that don't fit their column are errors).
+  struct StrictScope {
+    bool prev = tStrictTypes;
+    ~StrictScope() { tStrictTypes = prev; }
+  } strictScope;
+  tStrictTypes = sqlModeStrict() && !replaying_ && !tApplying && (s.type == Stmt::INSERT || s.type == Stmt::UPDATE || s.type == Stmt::ALTER);
   bool writes = false;  // (a statement that changes data or the schema: logged)
   switch (s.type) {
     case Stmt::SELECT: writes = !s.outfile.empty(); break;
@@ -1611,6 +1617,11 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
       else if (s.setName == "WARPSTORE_NPROBE") tNprobe = std::atoi(s.setValue.c_str());
       else if (s.setName == "WARPSTORE_CAGRA_ITOPK") tCagraItopk = std::atoi(s.setValue.c_str());
       else if (s.setName == "WARPSTORE_DEBUG_SCAN_DELAY_MS") tScanDelayMs = std::atoi(s.setValue.c_str());
+      else if (s.setName == "SQL_MODE") {
+        std::string v = s.setValue;
+        v.erase(std::remove(v.begin(), v.end(), '\''), v.end());
+        tSqlMode = v == "DEFAULT" ? kDefaultSqlMode : v;
+      }
       else if (s.setName == "WARPSTORE_DEBUG_WAL_FULL") gDebugWalFull = std::atoi(s.setValue.c_str()) != 0;
       else if (s.setName == "WARPSTORE_DEBUG_SYNC_FAIL") gDebugSyncFail = std::atoi(s.setValue.c_str()) != 0;
       else if (s.setName == "WARPSTORE_JOIN_FILTER_ROWS") tLazyRows = std::atoll(s.setValue.c_str());
@@ -2573,7 +2584,7 @@ std::vector<std::pair<std::string, std::string>> systemVariables() {
           {"character_set_server", "utf8mb4"}, {"character_set_database", "utf8mb4"}, {"character_set_system", "utf8mb3"},
           {"collation_connection", ciColl() ? "utf8mb4_0900_ai_ci" : "utf8mb4_bin"}, {"collation_server", "utf8mb4_0900_ai_ci"},
           {"collation_database", "utf8mb4_0900_ai_ci"}, {"lower_case_table_names", "1"}, {"lower_case_file_system", "OFF"},
-          {"max_allowed_packet", "1073741824"}, {"net_buffer_length", "16384"}, {"sql_mode", ""}, {"time_zone", "SYSTEM"},
+          {"max_allowed_packet", "1073741824"}, {"net_buffer_length", "16384"}, {"sql_mode", tSqlMode}, {"time_zone", "SYSTEM"},
           {"system_time_zone", "UTC"}, {"transaction_isolation", iso}, {"tx_isolation", iso}, {"transaction_read_only", "0"},
           {"tx_read_only", "0"}, {"wait_timeout", "28800"}, {"interactive_timeout", "28800"}, {"net_write_timeout", "60"},
           {"net_read_timeout", "30"}, {"connect_timeout", "10"}, {"max_connections", "1000"}, {"auto_increment_increment", "1"},
@@ -2893,6 +2904,9 @@ static int64_t insertColumns(Table& t, const std::vector<int>& map, const Result
     }
     t.lastInsertId = iv[t.autoIncCol][n - 1];
   }
+  if (tStrictTypes)
+    for (size_t c = 0; c < nc; ++c)
+      if (t.cols[c].pt != PType::F64 && (int)c != t.autoIncCol) t.checkFitsColumn((int)c, iv[c], 0, (size_t)n);
   t.appendColumns(iv, dv, n);
   return n;
 }
