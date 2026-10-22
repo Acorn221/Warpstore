@@ -100,6 +100,7 @@ TESTS = [
     ("crash", "crash.py", None, True),
     ("load", "load.py", None, True),
     ("autosnap", "autosnap.py", None, True),
+    ("crashfuzz", "crashfuzz.py", None, True),
     ("compact", "compact.py", None, True),
     ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),
