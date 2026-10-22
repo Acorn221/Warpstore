@@ -24,6 +24,7 @@ extern const std::string kNullCell;
 extern thread_local bool tTypedResult;
 extern thread_local bool tRawNumber;  // a single numeric SELECT column comes back as ResultSet::numCol
 extern thread_local bool tColumnar;   // an all-numeric GROUP BY result comes back as ResultSet::numCols
+extern thread_local bool tInsertCols;  // INSERT .. SELECT: a projection comes back as columns (ResultSet::insertCols)
 // >= 0: scans of partitioned (non-reference) tables read only this partition (a shuffle streams a
 // leaf's rows one partition at a time; co-located joins stay correct partition by partition).
 extern thread_local int tOnlyPart;
@@ -50,6 +51,11 @@ struct ResultSet {
   };
   std::vector<std::shared_ptr<DevColumn>> devCols;
   int64_t devRows = 0;
+  // tInsertCols: the rows as columns: intCols[i] (exact BIGINT / DATETIME values) or numCols[i]
+  // (VARCHAR: codes of colDicts[i], DECIMAL: in units, scale colScales[i]).
+  bool insertCols = false;
+  std::vector<std::vector<int64_t>> intCols;
+  std::vector<int> colScales;
   int64_t affected = 0;
   int64_t lastInsertId = 0;
   std::string info;

@@ -347,6 +347,12 @@ column at a time, and segment flushes encode their columns in parallel. The copy
 WAL replays is zstd-compressed in the same pass: 1.47 GB in the data dir instead of 7.9 GB. A restart
 of the snapshotted table takes 6.4 s (13.6 s before; dictionaries are open-addressing tables now).
 
+**Bulk writes** (4-column table, this machine): `INSERT .. SELECT` copies about 11M rows/s (the
+projection comes back as columns and is appended a column at a time; it used to build a row of
+values per row, at about 2M rows/s, and stopped at 20M rows); an UPDATE of 5.3M rows takes 1.9 s
+(new rows start as the old rows' stored cells, so only the SET columns are converted; it was about
+0.9M rows/s); DELETE of 5.3M rows 1.0 s.
+
 ### Against SingleStore's published "trillion rows per second" query
 
 SingleStore's headline benchmark ([blog](https://www.singlestore.com/blog/how-to-process-trillion-rows-per-second-ad-hoc-analytic-queries/))

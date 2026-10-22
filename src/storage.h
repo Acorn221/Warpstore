@@ -710,6 +710,12 @@ struct Table {
   void appendRow(const std::vector<Value>& row);  // converts types, enforces PK
   Loc lastDup{INT32_MIN, 0};  // the existing row of the last UNIQUE-key violation (writers hold the lock)
   void appendRaw(const std::vector<int64_t>& ints, const std::vector<double>& dbls);  // physical values
+  void rawOf(int c, const Value& v, int64_t& i, double& d);  // a value as column c stores it
+  // Appends n rows given as physical columns (iv[c] for I32 / I64 columns, dv[c] for F64; no VECTOR
+  // columns): whole columns per partition for plain tables, row by row otherwise.
+  void appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n);
+  // Set while a statement holds row locations across appends: full write buffers are flushed after.
+  bool deferFlush = false;
   void deleteAt(Loc l);
   void txnNoteDelete(Loc l);  // an open transaction deleted row l (read committed bookkeeping)
   TxnPending& pendingOfMine();  // this transaction's change set here (created and registered on first use)

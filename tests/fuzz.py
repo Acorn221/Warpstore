@@ -56,9 +56,30 @@ for name, rows in (("t1", rows1), ("t2", rows2)):
         d.execute(f"INSERT INTO {name} VALUES {vals}")
 # a second segment plus deletes and updates, so the queries cover mixed storage
 g.execute("OPTIMIZE TABLE t1")
-for sql in ("DELETE FROM t1 WHERE id % 17 = 3", "UPDATE t1 SET a = a + 1 WHERE id % 13 = 5", "UPDATE t2 SET s2 = 'zebra' WHERE id % 11 = 0"):
+for sql in ("DELETE FROM t1 WHERE id % 17 = 3", "UPDATE t1 SET a = a + 1 WHERE id % 13 = 5", "UPDATE t2 SET s2 = 'zebra' WHERE id % 11 = 0",
+            "UPDATE t1 SET s = CONCAT(s, 'x'), m = m * 2 WHERE id % 19 = 4 AND s IS NOT NULL",
+            "UPDATE t1 SET d = d + INTERVAL 3 DAY, c = NULL WHERE id % 23 = 7",
+            "UPDATE t1 SET b = CASE WHEN a IS NULL THEN -1 ELSE b - a END, s = CONCAT('z', s) WHERE id % 29 = 2 AND s IS NOT NULL",
+            "UPDATE t1 SET a = NULL, m = m + 0.05 WHERE id % 31 = 1",
+            "UPDATE t2 SET x = x * 3, s2 = NULL WHERE id % 7 = 2"):
     g.execute(sql)
     d.execute(sql)
+
+# INSERT .. SELECT (columnar path): type conversions, expressions, a column list with defaults, a
+# self-insert; the copies must match DuckDB's.
+T3 = "id BIGINT, a DOUBLE, b BIGINT, c DECIMAL(12,3), s VARCHAR(30), d DATETIME, m DECIMAL(10,2), x INT"
+g.execute(f"CREATE TABLE t3 ({T3})")
+d.execute(f"CREATE TABLE t3 ({T3.replace('VARCHAR(30)', 'VARCHAR')})")
+for sql in ("INSERT INTO t3 SELECT id, a, b, c, s, d, m, a * 2 FROM t1",
+            "INSERT INTO t3 (id, s, x) SELECT id + 100000, s2, x FROM t2 WHERE id % 3 = 0",
+            "INSERT INTO t3 SELECT id + 200000, b, a, m, CONCAT(s, '-', id), d, c, id % 7 FROM t1 WHERE s IS NOT NULL AND c IS NOT NULL AND m IS NOT NULL",
+            "INSERT INTO t3 SELECT id + 300000, a, b, c, s, d, m, x FROM t3 WHERE id < 1000"):
+    g.execute(sql)
+    d.execute(sql)
+g.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id")
+got = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in g.fetchall()]
+want = [tuple(float(v) if hasattr(v, "as_tuple") else v for v in r) for r in d.execute("SELECT id, a, b, c, s, d, m, x FROM t3 ORDER BY id").fetchall()]
+INSERT_CHECK = (got, want)  # (checked with the queries below)
 
 INT_COLS = {"t1": ["a", "b", "id"], "t2": ["x", "t1_id", "id"]}
 NUM_COLS = {"t1": ["c", "m"], "t2": []}
@@ -293,6 +314,7 @@ def gen():
 
 
 c = Checker()
+c.eq("INSERT .. SELECT copies", *INSERT_CHECK)
 errors = {}
 t0 = time.time()
 for i in range(N):

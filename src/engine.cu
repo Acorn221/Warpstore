@@ -6340,19 +6340,154 @@ ResultSet Engine::doShowMisc(Stmt& s) {
 }
 
 
+// A columnar INSERT .. SELECT result (ResultSet::insertCols) as rows of values.
+static std::vector<std::vector<Value>> columnsToRows(const ResultSet& r) {
+  const size_t ni = r.numCols.size();
+  int64_t n = 0;
+  for (size_t i = 0; i < ni; ++i) n = std::max<int64_t>(n, !r.intCols[i].empty() ? (int64_t)r.intCols[i].size() : (int64_t)r.numCols[i].size());
+  std::vector<std::vector<Value>> rows((size_t)n);
+  for (int64_t k = 0; k < n; ++k) {
+    rows[k].reserve(ni);
+    for (size_t i = 0; i < ni; ++i) {
+      if (!r.intCols[i].empty()) {
+        const int64_t v = r.intCols[i][k];
+        rows[k].push_back(v == kNullI64 ? Value::Null() : r.types[i] == LType::DATETIME ? Value::Ts(v) : Value::I(v));
+      } else {
+        rows[k].push_back(typedVal(r.numCols[i][k], r.types[i], r.colDicts[i].get(), r.colScales[i]));
+      }
+    }
+  }
+  return rows;
+}
+
+// INSERT .. SELECT from a columnar result: each target column is converted on its own (strings
+// recoded once per distinct value, matching types copied, anything else through a Value), then the
+// rows are appended in bulk (Table::appendColumns). Caller holds the table's exclusive lock.
+static int64_t insertColumns(Table& t, const std::vector<int>& map, const ResultSet& r) {
+  const size_t nc = t.cols.size(), ni = r.numCols.size();
+  if (ni != map.size()) throw SqlError("Column count doesn't match value count at row 1", 1136);
+  int64_t n = 0;
+  for (size_t i = 0; i < ni; ++i) n = std::max<int64_t>(n, !r.intCols[i].empty() ? (int64_t)r.intCols[i].size() : (int64_t)r.numCols[i].size());
+  if (n == 0) return 0;
+  std::vector<int> src(nc, -1);
+  for (size_t i = 0; i < ni; ++i) src[map[i]] = (int)i;
+  const std::vector<Value> defs = defaultRow(t);
+  std::vector<std::vector<int64_t>> iv(nc);
+  std::vector<std::vector<double>> dv(nc);
+  auto valueOf = [&](size_t i, int64_t k) {  // result cell k of item i as a Value
+    if (!r.intCols[i].empty()) {
+      const int64_t v = r.intCols[i][k];
+      return v == kNullI64 ? Value::Null() : r.types[i] == LType::DATETIME ? Value::Ts(v) : Value::I(v);
+    }
+    return typedVal(r.numCols[i][k], r.types[i], r.colDicts[i].get(), r.colScales[i]);
+  };
+  std::vector<std::exception_ptr> errs(nc);
+  ioParallel(nc, [&](size_t c) {  // one target column per task (each has its own dictionary)
+    try {
+      const ColumnMeta& cm = t.cols[c];
+      const bool f64 = cm.pt == PType::F64;
+      if (f64) dv[c].resize(n);
+      else iv[c].resize(n);
+      const int i = src[c];
+      if ((int)c == t.autoIncCol) {  // NULL / 0: the next number (assigned in order below)
+        for (int64_t k = 0; k < n; ++k) {
+          const Value v = i < 0 ? Value::Null() : valueOf(i, k);
+          iv[c][k] = v.isNull() ? 0 : (int64_t)v.num();
+        }
+        return;
+      }
+      if (i < 0) {  // not in the column list: the default
+        int64_t i0 = 0;
+        double d0 = 0;
+        t.rawOf((int)c, defs[c], i0, d0);
+        if (f64) std::fill(dv[c].begin(), dv[c].end(), d0);
+        else std::fill(iv[c].begin(), iv[c].end(), i0);
+        return;
+      }
+      const LType st = r.types[i];
+      const int64_t nul = cm.pt == PType::I64 ? kNullI64 : kNullI32;
+      auto nullable = [&](bool isNull) {
+        if (!isNull) return;
+        if (cm.notNull || (int)c == t.pk) throw SqlError("Column '" + cm.name + "' cannot be null", 1048);
+        t.hasNull[c] = 1;
+      };
+      if (st == LType::VARCHAR && cm.lt == LType::VARCHAR && r.colDicts[i]) {
+        const Dict& sd = *r.colDicts[i];
+        std::vector<int32_t> code(sd.strs.size(), -1);
+        Dict& td = *t.dicts[c];
+        for (int64_t k = 0; k < n; ++k) {
+          const double x = r.numCols[i][k];
+          if (x != x) {
+            nullable(true);
+            iv[c][k] = kNullI32;
+            continue;
+          }
+          const size_t sc = (size_t)x;
+          int32_t& m = code.at(sc);
+          if (m < 0) m = td.getOrAdd(sd.strs[sc]);
+          iv[c][k] = m;
+        }
+      } else if (!r.intCols[i].empty() && st == cm.lt && cm.pt == PType::I64) {  // BIGINT / DATETIME as is
+        for (int64_t k = 0; k < n; ++k) {
+          const int64_t v = r.intCols[i][k];
+          if (v == kNullI64) nullable(true);
+          iv[c][k] = v;
+        }
+      } else if (r.intCols[i].empty() && st == cm.lt && (st == LType::INT || st == LType::DATE || st == LType::DOUBLE)) {
+        for (int64_t k = 0; k < n; ++k) {
+          const double x = r.numCols[i][k];
+          if (x != x) nullable(true);
+          if (f64) dv[c][k] = x;
+          else iv[c][k] = x != x ? nul : std::llround(x);
+        }
+      } else {
+        int64_t i0;
+        double d0;
+        for (int64_t k = 0; k < n; ++k) {
+          Value v = valueOf(i, k);
+          if (!v.isNull() && cm.lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+          t.rawOf((int)c, v, i0, d0);
+          if (f64) dv[c][k] = d0;
+          else iv[c][k] = i0;
+        }
+      }
+    } catch (...) {
+      errs[c] = std::current_exception();
+    }
+  });
+  for (auto& e : errs)
+    if (e) std::rethrow_exception(e);
+  if (t.autoIncCol >= 0) {
+    for (int64_t k = 0; k < n; ++k) {
+      int64_t& v = iv[t.autoIncCol][k];
+      if (v == 0) v = t.autoNext++;
+      else t.autoNext = std::max<int64_t>(t.autoNext, v + 1);
+    }
+    t.lastInsertId = iv[t.autoIncCol][n - 1];
+  }
+  t.appendColumns(iv, dv, n);
+  return n;
+}
+
 ResultSet Engine::doInsert(Stmt& s) {
   std::vector<std::vector<Value>> rows;
+  ResultSet cols;  // INSERT .. SELECT whose projection came back as columns
   if (s.select) {  // INSERT .. SELECT: run the query first (it may read the target table)
     QueryCtx q;
     ResultSet r;
+    // Plain inserts outside a transaction take the result as columns (no per-row values).
+    tInsertCols = !undoLog() && !s.insertIgnore && !s.replaceInto && s.onDup.empty();
     try {
       r = query(*s.select, q, false, true);
     } catch (...) {
+      tInsertCols = false;
       dropTemps(q);
       throw;
     }
+    tInsertCols = false;
     dropTemps(q);
-    rows = std::move(r.vals);
+    if (r.insertCols) cols = std::move(r);
+    else rows = std::move(r.vals);
   }
   auto t = cat_.get(s.table);
   std::unique_lock<FairSharedMutex> lk(t->mu);
@@ -6383,7 +6518,18 @@ ResultSet Engine::doInsert(Stmt& s) {
       rows.push_back(std::move(vals));
     }
   }
-  int64_t n = insertRows(*t, map, rows, s);
+  int64_t n = 0;
+  if (cols.insertCols) {
+    bool vec = false;
+    for (auto& cm : t->cols) vec = vec || cm.pt == PType::VEC;
+    if (!vec) n = insertColumns(*t, map, cols);
+    else {  // (VECTOR columns: as rows after all)
+      rows = columnsToRows(cols);
+      n = insertRows(*t, map, rows, s);
+    }
+  } else {
+    n = insertRows(*t, map, rows, s);
+  }
   ResultSet r = okResult(n);
   r.lastInsertId = t->autoIncCol >= 0 ? t->lastInsertId : 0;
   if (r.lastInsertId) tLastInsertId = r.lastInsertId;
@@ -6702,6 +6848,60 @@ ResultSet Engine::modifyViaSelect(Stmt& s) {
   return applyModify(*t, matched, newRows);
 }
 
+static void markDeleted(Table* t, const std::vector<Loc>& matched);
+
+// UPDATE outside a transaction, without VECTOR columns: each new row starts as the old row's stored
+// cells (strings stay codes); Values are made only for the columns the SET expressions read, and
+// only the SET columns are converted back. Matched locations stay valid while the new rows are
+// appended (full write buffers are flushed at the end).
+static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std::vector<std::pair<int, ExprP>>& sets,
+                           const std::set<int>& reads) {
+  markDeleted(&t, matched);
+  t.deferFlush = true;
+  struct Flush {
+    Table& t;
+    ~Flush() {
+      t.deferFlush = false;
+      try {
+        for (int p = 0; p < t.nparts; ++p)
+          if (t.bufs[p]->n >= kSegRows) t.flushPart(p);
+      } catch (std::exception& e) {
+        fprintf(stderr, "[warpstore] flush after UPDATE: %s\n", e.what());
+      }
+    }
+  } flush{t};
+  const size_t nc = t.cols.size();
+  std::vector<int64_t> ints(nc);
+  std::vector<double> dbls(nc);
+  std::vector<Value> cur(nc), vals(sets.size());
+  PostCtx pc;
+  pc.row = &cur;
+  pc.colSlot = [](int bt, int bc) { return bt == 0 ? bc : -1; };
+  std::vector<const uint8_t*> base(nc);
+  int32_t baseSeg = INT32_MIN;
+  for (const Loc& l : matched) {
+    if (l.seg != baseSeg || l.seg < 0) {  // (write buffer columns may move as rows are appended)
+      for (size_t c = 0; c < nc; ++c) base[c] = t.colData(l, (int)c).data();
+      baseSeg = l.seg;
+    }
+    for (size_t c = 0; c < nc; ++c) switch (t.cols[c].pt) {
+        case PType::I32: ints[c] = ((const int32_t*)base[c])[l.row]; break;
+        case PType::I64: ints[c] = ((const int64_t*)base[c])[l.row]; break;
+        default: dbls[c] = ((const double*)base[c])[l.row]; break;
+      }
+    for (int c : reads) cur[c] = cellValue(t, l, c);
+    for (size_t j = 0; j < sets.size(); ++j) vals[j] = evalPost(sets[j].second, pc);  // (all against the old row)
+    for (size_t j = 0; j < sets.size(); ++j) {
+      const int c = sets[j].first;
+      Value& v = vals[j];
+      if (!v.isNull() && t.cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+      t.rawOf(c, v, ints[c], dbls[c]);
+    }
+    t.appendRaw(ints, dbls);
+  }
+  return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
+}
+
 ResultSet Engine::doModify(Stmt& s) {
   std::function<bool(const ExprP&)> hasSub = [&](const ExprP& e) {
     if (!e) return false;
@@ -6811,6 +7011,24 @@ ResultSet Engine::doModify(Stmt& s) {
     return doModify(s);
   }
   // UPDATE = delete + re-insert of the modified row (like SingleStore's columnstore updates).
+  if (s.type == Stmt::UPDATE && !undoLog()) {
+    bool raw = true;
+    for (auto& cm : t->cols) raw = raw && cm.pt != PType::VEC;
+    std::set<int> reads;  // columns the SET expressions read
+    std::function<bool(const ExprP&)> plain = [&](const ExprP& x) {
+      if (!x) return true;
+      if (x->kind == Expr::FUNC && x->op == "EMBED") return false;
+      if (x->kind == Expr::COL) {
+        if (x->bt != 0 || x->bc < 0) return false;
+        reads.insert(x->bc);
+      }
+      for (auto& a : x->args)
+        if (!plain(a)) return false;
+      return true;
+    };
+    for (auto& [c, e] : sets) raw = raw && c != t->autoIncCol && plain(e);
+    if (raw) return updateRaw(*t, matched, sets, reads);
+  }
   std::vector<std::vector<Value>> newRows;
   if (s.type == Stmt::UPDATE) {
     // EMBED(..) in SET: the texts of all matched rows go through the model in one batch first (the
@@ -6858,7 +7076,13 @@ ResultSet Engine::doModify(Stmt& s) {
 
 // Deletes the matched rows (and inserts their new versions, for UPDATE). Holds the table lock.
 ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const std::vector<std::vector<Value>>& newRows) {
-  Table* t = &tt;
+  markDeleted(&tt, matched);
+  for (auto& row : newRows) tt.appendRow(row);
+  return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
+}
+
+// Marks the matched rows deleted (undo records, PK and index entries, deleted-row bitmaps).
+static void markDeleted(Table* t, const std::vector<Loc>& matched) {
   std::set<int> touched, touchedBufs;
   for (const Loc& l : matched) {
     if (undoLog()) {
@@ -6881,8 +7105,6 @@ ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const 
     std::lock_guard<std::mutex> g(t->bufs[p]->del->mu);
     ++t->bufs[p]->del->ver;
   }
-  for (auto& row : newRows) t->appendRow(row);
-  return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
 }
 
 // ------------------------------------------------------------------ SELECT
@@ -8812,7 +9034,8 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
   DevVec<int32_t> finalIdx;
   int64_t start = std::min<int64_t>(s.offset, m);
   int64_t cnt = s.limit < 0 ? m - start : std::min<int64_t>(m - start, s.limit);
-  if (cnt > 20'000'000) throw SqlError("result set too large (" + std::to_string(cnt) + " rows); add a LIMIT", 1105);
+  if (tInsertCols ? cnt * (int64_t)projs.size() > 1'000'000'000 : cnt > 20'000'000)
+    throw SqlError("result set too large (" + std::to_string(cnt) + " rows); add a LIMIT", 1105);
   ProfStage psort(orderBy.empty() ? "limit" : "GPU sort");
   if (!orderBy.empty() && m > 0) {
     std::vector<DevVec<double>> keyBufs;
@@ -8922,6 +9145,26 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
     pproj.done(cnt);
     res.info = "gpu-scan";
     return res;
+  }
+  if (tInsertCols) {  // INSERT .. SELECT: the columns as they are (strings: codes of plain columns)
+    bool ok = true;
+    for (auto& it : items)
+      ok = ok && it.e->ty != LType::VECTOR && (it.e->ty != LType::VARCHAR || (it.e->kind == Expr::COL && it.e->bt >= 0));
+    if (ok) {
+      res.insertCols = res.typed = true;
+      res.colDicts.assign(items.size(), nullptr);
+      res.colScales.assign(items.size(), -1);
+      for (size_t i = 0; i < items.size(); ++i) {
+        const ExprP& e = items[i].e;
+        if (e->ty == LType::VARCHAR) res.colDicts[i] = ctx.tabs[e->bt]->dicts[e->bc];
+        res.colScales[i] = e->scale;
+      }
+      res.numCols = std::move(cols);
+      res.intCols = std::move(icols);
+      pproj.done(cnt, "columns for INSERT .. SELECT");
+      res.info = "gpu-scan";
+      return res;
+    }
   }
   auto valueAt = [&](size_t i, int64_t r) {
     if (!icols[i].empty()) {
@@ -10119,10 +10362,11 @@ ResultSet Engine::queryRetry(Stmt& s, QueryCtx& q, bool explain, bool typed) {
 ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   // tRawNumber applies to this statement's own projection only, not to the queries run on the way.
   const bool rawNumber = tRawNumber && !s.unionNext && !explain, columnar = tColumnar && !s.unionNext && !explain;
-  tRawNumber = tColumnar = false;
+  const bool insertCols = tInsertCols && !s.unionNext && !explain;
+  tRawNumber = tColumnar = tInsertCols = false;
   struct RawRestore {
     bool v;
-    ~RawRestore() { tRawNumber = tColumnar = false; }
+    ~RawRestore() { tRawNumber = tColumnar = tInsertCols = false; }
   } rawRestore{rawNumber};
   expandTableFunctions(s);
   if (!s.groupingSets.empty()) return groupingSetsQuery(s, q, explain, typed);
@@ -10470,8 +10714,9 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   try {
     tRawNumber = rawNumber;
     tColumnar = columnar;
+    tInsertCols = insertCols;
     out = doSelect(s, explain);
-    tRawNumber = tColumnar = false;
+    tRawNumber = tColumnar = tInsertCols = false;
   } catch (SqlError& e) {
     tWantVals = savedWant;
     if (pristine && std::string(e.what()).find("GROUP BY on this string") != std::string::npos)
@@ -11454,6 +11699,7 @@ ResultSet Engine::hostAggregate(Stmt& s, QueryCtx& q, bool explain, bool typed) 
 thread_local bool tTypedResult = false;
 thread_local bool tRawNumber = false;
 thread_local bool tColumnar = false;  // a single numeric column comes back as ResultSet::numCol (IN subqueries)
+thread_local bool tInsertCols = false;
 thread_local int tOnlyPart = -1;
 ResultSet Engine::runStatementQuery(Stmt& s, bool explain) {
   QueryCtx q;

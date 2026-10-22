@@ -73,6 +73,14 @@ cur.execute(f"LOAD DATA INFILE '{pk}' INTO TABLE pk FIELDS TERMINATED BY ',' IGN
 c.eq("auto increment ids in file order", q("SELECT COUNT(*), MIN(id), MAX(id), SUM(score), SUM(id * score) FROM pk"),
      [(50000, 1, 50000, 3 * 49999 * 50000 // 2, sum((i + 1) * i * 3 for i in range(50000)))])
 c.eq("name of id 777", q("SELECT name FROM pk WHERE id = 777"), [("n776",)])
+# INSERT .. SELECT into AUTO_INCREMENT / PRIMARY KEY / NOT NULL columns.
+cur.execute("CREATE TABLE ai (id INT AUTO_INCREMENT PRIMARY KEY, v INT NOT NULL)")
+cur.execute("INSERT INTO ai (v) SELECT score FROM pk WHERE id <= 1000")
+cur.execute("INSERT INTO ai SELECT NULL, score FROM pk WHERE id <= 10")
+c.eq("INSERT .. SELECT numbers AUTO_INCREMENT", q("SELECT COUNT(*), MIN(id), MAX(id), SUM(v) FROM ai"),
+     [(1010, 1, 1010, 3 * 999 * 1000 // 2 + 3 * 9 * 10 // 2)])
+c.raises("INSERT .. SELECT duplicate key", lambda: cur.execute("INSERT INTO ai SELECT id, score FROM pk WHERE id <= 5"), 1062)
+c.raises("INSERT .. SELECT NULL into NOT NULL", lambda: cur.execute("INSERT INTO ai (v) SELECT NULL FROM pk WHERE id <= 5"), 1048)
 dup = path("dup.csv")
 with open(dup, "w") as f:
     f.writelines(f"{i},x{i}\n" for i in [1, 2, 3, 2, 4])
@@ -137,13 +145,13 @@ copies = sum(os.path.getsize(os.path.join(loads, f)) for f in os.listdir(loads))
 c.check("compressed copies are much smaller than the big file", copies < os.path.getsize(big) / 2, (copies, os.path.getsize(big)))
 for p in (big, pk, sk, csv, esc, bad, zin + ".zst", empty):
     os.unlink(p)
-before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt")]
+before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai")]
 srv.kill()
 srv.start()
 cur = srv.cursor()
 cur.execute("USE l")
 check_big("after crash replay")
-c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt")], before)
+c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai")], before)
 c.eq("pk table after replay", q("SELECT COUNT(*), MAX(id), SUM(score) FROM pk"), [(50000, 50000, 3 * 49999 * 50000 // 2)])
 srv.stop()
 c.done()

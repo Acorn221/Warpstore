@@ -632,7 +632,137 @@ void Table::appendRaw(const std::vector<int64_t>& ints, const std::vector<double
     tp.hiddenIx.insert(TxnPending::key(nl));
   }
   if (!indexes.empty()) indexAdd(nl);
-  if (buf.n >= kSegRows) flushPart(part);
+  if (buf.n >= kSegRows && !deferFlush) flushPart(part);
+}
+
+// A value as column c stores it (NULL checks, conversions, string -> code); VECTOR cells go to curVec.
+void Table::rawOf(int c, const Value& v, int64_t& i, double& d) {
+  if (v.isNull()) {
+    if (cols[c].notNull || (int)c == pk) throw SqlError("Column '" + cols[c].name + "' cannot be null", 1048);
+    hasNull[c] = 1;
+    i = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
+    d = nullv();
+    return;
+  }
+  switch (cols[c].lt) {
+    case LType::INT:
+    case LType::BIGINT:
+      i = v.kind == Value::STR ? std::stoll(v.s) : v.kind == Value::DBL ? (int64_t)std::llround(v.d) : v.i;
+      break;
+    case LType::DOUBLE: d = v.kind == Value::STR ? std::stod(v.s) : v.num(); break;
+    case LType::DECIMAL: {
+      int64_t raw;
+      if (v.kind == Value::STR) {
+        if (!parseDecimal(v.s.data(), v.s.data() + v.s.size(), cols[c].scale, raw))
+          throw SqlError("Incorrect decimal value: '" + v.s + "' for column '" + cols[c].name + "'", 1366);
+      } else if (v.kind == Value::DBL) {
+        raw = std::llround(v.d * pow10i(cols[c].scale));
+      } else {
+        raw = v.i * (int64_t)pow10i(cols[c].scale);
+      }
+      i = raw;
+      break;
+    }
+    case LType::DATE: {
+      if (v.kind == Value::STR) {
+        int32_t day;
+        if (!parseDate(v.s, day)) throw SqlError("Incorrect date value: '" + v.s + "'", 1292);
+        i = day;
+      } else if (v.kind == Value::DATETIME) {
+        i = floorDiv(v.i, kUsPerDay);
+      } else {
+        i = v.i;
+      }
+      break;
+    }
+    case LType::DATETIME: {
+      if (v.kind == Value::STR) {
+        int64_t us;
+        if (!parseDateTime(v.s, us)) throw SqlError("Incorrect datetime value: '" + v.s + "'", 1292);
+        i = us;
+      } else if (v.kind == Value::DATE) {
+        i = v.i * kUsPerDay;
+      } else {
+        i = v.i;
+      }
+      break;
+    }
+    case LType::VARCHAR: i = dicts[c]->getOrAdd(v.kind == Value::STR ? v.s : v.toString()); break;
+    case LType::VECTOR: {
+      if (!parseVector(v.toString(), curVec[c]) || (int)curVec[c].size() != cols[c].vecDim)
+        throw SqlError("Invalid VECTOR(" + std::to_string(cols[c].vecDim) + ") value for column '" + cols[c].name + "'", 1105);
+      i = 0;
+      break;
+    }
+  }
+}
+
+void Table::appendColumns(const std::vector<std::vector<int64_t>>& iv, const std::vector<std::vector<double>>& dv, int64_t n) {
+  const size_t nc = cols.size();
+  for (size_t c = 0; c < nc; ++c) {
+    if (cols[c].pt == PType::VEC) throw SqlError("internal: appendColumns with a VECTOR column", 1105);
+    if (hasNull[c]) continue;
+    if (cols[c].pt == PType::F64) {
+      for (double x : dv[c])
+        if (x != x) { hasNull[c] = 1; break; }
+    } else {
+      const int64_t nul = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
+      for (int64_t x : iv[c])
+        if (x == nul) { hasNull[c] = 1; break; }
+    }
+  }
+  std::vector<int64_t> ints(nc);
+  std::vector<double> dbls(nc);
+  auto cell = [&](size_t c, int64_t r) {
+    if (cols[c].pt == PType::F64) dbls[c] = dv[c][r];
+    else ints[c] = iv[c][r];
+  };
+  if (pk >= 0 || !indexes.empty() || (txnKey() && db != "__tmp")) {  // keys, indexes, transactions: row by row
+    for (int64_t r = 0; r < n; ++r) {
+      for (size_t c = 0; c < nc; ++c) cell(c, r);
+      appendRaw(ints, dbls);
+    }
+    return;
+  }
+  std::vector<std::vector<uint32_t>> rowsOf(nparts);
+  if (nparts == 1 || shardKey.empty()) {  // no shard key: a contiguous slice per partition
+    for (int i = 0; i < nparts; ++i) {
+      const int p = (int)((nextPart + i) % nparts);
+      for (int64_t g = n * i / nparts; g < n * (i + 1) / nparts; ++g) rowsOf[p].push_back((uint32_t)g);
+    }
+    ++nextPart;
+  } else {
+    for (int64_t r = 0; r < n; ++r) {
+      for (int c : shardKey) cell(c, r);
+      rowsOf[partOf(ints, dbls)].push_back((uint32_t)r);
+    }
+  }
+  for (int p = 0; p < nparts; ++p) {
+    const std::vector<uint32_t>& list = rowsOf[p];
+    for (size_t done = 0; done < list.size();) {
+      WriteBuffer& buf = *bufs[p];
+      const size_t room = buf.n < kSegRows ? (size_t)(kSegRows - buf.n) : list.size() - done;
+      const size_t k = std::min(list.size() - done, room);
+      buf.reserveForAppend((int64_t)k);
+      const uint32_t* idx = list.data() + done;
+      ioParallel(nc, [&](size_t c) {
+        std::vector<uint8_t>& dst = buf.cols[c];
+        const size_t w = (size_t)psize(cols[c].pt), o = dst.size();
+        dst.resize(o + k * w);
+        uint8_t* d = dst.data() + o;
+        switch (cols[c].pt) {
+          case PType::I32: for (size_t j = 0; j < k; ++j) ((int32_t*)d)[j] = (int32_t)iv[c][idx[j]]; break;
+          case PType::I64: for (size_t j = 0; j < k; ++j) ((int64_t*)d)[j] = iv[c][idx[j]]; break;
+          default: for (size_t j = 0; j < k; ++j) ((double*)d)[j] = dv[c][idx[j]]; break;
+        }
+      }, true);
+      buf.del->host.resize((size_t)(buf.n + (int64_t)k + 31) / 32, 0);
+      buf.n += (int64_t)k;
+      ++buf.version;
+      done += k;
+      if (buf.n >= kSegRows && !deferFlush) flushPart(p);
+    }
+  }
 }
 
 void Table::appendRow(const std::vector<Value>& rowIn) {
@@ -653,67 +783,7 @@ void Table::appendRow(const std::vector<Value>& rowIn) {
       if (ok && undoLog() && t->db != "__tmp") undoLog()->push_back({t, true, row});
     }
   } undo{this, row};
-  for (size_t c = 0; c < cols.size(); ++c) {
-    const Value& v = row[c];
-    if (v.isNull()) {
-      if (cols[c].notNull || (int)c == pk) throw SqlError("Column '" + cols[c].name + "' cannot be null", 1048);
-      hasNull[c] = 1;
-      ints[c] = cols[c].pt == PType::I64 ? kNullI64 : kNullI32;
-      dbls[c] = nullv();
-      continue;
-    }
-    switch (cols[c].lt) {
-      case LType::INT:
-      case LType::BIGINT:
-        ints[c] = v.kind == Value::STR ? std::stoll(v.s) : v.kind == Value::DBL ? (int64_t)std::llround(v.d) : v.i;
-        break;
-      case LType::DOUBLE: dbls[c] = v.kind == Value::STR ? std::stod(v.s) : v.num(); break;
-      case LType::DECIMAL: {
-        int64_t raw;
-        if (v.kind == Value::STR) {
-          if (!parseDecimal(v.s.data(), v.s.data() + v.s.size(), cols[c].scale, raw))
-            throw SqlError("Incorrect decimal value: '" + v.s + "' for column '" + cols[c].name + "'", 1366);
-        } else if (v.kind == Value::DBL) {
-          raw = std::llround(v.d * pow10i(cols[c].scale));
-        } else {
-          raw = v.i * (int64_t)pow10i(cols[c].scale);
-        }
-        ints[c] = raw;
-        break;
-      }
-      case LType::DATE: {
-        if (v.kind == Value::STR) {
-          int32_t d;
-          if (!parseDate(v.s, d)) throw SqlError("Incorrect date value: '" + v.s + "'", 1292);
-          ints[c] = d;
-        } else if (v.kind == Value::DATETIME) {
-          ints[c] = floorDiv(v.i, kUsPerDay);
-        } else {
-          ints[c] = v.i;
-        }
-        break;
-      }
-      case LType::DATETIME: {
-        if (v.kind == Value::STR) {
-          int64_t us;
-          if (!parseDateTime(v.s, us)) throw SqlError("Incorrect datetime value: '" + v.s + "'", 1292);
-          ints[c] = us;
-        } else if (v.kind == Value::DATE) {
-          ints[c] = v.i * kUsPerDay;
-        } else {
-          ints[c] = v.i;
-        }
-        break;
-      }
-      case LType::VARCHAR: ints[c] = dicts[c]->getOrAdd(v.kind == Value::STR ? v.s : v.toString()); break;
-      case LType::VECTOR: {
-        if (!parseVector(v.toString(), curVec[c]) || (int)curVec[c].size() != cols[c].vecDim)
-          throw SqlError("Invalid VECTOR(" + std::to_string(cols[c].vecDim) + ") value for column '" + cols[c].name + "'", 1105);
-        ints[c] = 0;
-        break;
-      }
-    }
-  }
+  for (size_t c = 0; c < cols.size(); ++c) rawOf((int)c, row[c], ints[c], dbls[c]);
   appendRaw(ints, dbls);
   undo.ok = true;
 }
