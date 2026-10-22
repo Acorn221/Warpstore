@@ -59,4 +59,11 @@ c.eq("NULL-safe equality", q("SELECT 1 <=> 1, NULL <=> NULL, 1 <=> NULL, 1 IS NO
      [(1, 1, 0, 1, 0, 1)])
 c.eq("REGEXP / RLIKE operators", q("SELECT 'video one' REGEXP 'video|music', 'news' NOT REGEXP '^n', 'abc' RLIKE 'b'"), [(1, 0, 1)])
 c.eq("UNION drops duplicates", q("SELECT COUNT(*) FROM (SELECT 1 x UNION SELECT 1 UNION SELECT 2 UNION ALL SELECT 2) t"), [(3,)])
+c.eq("bitwise operators", q("SELECT 5 & 3, 5 | 3, 5 ^ 3, 1 << 4, 256 >> 2, 1 + 2 << 1, 6 & 3 | 8"), [(1, 7, 6, 16, 64, 6, 10)])
+c.eq("GREATEST / LEAST on strings", q("SELECT GREATEST('apple', 'pear', 'banana'), LEAST('b', 'a', 'c'), GREATEST('a', NULL)"), [("pear", "a", None)])
+c.eq("STR_TO_DATE", q("SELECT STR_TO_DATE('05/03/2024', '%d/%m/%Y'), STR_TO_DATE('Mar 5 2024 2:07 PM', '%b %e %Y %l:%i %p')"),
+     [(datetime.date(2024, 3, 5), datetime.datetime(2024, 3, 5, 14, 7))])
+c.eq("FIND_IN_SET / UNHEX / INSERT", q("SELECT FIND_IN_SET('b', 'a,b,c'), UNHEX('4D7953514C'), INSERT('Quadratic', 3, 4, 'What')"), [(2, "MySQL", "QuWhattic")])
+c.eq("EXTRACT compound units", q("SELECT EXTRACT(YEAR_MONTH FROM '2024-03-05 10:20:30'), EXTRACT(DAY_SECOND FROM TIMESTAMP '2024-03-05 10:20:30')"),
+     [(202403, 5102030)])
 c.done()

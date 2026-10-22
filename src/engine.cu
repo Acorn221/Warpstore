@@ -799,6 +799,15 @@ void bindFunc(ExprP& e, BindCtx& c) {
   if (f == "MOD") { argc(2, 2); ExprP r = boundNode(Expr::BIN, "%", {A[0], A[1]}, numTy(A)); r->scale = maxScale(A); finish(r); return; }
   if (f == "GREATEST" || f == "LEAST") {
     argc(2, 64);
+    bool str = false;
+    for (auto& x : A) str = str || x->ty == LType::VARCHAR;
+    if (str) {  // strings: compared as strings, on the host
+      e->ty = LType::VARCHAR;
+      e->bound = true;
+      if (allLits(e)) e = boundLit(evalConst(e));
+      else encodeStrings(e, c);
+      return;
+    }
     LType t = numTy(A);
     ExprP r = A[0];
     for (size_t i = 1; i < n; ++i) {
@@ -1024,13 +1033,31 @@ void bindFunc(ExprP& e, BindCtx& c) {
       {"SHA2", LType::VARCHAR}, {"MD5", LType::VARCHAR}, {"SHA1", LType::VARCHAR}, {"SHA", LType::VARCHAR}, {"TO_BASE64", LType::VARCHAR}, {"FROM_BASE64", LType::VARCHAR}, {"CRC32", LType::BIGINT}, {"BIT_COUNT", LType::BIGINT}, {"RAND", LType::DOUBLE},
       {"CONVERT_TZ", LType::DATETIME}, {"GEOGRAPHY_POINT", LType::VARCHAR}, {"GEOGRAPHY_DISTANCE", LType::DOUBLE},
       {"GEOGRAPHY_WITHIN_DISTANCE", LType::INT}, {"GEOGRAPHY_CONTAINS", LType::INT}, {"GEOGRAPHY_INTERSECTS", LType::INT},
-      {"GEOGRAPHY_LONGITUDE", LType::DOUBLE}, {"GEOGRAPHY_LATITUDE", LType::DOUBLE}};
+      {"GEOGRAPHY_LONGITUDE", LType::DOUBLE}, {"GEOGRAPHY_LATITUDE", LType::DOUBLE},
+      {"FIND_IN_SET", LType::BIGINT}, {"UNHEX", LType::VARCHAR}, {"INSERT", LType::VARCHAR},
+      {"BITAND", LType::BIGINT}, {"BITOR", LType::BIGINT}, {"BITXOR", LType::BIGINT}, {"SHL", LType::BIGINT}, {"SHR", LType::BIGINT},
+      {"BITNOT", LType::BIGINT}};
   if (f == "#UDF") {  // stored function with a procedural body over columns (proc.cpp inlineUdf)
     const std::string t = A[1]->lit.s.substr(0, A[1]->lit.s.find('#'));
     e->ty = t == "BIGINT" ? LType::BIGINT : t == "DOUBLE" || t == "DECIMAL" ? LType::DOUBLE : t == "DATE" ? LType::DATE
           : t == "DATETIME" ? LType::DATETIME : LType::VARCHAR;
     e->bound = true;
     encodeStrings(e, c);
+    return;
+  }
+  if (f == "STR_TO_DATE") {  // DATETIME when the format has time fields, else DATE
+    argc(2, 2);
+    bool timeFields = true;
+    if (A[1]->kind == Expr::LIT && A[1]->lit.kind == Value::STR) {
+      timeFields = false;
+      const std::string& fm = A[1]->lit.s;
+      for (size_t i = 0; i + 1 < fm.size(); ++i)
+        if (fm[i] == '%' && strchr("HkhIlisSfpTr", fm[i + 1])) timeFields = true;
+    }
+    e->ty = timeFields ? LType::DATETIME : LType::DATE;
+    e->bound = true;
+    if (allLits(e)) e = boundLit(evalConst(e));
+    else encodeStrings(e, c);
     return;
   }
   if (strFns.count(f)) {
@@ -2656,6 +2683,123 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     const std::string s0 = a[0].kind == Value::STR ? a[0].s : a[0].toString();
     if (f == "CASTINT") return Value::I(std::strtoll(s0.c_str(), nullptr, 10));
     return Value::D(std::strtod(s0.c_str(), nullptr));
+  }
+  if (f == "GREATEST" || f == "LEAST") {  // (string arguments)
+    for (auto& x : a)
+      if (x.isNull()) return Value::Null();
+    Value best = a[0];
+    for (size_t i = 1; i < a.size(); ++i) {
+      const int cmp = collCmp(a[i].toString(), best.toString());
+      if (f == "GREATEST" ? cmp > 0 : cmp < 0) best = a[i];
+    }
+    return Value::S(best.toString());
+  }
+  if (f == "BITAND" || f == "BITOR" || f == "BITXOR" || f == "SHL" || f == "SHR" || f == "BITNOT") {
+    for (auto& x : a)
+      if (x.isNull()) return Value::Null();
+    const uint64_t x = (uint64_t)(int64_t)std::llround(num(0)), y = a.size() > 1 ? (uint64_t)(int64_t)std::llround(num(1)) : 0;
+    const uint64_t r = f == "BITAND" ? x & y : f == "BITOR" ? x | y : f == "BITXOR" ? x ^ y : f == "SHL" ? (y < 64 ? x << y : 0)
+                     : f == "SHR" ? (y < 64 ? x >> y : 0) : ~x;
+    return Value::I((int64_t)r);
+  }
+  if (f == "FIND_IN_SET") {
+    if (a[0].isNull() || a[1].isNull()) return Value::Null();
+    const std::string needle = a[0].toString(), list = a[1].toString();
+    if (needle.find(',') != std::string::npos) return Value::I(0);
+    int64_t pos = 1;
+    for (size_t b = 0;; ++pos) {
+      const size_t e2 = list.find(',', b);
+      if (collCmp(list.substr(b, e2 == std::string::npos ? std::string::npos : e2 - b), needle) == 0) return Value::I(list.empty() ? 0 : pos);
+      if (e2 == std::string::npos) return Value::I(0);
+      b = e2 + 1;
+    }
+  }
+  if (f == "UNHEX") {
+    if (a[0].isNull()) return Value::Null();
+    const std::string h = a[0].toString();
+    std::string r;
+    auto hv = [](char ch) { return ch >= '0' && ch <= '9' ? ch - '0' : ch >= 'a' && ch <= 'f' ? ch - 'a' + 10 : ch >= 'A' && ch <= 'F' ? ch - 'A' + 10 : -1; };
+    size_t i = h.size() % 2;
+    if (i && hv(h[0]) < 0) return Value::Null();
+    if (i) r += (char)hv(h[0]);
+    for (; i + 1 < h.size(); i += 2) {
+      const int x = hv(h[i]), y = hv(h[i + 1]);
+      if (x < 0 || y < 0) return Value::Null();
+      r += (char)(x * 16 + y);
+    }
+    return Value::S(r);
+  }
+  if (f == "INSERT") {  // INSERT(str, pos, len, newstr): characters
+    for (auto& x : a)
+      if (x.isNull()) return Value::Null();
+    const std::string s0 = a[0].toString();
+    const int64_t n = (int64_t)utf8Len(s0), pos = (int64_t)num(1), len = (int64_t)num(2);
+    if (pos < 1 || pos > n) return Value::S(s0);
+    return Value::S(u8Sub(s0, 0, pos - 1) + a[3].toString() + u8Sub(s0, pos - 1 + std::max<int64_t>(len, 0), n));
+  }
+  if (f == "STR_TO_DATE") {
+    if (a[0].isNull() || a[1].isNull()) return Value::Null();
+    const std::string str = a[0].toString(), fm = a[1].toString();
+    static const char* mon[] = {"jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"};
+    int64_t Y = 0, M = 0, D = 0, h = 0, mi = 0, sec = 0, us = 0;
+    bool pm = false, ampm = false, hasTime = false;
+    size_t i = 0;
+    auto num2 = [&](int maxd, int64_t& out) {
+      size_t k = 0;
+      int64_t v = 0;
+      while (i < str.size() && k < (size_t)maxd && isdigit((unsigned char)str[i])) v = v * 10 + (str[i++] - '0'), ++k;
+      out = v;
+      return k > 0;
+    };
+    for (size_t j = 0; j < fm.size(); ++j) {
+      if (fm[j] != '%' || j + 1 >= fm.size()) {
+        if (i >= str.size() || (str[i] != fm[j] && !(isspace((unsigned char)fm[j]) && isspace((unsigned char)str[i])))) return Value::Null();
+        ++i;
+        continue;
+      }
+      const char k = fm[++j];
+      bool ok = true;
+      switch (k) {
+        case 'Y': ok = num2(4, Y); break;
+        case 'y': ok = num2(2, Y); Y += Y < 70 ? 2000 : 1900; break;
+        case 'm': case 'c': ok = num2(2, M); break;
+        case 'd': case 'e': ok = num2(2, D); break;
+        case 'H': case 'k': ok = num2(2, h); hasTime = true; break;
+        case 'h': case 'I': case 'l': ok = num2(2, h); ampm = hasTime = true; break;
+        case 'i': ok = num2(2, mi); hasTime = true; break;
+        case 's': case 'S': ok = num2(2, sec); hasTime = true; break;
+        case 'f': {
+          size_t st = i;
+          ok = num2(6, us);
+          for (size_t z = i - st; z < 6; ++z) us *= 10;
+          break;
+        }
+        case 'p':
+          if (i + 1 < str.size() && (toupper(str[i]) == 'A' || toupper(str[i]) == 'P') && toupper(str[i + 1]) == 'M') pm = toupper(str[i]) == 'P', i += 2;
+          else ok = false;
+          break;
+        case 'b': case 'M': {
+          ok = false;
+          for (int q = 0; q < 12 && !ok; ++q)
+            if (i + 3 <= str.size() && strncasecmp(str.c_str() + i, mon[q], 3) == 0) {
+              M = q + 1;
+              i += 3;
+              while (k == 'M' && i < str.size() && isalpha((unsigned char)str[i])) ++i;
+              ok = true;
+            }
+          break;
+        }
+        case '%': ok = i < str.size() && str[i++] == '%'; break;
+        default: return Value::Null();
+      }
+      if (!ok) return Value::Null();
+    }
+    if (ampm) h = h % 12 + (pm ? 12 : 0);
+    if (M < 1 || M > 12 || D < 1 || D > 31) return Value::Null();
+    const int64_t days = daysFromCivil(Y, (unsigned)M, (unsigned)D);
+    if (e->ty == LType::DATE) return Value::Dt(days);
+    (void)hasTime;
+    return Value::Ts(days * kUsPerDay + ((h * 60 + mi) * 60 + sec) * 1000000 + us);
   }
   if (f == "HEX") {
     std::string r;

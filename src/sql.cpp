@@ -1,3 +1,4 @@
+#include <map>
 #include <charconv>
 #include "sql.h"
 
@@ -221,7 +222,7 @@ std::vector<Tok> lex(const std::string& s) {
     for (auto t : three)
       if (s.compare(i, 3, t) == 0) { out.push_back({Tok::SYM, t}); i += 3; matched = true; break; }
     if (matched) continue;
-    static const char* two[] = {"<=", ">=", "<>", "!=", "||", "&&", ":=", "->", "::"};
+    static const char* two[] = {"<=", ">=", "<>", "!=", "||", "&&", ":=", "->", "::", "<<", ">>"};
     for (auto t : two)
       if (s.compare(i, 2, t) == 0) { out.push_back({Tok::SYM, t}); i += 2; matched = true; break; }
     if (matched) continue;
@@ -314,17 +315,17 @@ struct Parser {
     return co;
   }
   ExprP cmpExpr() {
-    ExprP l = addExpr();
+    ExprP l = bitOrExpr();
     for (;;) {
       if (acceptSym("<=>")) {
-        l = nullSafeEq(l, addExpr());
+        l = nullSafeEq(l, bitOrExpr());
         continue;
       }
       static const char* ops[] = {"=", "<>", "!=", "<=", ">=", "<", ">"};
       bool done = true;
       for (auto o : ops)
         if (acceptSym(o)) {
-          l = mkBin(std::string(o) == "!=" ? "<>" : o, l, addExpr());
+          l = mkBin(std::string(o) == "!=" ? "<>" : o, l, bitOrExpr());
           done = false;
           break;
         }
@@ -333,7 +334,7 @@ struct Parser {
         bool n = acceptKw("NOT");
         if (acceptKw("DISTINCT")) {
           expectKw("FROM");
-          ExprP eq = nullSafeEq(l, addExpr());
+          ExprP eq = nullSafeEq(l, bitOrExpr());
           if (n) {
             l = eq;
           } else {
@@ -366,9 +367,9 @@ struct Parser {
         auto e = std::make_shared<Expr>();
         e->kind = Expr::BETWEEN;
         e->neg = neg;
-        ExprP lo = addExpr();
+        ExprP lo = bitOrExpr();
         expectKw("AND");
-        e->args = {l, lo, addExpr()};
+        e->args = {l, lo, bitOrExpr()};
         l = e;
         continue;
       }
@@ -391,7 +392,7 @@ struct Parser {
         auto e = std::make_shared<Expr>();
         e->kind = Expr::LIKE;
         e->neg = neg;
-        e->args = {l, addExpr()};
+        e->args = {l, bitOrExpr()};
         l = e;
         continue;
       }
@@ -399,7 +400,7 @@ struct Parser {
         auto e = std::make_shared<Expr>();
         e->kind = Expr::FUNC;
         e->op = "REGEXP_LIKE";
-        e->args = {l, addExpr()};
+        e->args = {l, bitOrExpr()};
         if (neg) {
           auto nt = std::make_shared<Expr>();
           nt->kind = Expr::UNARY;
@@ -415,6 +416,38 @@ struct Parser {
       return l;
     }
   }
+  // Bitwise operators (MySQL precedence: | < & < << >> < + - < * / < ^ < unary ~), evaluated on the host.
+  static ExprP bitFn(const char* op, ExprP a, ExprP b) {
+    auto e = std::make_shared<Expr>();
+    e->kind = Expr::FUNC;
+    e->op = op;
+    e->args = {a};
+    if (b) e->args.push_back(b);
+    return e;
+  }
+  ExprP bitOrExpr() {
+    ExprP l = bitAndExpr();
+    while (acceptSym("|")) l = bitFn("BITOR", l, bitAndExpr());
+    return l;
+  }
+  ExprP bitAndExpr() {
+    ExprP l = shiftExpr();
+    while (acceptSym("&")) l = bitFn("BITAND", l, shiftExpr());
+    return l;
+  }
+  ExprP shiftExpr() {
+    ExprP l = addExpr();
+    for (;;) {
+      if (acceptSym("<<")) l = bitFn("SHL", l, addExpr());
+      else if (acceptSym(">>")) l = bitFn("SHR", l, addExpr());
+      else return l;
+    }
+  }
+  ExprP caretExpr() {
+    ExprP l = unary();
+    while (acceptSym("^")) l = bitFn("BITXOR", l, unary());
+    return l;
+  }
   ExprP addExpr() {
     ExprP l = mulExpr();
     for (;;) {
@@ -424,23 +457,23 @@ struct Parser {
     }
   }
   ExprP mulExpr() {
-    ExprP l = unary();
+    ExprP l = caretExpr();
     for (;;) {
-      if (acceptSym("*")) l = mkBin("*", l, unary());
-      else if (acceptSym("/")) l = mkBin("/", l, unary());
-      else if (acceptSym("%") || acceptKw("MOD")) l = mkBin("%", l, unary());
+      if (acceptSym("*")) l = mkBin("*", l, caretExpr());
+      else if (acceptSym("/")) l = mkBin("/", l, caretExpr());
+      else if (acceptSym("%") || acceptKw("MOD")) l = mkBin("%", l, caretExpr());
       else if (acceptKw("DIV")) {  // integer division
         auto f = std::make_shared<Expr>();
         f->kind = Expr::FUNC;
         f->op = "DIV";
-        f->args = {l, unary()};
+        f->args = {l, caretExpr()};
         l = f;
       }
       else if (acceptSym("<*>") || acceptSym("<->")) {  // SingleStore vector operators
         auto e = std::make_shared<Expr>();
         e->kind = Expr::FUNC;
         e->op = t[p - 1].v == "<*>" ? "DOT_PRODUCT" : "EUCLIDEAN_DISTANCE";
-        e->args = {l, unary()};
+        e->args = {l, caretExpr()};
         l = e;
       }
       else return l;
@@ -458,6 +491,7 @@ struct Parser {
       return e;
     }
     if (acceptSym("+")) return unary();
+    if (acceptSym("~")) return bitFn("BITNOT", unary(), nullptr);
     if (isKw("BINARY") && t[p + 1].k != Tok::END && !(t[p + 1].k == Tok::SYM && (t[p + 1].v == "," || t[p + 1].v == ")"))) {
       ++p;  // BINARY expr: a binary-collation cast; comparisons here are already exact unless ci collation is set
       return unary();
@@ -566,6 +600,15 @@ struct Parser {
       ++p;
       return mkLit(Value::Dt(d));
     }
+    if ((isKw("TIMESTAMP") || isKw("DATETIME") || isKw("TIME")) && t[p + 1].k == Tok::STR) {  // typed literal
+      auto e = std::make_shared<Expr>();
+      e->kind = Expr::FUNC;
+      e->op = "CAST";
+      e->castType = isKw("TIME") ? "TIME" : "DATETIME";
+      ++p;
+      e->args.push_back(mkLit(Value::S(t[p++].v)));
+      return e;
+    }
     if (acceptKw("INTERVAL")) {
       auto e = std::make_shared<Expr>();
       e->kind = Expr::INTERVAL;
@@ -606,13 +649,31 @@ struct Parser {
         auto e = std::make_shared<Expr>();
         e->kind = Expr::FUNC;
         e->op = upper(name);
-        if (e->op == "EXTRACT") {  // EXTRACT(unit FROM x) -> unit(x)
+        if (e->op == "EXTRACT") {  // EXTRACT(unit FROM x) -> unit(x); YEAR_MONTH etc. -> parts * 100 ..
           std::string unit = upper(ident());
           expectKw("FROM");
-          e->op = unit == "DAY" ? "DAYOFMONTH" : unit;
-          e->args.push_back(expr());
+          ExprP x = expr();
           expectSym(")");
-          return e;
+          static const std::map<std::string, std::vector<std::string>> compound = {
+              {"YEAR_MONTH", {"YEAR", "MONTH"}},           {"DAY_HOUR", {"DAYOFMONTH", "HOUR"}},
+              {"DAY_MINUTE", {"DAYOFMONTH", "HOUR", "MINUTE"}}, {"DAY_SECOND", {"DAYOFMONTH", "HOUR", "MINUTE", "SECOND"}},
+              {"HOUR_MINUTE", {"HOUR", "MINUTE"}},         {"HOUR_SECOND", {"HOUR", "MINUTE", "SECOND"}},
+              {"MINUTE_SECOND", {"MINUTE", "SECOND"}}};
+          auto it = compound.find(unit);
+          if (it == compound.end()) {
+            e->op = unit == "DAY" ? "DAYOFMONTH" : unit;
+            e->args.push_back(x);
+            return e;
+          }
+          ExprP r;
+          for (auto& part : it->second) {
+            auto f = std::make_shared<Expr>();
+            f->kind = Expr::FUNC;
+            f->op = part;
+            f->args = {copyExpr(x)};
+            r = r ? mkBin("+", mkBin("*", r, mkLit(Value::I(100))), f) : ExprP(f);
+          }
+          return r;
         }
         if (e->op == "CAST" || e->op == "CONVERT") {  // CAST(x AS type), CONVERT(x, type)
           e->args.push_back(expr());
