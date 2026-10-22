@@ -12898,7 +12898,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
 }
 
 std::string gWalArchive;
-int64_t gSnapshotTriggerBytes = (int64_t)1 << 30;
+int64_t gSnapshotTriggerBytes = (int64_t)256 << 20;  // (replay runs ~150K records/s: a crash costs ~20 s at most)
 
 static void copyFile(const std::string& from, const std::string& to) {
   int in = open(from.c_str(), O_RDONLY);
