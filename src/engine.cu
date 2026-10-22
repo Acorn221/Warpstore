@@ -11840,17 +11840,177 @@ double getDbl(FILE* f) {
   return v;
 }
 
+// ---- Dictionary files (snapshot format 5): <data dir>/dicts/<name>.wdict, append-only: "WDICT001",
+// then frames of u32 "WDFR", u32 strings, u32 raw bytes, u32 compressed bytes, u32 CRC32 of the
+// compressed bytes, and the zstd-compressed strings (u32 length + bytes each). A snapshot records
+// (file, n, bytes): the first n strings end at byte `bytes`. Each snapshot appends only the strings
+// added since the last one (before writes are paused); bytes after `bytes` (from a snapshot that
+// was never installed) are cut off when the dictionary is loaded.
+static constexpr uint32_t kDictFrame = 0x52464457;  // "WDFR"
+static bool writeAt(int fd, const char* p, size_t len, uint64_t off) {
+  while (len) {
+    const ssize_t k = ::pwrite(fd, p, len, (off_t)off);
+    if (k <= 0) return false;
+    p += k, len -= (size_t)k, off += (uint64_t)k;
+  }
+  return true;
+}
+static void dictPersist(Dict& d, size_t upto, const std::string& dir) {
+  if (!d.fileName.empty() && upto <= d.fileStrs) return;
+  if (d.fileName.empty()) {
+    mkdir(dir.c_str(), 0755);
+    for (int tries = 0; d.fileName.empty(); ++tries) {
+      char name[40];
+      snprintf(name, sizeof name, "%016llx", (unsigned long long)(nowUs() * 6364136223846793005ull + d.uid * 1442695040888963407ull + tries));
+      const int fd = ::open((dir + "/" + name + ".wdict").c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+      if (fd < 0) {
+        if (errno == EEXIST && tries < 8) continue;
+        throw SqlError("cannot create a dictionary file in " + dir, 1105);
+      }
+      const bool ok = ::write(fd, "WDICT001", 8) == 8 && fdatasync(fd) == 0;
+      ::close(fd);
+      if (!ok) throw SqlError("cannot write a dictionary file in " + dir, 1105);
+      d.fileName = name;
+      d.fileStrs = 0;
+      d.fileBytes = 8;
+    }
+  }
+  std::vector<std::pair<size_t, size_t>> ranges;  // frames: up to 64K strings / 8 MB
+  for (size_t i = d.fileStrs; i < upto;) {
+    size_t j = i, bytes = 0;
+    while (j < upto && j - i < 65536 && bytes < (8u << 20)) bytes += 4 + d.strs[j++].size();
+    ranges.push_back({i, j});
+    i = j;
+  }
+  std::vector<std::string> frames(ranges.size());
+  std::atomic<bool> bad{false};
+  ioParallel(ranges.size(), [&](size_t k) {
+    std::string raw;
+    for (size_t i = ranges[k].first; i < ranges[k].second; ++i) {
+      const std::string& x = d.strs[i];
+      const uint32_t len = (uint32_t)x.size();
+      raw.append((const char*)&len, 4).append(x);
+    }
+    std::string& fr = frames[k];
+    fr.resize(20 + ZSTD_compressBound(raw.size()));
+    const size_t z = ZSTD_compress(fr.data() + 20, fr.size() - 20, raw.data(), raw.size(), 3);
+    if (ZSTD_isError(z)) {
+      bad = true;
+      return;
+    }
+    const uint32_t hdr[5] = {kDictFrame, (uint32_t)(ranges[k].second - ranges[k].first), (uint32_t)raw.size(), (uint32_t)z,
+                             (uint32_t)crc32(0, (const Bytef*)fr.data() + 20, (uInt)z)};
+    memcpy(fr.data(), hdr, 20);
+    fr.resize(20 + z);
+  });
+  if (bad) throw SqlError("cannot compress a dictionary", 1105);
+  const std::string path = dir + "/" + d.fileName + ".wdict";
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+  if (fd < 0) throw SqlError("cannot open " + path, 1105);
+  uint64_t off = d.fileBytes;
+  bool ok = true;
+  for (auto& fr : frames) {
+    ok = ok && writeAt(fd, fr.data(), fr.size(), off);
+    off += fr.size();
+  }
+  ok = ok && fdatasync(fd) == 0;
+  ::close(fd);
+  if (!ok) throw SqlError("cannot write " + path, 1105);
+  d.fileBytes = off;
+  d.fileStrs = upto;
+}
+
+// The first n strings of a dictionary file (ending at byte `bytes`) into an empty dictionary.
+static void dictLoad(Dict& d, const std::string& dir, const std::string& name, uint64_t n, uint64_t bytes) {
+  const std::string path = dir + "/" + name + ".wdict";
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) throw SqlError("snapshot: dictionary file " + path + " is missing", 1105);
+  struct Close {
+    int fd;
+    ~Close() { ::close(fd); }
+  } closer{fd};
+  std::string buf(bytes, '\0');
+  if (bytes < 8 || pread(fd, buf.data(), bytes, 0) != (ssize_t)bytes || memcmp(buf.data(), "WDICT001", 8) != 0)
+    throw SqlError("snapshot: dictionary file " + path + " is truncated", 1105);
+  struct Fr {
+    size_t off, count, raw, z;
+  };
+  std::vector<Fr> frs;
+  uint64_t got = 0;
+  for (size_t off = 8; off < bytes;) {
+    uint32_t hdr[5];
+    if (off + 20 > bytes) throw SqlError("snapshot: dictionary file " + path + " is corrupt", 1105);
+    memcpy(hdr, buf.data() + off, 20);
+    if (hdr[0] != kDictFrame || off + 20 + hdr[3] > bytes || (uint32_t)crc32(0, (const Bytef*)buf.data() + off + 20, (uInt)hdr[3]) != hdr[4])
+      throw SqlError("snapshot: dictionary file " + path + " is corrupt (frame at byte " + std::to_string(off) + ")", 1105);
+    frs.push_back({off + 20, hdr[1], hdr[2], hdr[3]});
+    got += hdr[1];
+    off += 20 + hdr[3];
+  }
+  if (got != n) throw SqlError("snapshot: dictionary file " + path + " has " + std::to_string(got) + " strings, not " + std::to_string(n), 1105);
+  std::vector<std::vector<std::string>> out(frs.size());
+  std::atomic<bool> bad{false};
+  ioParallel(frs.size(), [&](size_t k) {
+    std::string raw(frs[k].raw, '\0');
+    if (ZSTD_isError(ZSTD_decompress(raw.data(), raw.size(), buf.data() + frs[k].off, frs[k].z))) {
+      bad = true;
+      return;
+    }
+    auto& v = out[k];
+    v.reserve(frs[k].count);
+    for (size_t p = 0; p + 4 <= raw.size() && v.size() < frs[k].count;) {
+      uint32_t len;
+      memcpy(&len, raw.data() + p, 4);
+      v.emplace_back(raw.data() + p + 4, len);
+      p += 4 + len;
+    }
+    if (v.size() != frs[k].count) bad = true;
+  });
+  if (bad) throw SqlError("snapshot: dictionary file " + path + " is corrupt", 1105);
+  for (auto& v : out)
+    for (auto& x : v) d.appendUnique(std::move(x));
+  struct stat st;
+  if (fstat(fd, &st) == 0 && (uint64_t)st.st_size > bytes && ftruncate(fd, (off_t)bytes) != 0) {}  // (an uninstalled snapshot's tail)
+  d.fileName = name;
+  d.fileStrs = n;
+  d.fileBytes = bytes;
+}
+
+// After a snapshot is installed: dictionary files it doesn't refer to go.
+static void dictFilesInstalled(const std::string& dir, const std::set<std::string>& used) {
+  DIR* dp = opendir(dir.c_str());
+  if (!dp) return;
+  std::vector<std::string> gone;
+  while (dirent* e = readdir(dp)) {
+    std::string n = e->d_name;
+    if (n.size() > 6 && n.compare(n.size() - 6, 6, ".wdict") == 0 && !used.count(n.substr(0, n.size() - 6))) gone.push_back(n);
+  }
+  closedir(dp);
+  for (auto& n : gone) unlink((dir + "/" + n).c_str());
+}
+
 // refs (snapshot.bin with a data dir): segments that are mostly live are not copied but referred to
 // by their segment file (written now if they have none), with their deleted-row bitmap; their file
 // ids are added to refs. Everything else is written row by row as before (and compacted).
-void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullptr) {
+// dictDir (format 5): dictionaries go to their files (dictPersist); their names are added to dictRefs.
+void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullptr, const std::string* dictDir = nullptr,
+                   std::set<std::string>* dictRefs = nullptr) {
   const size_t nc = t.cols.size();
   putU64(f, (uint64_t)t.nparts);
   for (size_t c = 0; c < nc; ++c) {
-    const Dict* d = t.dicts[c].get();
-    putU64(f, d ? d->strs.size() : 0);
-    if (d)
-      for (auto& x : d->strs) putStr(f, x);
+    Dict* d = t.dicts[c].get();
+    const size_t n = d ? d->strs.size() : 0;
+    putU64(f, n);
+    if (dictDir) {
+      if (n) {
+        dictPersist(*d, n, *dictDir);  // (the strings added since the pre-pass)
+        dictRefs->insert(d->fileName);
+      }
+      putStr(f, n ? d->fileName : std::string());
+      putU64(f, n ? d->fileBytes : 0);
+    } else if (d) {
+      for (size_t i = 0; i < n; ++i) putStr(f, d->strs[i]);
+    }
     putU64(f, t.hasNull[c]);
   }
   // The committed state: rows inserted by still-open transactions are left out, rows they deleted
@@ -11932,7 +12092,7 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
   }
 }
 
-void readColumnar(FILE* f, Table& t, bool refs = false) {
+void readColumnar(FILE* f, Table& t, bool refs = false, const std::string* dictDir = nullptr) {
   const size_t nc = t.cols.size();
   uint64_t np, v;
   getU64(f, np);
@@ -11940,10 +12100,18 @@ void readColumnar(FILE* f, Table& t, bool refs = false) {
     getU64(f, v);
     // (codes are positions: appended as they are, indexed when first looked up)
     if (v && (!t.dicts[c] || t.dicts[c]->strs.size() != 0)) throw SqlError("snapshot: unexpected dictionary for " + t.cols[c].name, 1105);
-    for (uint64_t i = 0; i < v; ++i) {
-      std::string x;
-      getStr(f, x);
-      t.dicts[c]->appendUnique(std::move(x));
+    if (dictDir) {  // format 5: in its dictionary file
+      std::string name;
+      uint64_t bytes = 0;
+      getStr(f, name);
+      getU64(f, bytes);
+      if (v) dictLoad(*t.dicts[c], *dictDir, name, v, bytes);
+    } else {
+      for (uint64_t i = 0; i < v; ++i) {
+        std::string x;
+        getStr(f, x);
+        t.dicts[c]->appendUnique(std::move(x));
+      }
     }
     getU64(f, v);
     t.hasNull[c] = (uint8_t)v;
@@ -12180,6 +12348,18 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n, t->sortKey));
     }
   std::vector<uint64_t> refs;
+  const std::string dictDir = dir_ + "/dicts";
+  std::set<std::string> dictRefs;
+  if (v4)  // dictionaries: the strings added since the last snapshot go to their files (no pause)
+    for (auto& t : tabs) {
+      std::vector<std::shared_ptr<Dict>> ds;
+      {
+        std::shared_lock<FairSharedMutex> lk(t->mu);
+        ds = t->dicts;
+      }
+      for (auto& d : ds)
+        if (d && d->strs.size()) dictPersist(*d, d->strs.size(), dictDir);
+    }
   const auto pause0 = Clock::now();
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
   std::sort(tabs.begin(), tabs.end());
@@ -12190,7 +12370,8 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   const std::string fin = outPath.empty() ? dir_ + "/snapshot.bin" : outPath, tmp = fin + ".tmp";
   FILE* f = fopen(tmp.c_str(), "wb");
   if (!f) throw SqlError("cannot write " + tmp, 1105);
-  fwrite(v4 ? "GDBSNAP4" : "GDBSNAP3", 1, 8, f);  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables; 4: + segment files
+  // GDBSNAP2+: the rest is one zstd stream; 3: columnar tables; 4: + segment files; 5: + dictionary files
+  fwrite(v4 ? "GDBSNAP5" : "GDBSNAP3", 1, 8, f);
   f = zstdWriter(f);
   putU64(f, dbs.size());
   for (auto& d : dbs) putStr(f, cat_.syncDbs.count(d) ? d + "\x1fSYNC" : d);  // (cat_.mu not needed: dbs only grow under writes, quiesced here)
@@ -12203,7 +12384,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     putStr(f, showCreate(*t));
     putU64(f, (uint64_t)t->autoNext);
     putU64(f, (uint64_t)t->liveRows());
-    writeColumnar(f, *t, v4 ? &refs : nullptr);
+    writeColumnar(f, *t, v4 ? &refs : nullptr, v4 ? &dictDir : nullptr, &dictRefs);
     rows += t->liveRows();
   }
   std::vector<std::shared_ptr<Pipeline>> ps;
@@ -12265,7 +12446,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   }
   if (rename(tmp.c_str(), fin.c_str()) != 0) throw SqlError("cannot install snapshot " + fin, 1105);
   syncDir(fin);
-  if (v4) segFilesInstalled(refs);  // files only the previous snapshot used can go
+  if (v4) segFilesInstalled(refs), dictFilesInstalled(dictDir, dictRefs);  // files only the previous snapshot used can go
   if (outPath.empty()) {
     archiveWal(dir_ + "/wal.old");
     archiveLoads(walGen_);
@@ -12814,7 +12995,7 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
   auto t0 = Clock::now();
   const std::string savedDb = currentDb();
   char magic[8];
-  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '4') {
+  if (fread(magic, 1, 8, f) != 8 || memcmp(magic, "GDBSNAP", 7) != 0 || magic[7] < '1' || magic[7] > '5') {
     fclose(f);
     throw SqlError("bad snapshot file " + path, 1105);
   }
@@ -12857,7 +13038,8 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
     auto t = cat_.get(db + "." + cs.table);
     std::unique_lock<FairSharedMutex> lk(t->mu);
     std::vector<Value> row(t->cols.size());
-    if (columnar) readColumnar(f, *t, magic[7] >= '4'), rows = 0;  // (rows: counted below from the table)
+    const std::string dictDir = dir_ + "/dicts";
+    if (columnar) readColumnar(f, *t, magic[7] >= '4', magic[7] >= '5' ? &dictDir : nullptr), rows = 0;  // (rows: counted below from the table)
     for (uint64_t r = 0; r < rows; ++r) {
       for (auto& v : row) getVal(f, v);
       t->appendRow(row);

@@ -37,5 +37,27 @@ cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t")
 c.eq("rows after kill -9", [tuple(r) for r in cur.fetchall()], want)
 cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u")
 c.eq("second table after kill -9", [tuple(r) for r in cur.fetchall()], want_u)
+
+# Dictionary files: a tail left by a snapshot that was never installed is cut off at load, and the
+# strings the WAL replays after it are appended in the right place.
+cur.execute("SNAPSHOT")
+dd = os.path.join(srv.data_dir, "dicts")
+for f in os.listdir(dd):
+    with open(os.path.join(dd, f), "ab") as fh:
+        fh.write(b"WDFR" + os.urandom(200))
+cur.execute("INSERT INTO u VALUES " + ",".join(f"({i}, 'tail{i}')" for i in range(300)))
+srv.kill()
+srv.start()
+cur = srv.cursor()
+cur.execute("USE a")
+cur.execute("SNAPSHOT")
+srv.stop()
+srv.start()
+cur = srv.cursor()
+cur.execute("USE a")
+cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u WHERE s LIKE 'tail%'")
+c.eq("strings after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], [(300, 300)])
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t")
+c.eq("rows after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], want)
 srv.stop()
 c.done()

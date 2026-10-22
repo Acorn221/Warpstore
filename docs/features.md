@@ -137,6 +137,11 @@ segments with columns on disk; `/metrics` has `warpstore_table_memory_bytes`.
 their rows deleted are still rewritten, which compacts them), so it only writes what changed, and a
 restart takes seconds: tables come back on disk and the cache fills up in the background. Files no
 snapshot or segment uses any more are deleted. `BACKUP` files stay self-contained.
+String dictionaries live in append-only files too (`<data dir>/dicts`, zstd frames with CRC32s):
+a snapshot appends the strings added since the last one before it pauses writes, and records how
+many strings it covers (a torn tail from a snapshot that was never installed is cut off on load).
+ClickBench 10M rows: writes pause about 50 ms per snapshot (3.8 s when the dictionaries were part of
+the snapshot), and a restart takes 1.6 s.
 
 Still in memory, whatever the limit: write buffers (up to 1M rows per partition), primary-key and
 secondary indexes, string dictionaries, deleted-row bitmaps. `ALTER TABLE` rebuilds, `BACKUP` and

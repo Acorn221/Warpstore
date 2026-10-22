@@ -137,6 +137,11 @@ class StrVec {
 
 struct Dict {
   StrVec strs;
+  // Dictionary file (snapshots in a data dir; engine.cu): strs [0, fileStrs) are in it, ending at
+  // byte fileBytes. (Not copied with the dictionary: a copy gets its own file.)
+  std::string fileName;
+  size_t fileStrs = 0;
+  uint64_t fileBytes = 0;
   // string -> code: an open-addressing table of (32-bit hash << 32 | code + 1) slots; the strings
   // themselves are compared in strs. Strings added with appendUnique() are indexed lazily, on the
   // first lookup (derived dictionaries are often only ever read by code).
