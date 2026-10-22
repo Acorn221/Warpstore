@@ -202,6 +202,22 @@ for sql, code in [("INSERT INTO ins VALUES (1, 1), (2, 2), (1, 3)", 1062), ("INS
 cur.execute("INSERT INTO ins VALUES (1, 1), (2, 2)")
 c.eq("the keys of a refused INSERT are free again", q("SELECT COUNT(*), SUM(id) FROM ins"), [(2, Decimal(3))])
 
+# in a transaction a refused statement is undone on its own (the transaction goes on); a table
+# with a VECTOR column (rows rewritten from values) loses nothing either
+cur.execute("CREATE TABLE tx (id INT PRIMARY KEY, v INT NOT NULL)")
+cur.execute("CREATE TABLE vx (id INT PRIMARY KEY, v INT NOT NULL, e VECTOR(2))")
+cur.execute("INSERT INTO tx VALUES (1, 1), (2, 2), (3, 3)")
+cur.execute("INSERT INTO vx VALUES (1, 1, '[1,2]'), (2, 2, '[1,2]'), (3, 3, '[1,2]')")
+cur.execute("BEGIN")
+c.raises("in a transaction: INSERT refused", lambda: cur.execute("INSERT INTO tx VALUES (10, 1), (11, 1), (1, 1)"), 1062)
+c.raises("in a transaction: UPDATE refused", lambda: cur.execute("UPDATE tx SET id = 3 WHERE id IN (1, 2)"), 1062)
+cur.execute("INSERT INTO tx VALUES (7, 7)")
+cur.execute("COMMIT")
+c.eq("the transaction kept only its successful statement", q("SELECT COUNT(*), SUM(id), SUM(v) FROM tx"), [(4, Decimal(13), Decimal(13))])
+c.raises("VECTOR table: duplicate key refused", lambda: cur.execute("UPDATE vx SET id = 3 WHERE id IN (1, 2)"), 1062)
+c.raises("VECTOR table: NULL into NOT NULL refused", lambda: cur.execute("UPDATE vx SET v = NULL WHERE id > 1"), 1048)
+c.eq("VECTOR table: nothing changed", q("SELECT COUNT(*), SUM(id), SUM(v) FROM vx"), [(3, Decimal(6), Decimal(6))])
+
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
 out = {}

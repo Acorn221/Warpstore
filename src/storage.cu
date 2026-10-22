@@ -918,6 +918,20 @@ void Table::txnNoteDelete(Loc l) {
   }
 }
 
+void Table::undoAppendsSince(const std::vector<int64_t>& mark) {
+  for (int p = 0; p < nparts && p < (int)mark.size(); ++p)
+    for (int64_t r = mark[p]; r < bufs[p]->n; ++r) {
+      if (bufs[p]->del->test(r)) continue;
+      const Loc l = bufLoc(p, r);
+      if (pk >= 0)
+        if (auto it = pkIndex.find(pkValue(l)); it != pkIndex.end() && it->second == l) pkIndex.erase(it);
+      if (!indexes.empty()) indexRemove(l);
+      WriteBuffer& buf = *bufs[p];
+      delSet(delForWrite(buf.del), r);
+      ++buf.version;
+    }
+}
+
 void Table::deleteAt(Loc l) {
   if (undoLog()) {
     undoLog()->push_back({this, false, rowValues(l)});

@@ -1458,6 +1458,25 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
     ~WalRoom() { e->walUnreserve(bytes); }
   } walRoom{this};
   if (writes && writeGate.owns_lock() && !tTxn.active && !replaying_) walRoom.bytes = walReserve((int64_t)sql.size() + 512);
+  // In a transaction a failed statement is undone on its own (MySQL: the transaction stays open with
+  // what came before), as a rollback to a savepoint taken when it started.
+  struct StmtSavepoint {
+    bool on;
+    size_t undo, wal;
+    int ex = std::uncaught_exceptions();
+    ~StmtSavepoint() {
+      if (!on || std::uncaught_exceptions() <= ex || !tTxn.active) return;
+      try {
+        undoLog() = nullptr;
+        undoRecords(tTxn.undo, undo);
+        tTxn.undo.resize(undo);
+        tTxn.wal.resize(std::min(wal, tTxn.wal.size()));
+      } catch (std::exception& e) {
+        fprintf(stderr, "[warpstore] undoing a failed statement: %s\n", e.what());
+      }
+      undoLog() = &tTxn.undo;
+    }
+  } stmtSavepoint{writes && tTxn.active && !replaying_, tTxn.undo.size(), tTxn.wal.size()};
   if (s.type == Stmt::SET && (s.setName == "TRANSACTION" || s.setName == "TRANSACTION_ISOLATION" || s.setName == "TX_ISOLATION")) {
     static const std::regex snapRe(R"(REPEATABLE[\s_-]+READ|SERIALIZABLE|SNAPSHOT)", std::regex::icase);
     static const std::regex rcRe(R"(READ[\s_-]+(COMMITTED|UNCOMMITTED))", std::regex::icase);
@@ -2889,19 +2908,7 @@ ResultSet Engine::doInsert(Stmt& s) {
       if (!on) return;
       t.deferFlush = prevDefer;
       try {
-        if (std::uncaught_exceptions() > ex) {
-          for (int p = 0; p < t.nparts; ++p)
-            for (int64_t r = mark[p]; r < t.bufs[p]->n; ++r) {
-              if (t.bufs[p]->del->test(r)) continue;
-              const Loc l = bufLoc(p, r);
-              if (t.pk >= 0)
-                if (auto it = t.pkIndex.find(t.pkValue(l)); it != t.pkIndex.end() && it->second == l) t.pkIndex.erase(it);
-              if (!t.indexes.empty()) t.indexRemove(l);
-              WriteBuffer& buf = *t.bufs[p];
-              delSet(delForWrite(buf.del), r);
-              ++buf.version;
-            }
-        }
+        if (std::uncaught_exceptions() > ex) t.undoAppendsSince(mark);
         if (!prevDefer)
           for (int p = 0; p < t.nparts; ++p)
             if (t.bufs[p]->n >= kSegRows) t.flushPart(p);

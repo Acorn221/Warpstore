@@ -933,8 +933,33 @@ ResultSet Engine::doModify(Stmt& s) {
 
 // Deletes the matched rows (and inserts their new versions, for UPDATE). Holds the table lock.
 ResultSet Engine::applyModify(Table& tt, const std::vector<Loc>& matched, const std::vector<std::vector<Value>>& newRows) {
-  markDeleted(&tt, matched);
-  for (auto& row : newRows) tt.appendRow(row);
+  // Outside a transaction a failure on the way (a duplicate key, a NULL into NOT NULL) puts the old
+  // rows back (in one, the statement's undo records do: see execute).
+  const bool own = !undoLog();
+  std::vector<std::vector<Value>> old;
+  std::vector<int64_t> mark;
+  const bool prevDefer = tt.deferFlush;
+  if (own) {
+    for (const Loc& l : matched) old.push_back(tt.rowValues(l));
+    for (auto& b : tt.bufs) mark.push_back(b->n);
+    tt.deferFlush = true;
+  }
+  try {
+    markDeleted(&tt, matched);
+    for (auto& row : newRows) tt.appendRow(row);
+  } catch (...) {
+    if (own) {
+      tt.undoAppendsSince(mark);
+      for (auto& row : old) tt.appendRow(row);
+      tt.deferFlush = prevDefer;
+    }
+    throw;
+  }
+  if (own) {
+    tt.deferFlush = prevDefer;
+    for (int p = 0; p < tt.nparts && !prevDefer; ++p)
+      if (tt.bufs[p]->n >= kSegRows) tt.flushPart(p);
+  }
   return okResult((int64_t)matched.size(), "Rows matched: " + std::to_string(matched.size()));
 }
 

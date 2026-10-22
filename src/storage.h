@@ -1144,6 +1144,9 @@ struct Table {
   // Set while a statement holds row locations across appends: full write buffers are flushed after.
   bool deferFlush = false;
   void deleteAt(Loc l);
+  // A failed statement's rows: deletes the write-buffer rows appended since mark (per partition:
+  // buffer row counts then; no flush meanwhile), their keys and index entries included.
+  void undoAppendsSince(const std::vector<int64_t>& mark);
   void txnNoteDelete(Loc l);  // an open transaction deleted row l (read committed bookkeeping)
   TxnPending& pendingOfMine();  // this transaction's change set here (created and registered on first use)
   void gcPending();             // drops committed change sets no snapshot needs (caller holds the exclusive lock)
