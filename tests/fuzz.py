@@ -95,6 +95,8 @@ for sql in (f"SELECT DISTINCT {ks} FROM t4 ORDER BY {ks}",
             f"SELECT k3 + k4, {ks}, MAX(v) FROM t4 WHERE k0 IS NOT NULL GROUP BY {ks} ORDER BY {ks} LIMIT 40",
             "SELECT COUNT(DISTINCT k1), COUNT(DISTINCT k2), COUNT(*), SUM(v), COUNT(DISTINCT k1 + k2) FROM t4 WHERE k0 > -5",
             "SELECT COUNT(DISTINCT s), COUNT(DISTINCT a), COUNT(DISTINCT d) FROM t1",
+            "SELECT a % 5, COUNT(DISTINCT s) ds, COUNT(DISTINCT d), SUM(b), COUNT(*) FROM t1 GROUP BY a % 5 HAVING COUNT(*) > 3 ORDER BY 1",
+            "SELECT s, COUNT(DISTINCT a), SUM(DISTINCT a % 7), MAX(m) FROM t1 WHERE id % 3 = 0 GROUP BY s ORDER BY ds IS NULL, s".replace("ds IS NULL", "s IS NULL"),
             # window functions over a GROUP BY (columnar window path)
             "SELECT s, COUNT(*) c, RANK() OVER (ORDER BY COUNT(*) DESC, s), SUM(COUNT(*)) OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW), "
             "LAG(COUNT(*)) OVER (ORDER BY s), ROW_NUMBER() OVER (PARTITION BY COUNT(*) % 3 ORDER BY s) FROM t1 WHERE s IS NOT NULL GROUP BY s ORDER BY s",

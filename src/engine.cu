@@ -11348,6 +11348,13 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
       }
       return queryImpl(outer, q, explain, typed);
     }
+    if (mixed && !explain && !s.unionNext && s.groupingSets.empty()) {
+      try {
+        Stmt copy = cloneStmt(s);
+        return multiDistinct(copy, q, typed);
+      } catch (SqlError&) {
+      }
+    }
     if (mixed) return hostAggregate(s, q, explain, typed);  // mixed DISTINCT with GROUP BY: host path
     for (auto& d : dist)
       if (d->op == "MIN" || d->op == "MAX") d->distinct = false;  // MIN/MAX(DISTINCT x) = MIN/MAX(x)
@@ -12590,6 +12597,102 @@ bool Engine::packGroupKeys(Stmt& s) {
   s.groupBy = rest;
   s.groupBy.insert(s.groupBy.begin(), parseExpr(p));
   return true;
+}
+
+// GROUP BY with DISTINCT aggregates over different arguments: one GPU aggregation for the plain
+// aggregates and one per DISTINCT aggregate (each the usual single-DISTINCT path), merged per group
+// key (NULL keys included) into a temp table; the select list, HAVING, ORDER BY and LIMIT then run
+// over it.
+ResultSet Engine::multiDistinct(Stmt& s, QueryCtx& q, bool typed) {
+  auto resolve = [&](const ExprP& g) -> ExprP {
+    if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size()) return s.items[g->lit.i - 1].e;
+    if (g->kind == Expr::COL && g->table.empty())
+      for (auto& it : s.items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), g->name.c_str()) == 0) return it.e;
+    return g;
+  };
+  std::vector<ExprP> keys;
+  for (auto& g : s.groupBy) keys.push_back(cloneExpr(resolve(g)));
+  std::vector<ExprP> plain, dist;
+  std::map<std::string, std::string> colOf;  // aggregate text -> merged column
+  std::function<void(const ExprP&)> collect = [&](const ExprP& e) {
+    if (!e || e->kind == Expr::SUBQUERY || e->sub) return;
+    if (e->kind == Expr::FUNC && e->window) throw SqlError("window", 1235);
+    if (e->kind == Expr::FUNC && (isAggName(e->op) || isHostAggName(e->op))) {
+      const std::string k = e->str();
+      if (!colOf.count(k)) {
+        if (e->distinct) colOf[k] = "__d" + std::to_string(dist.size()), dist.push_back(e);
+        else colOf[k] = "__a" + std::to_string(plain.size()), plain.push_back(e);
+      }
+      return;
+    }
+    for (auto& a : e->args) collect(a);
+  };
+  for (auto& it : s.items) collect(it.e);
+  collect(s.having);
+  for (auto& o : s.orderBy) collect(o.e);
+  auto part = [&](const std::vector<ExprP>& aggs, const std::string& prefix) {
+    Stmt p;
+    p.type = Stmt::SELECT;
+    p.from = s.from;
+    p.joinConds = s.joinConds;
+    p.where = s.where ? cloneExpr(s.where) : nullptr;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      p.items.push_back({cloneExpr(keys[i]), "__g" + std::to_string(i)});
+      p.groupBy.push_back(cloneExpr(keys[i]));
+    }
+    for (size_t j = 0; j < aggs.size(); ++j) p.items.push_back({cloneExpr(aggs[j]), prefix + std::to_string(j)});
+    return p;
+  };
+  auto keyOf = [&](const std::vector<Value>& row) {
+    std::string k;
+    for (size_t i = 0; i < keys.size(); ++i) k += (row[i].isNull() ? std::string("\x02") : row[i].toString()) + '\x1f';
+    return k;
+  };
+  Stmt base = part(plain, "__a");
+  ResultSet m = query(base, q, false, true);
+  std::unordered_map<std::string, size_t> at;
+  for (size_t r = 0; r < m.vals.size(); ++r) at.emplace(keyOf(m.vals[r]), r);
+  for (size_t k = 0; k < dist.size(); ++k) {
+    Stmt dk = part({dist[k]}, "__v");
+    ResultSet rk = query(dk, q, false, true);
+    for (auto& row : m.vals) row.push_back(Value::Null());
+    for (auto& row : rk.vals) {
+      auto it = at.find(keyOf(row));
+      if (it != at.end()) m.vals[it->second].back() = row[keys.size()];
+    }
+    m.names.push_back("__d" + std::to_string(k));
+    m.types.push_back(rk.types.at(keys.size()));
+  }
+  const std::string tmp = makeTemp(m, q, "mdist");
+  // the original query over the merged groups
+  std::function<ExprP(const ExprP&)> rw = [&](const ExprP& e) -> ExprP {
+    if (!e) return e;
+    if (e->kind == Expr::SUBQUERY || e->sub) return e;
+    const std::string k = e->str();
+    for (size_t i = 0; i < keys.size(); ++i)
+      if (keys[i]->str() == k) return mkCol("__mg", "__g" + std::to_string(i));
+    if (auto it = colOf.find(k); it != colOf.end() && e->kind == Expr::FUNC) return mkCol("__mg", it->second);
+    auto y = std::make_shared<Expr>(*e);
+    y->bound = false;
+    for (auto& a : y->args) a = rw(a);
+    return y;
+  };
+  Stmt outer;
+  outer.type = Stmt::SELECT;
+  for (auto& it : s.items) outer.items.push_back({rw(it.e), it.alias.empty() ? (it.e->kind == Expr::COL ? it.e->name : it.e->str()) : it.alias});
+  outer.from = {TableRef{tmp, "__mg", nullptr, 0, nullptr}};
+  outer.where = rw(s.having);
+  for (auto& o : s.orderBy) {
+    const bool pos = o.e->kind == Expr::LIT && o.e->lit.kind == Value::INT;
+    const bool alias = o.e->kind == Expr::COL && o.e->table.empty() &&
+                       std::any_of(s.items.begin(), s.items.end(), [&](const SelectItem& it) { return !it.alias.empty() && strcasecmp(it.alias.c_str(), o.e->name.c_str()) == 0; });
+    outer.orderBy.push_back({pos || alias ? o.e : rw(o.e), o.desc});
+  }
+  outer.limit = s.limit;
+  outer.offset = s.offset;
+  outer.distinct = s.distinct;
+  return query(outer, q, false, typed);
 }
 
 ResultSet Engine::hostAggregate(Stmt& s, QueryCtx& q, bool explain, bool typed) {

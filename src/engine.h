@@ -246,7 +246,8 @@ class Engine {
   ResultSet modifyViaSelect(Stmt& s);
   ResultSet groupingSetsQuery(Stmt& s, QueryCtx& q, bool explain, bool typed);
   ResultSet applyModify(Table& t, const std::vector<Loc>& matched, const std::vector<std::vector<Value>>& newRows);  // DELETE / UPDATE
-  bool packGroupKeys(Stmt& s);  // GROUP BY with too many keys: integer columns packed into one
+  bool packGroupKeys(Stmt& s);
+  ResultSet multiDistinct(Stmt& s, QueryCtx& q, bool typed);  // GROUP BY with DISTINCT aggregates over different arguments  // GROUP BY with too many keys: integer columns packed into one
   ResultSet loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const std::vector<int>& srcOf);  // LOAD DATA of a Parquet file
   ResultSet doLoad(Stmt& s);
   ResultSet doOptimize(Stmt& s);
