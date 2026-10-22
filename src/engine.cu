@@ -8322,8 +8322,8 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
         return x->kind == Expr::COL && x->bt == 0 && x->bc >= 0 && t.cols[x->bc].lt == cm.lt && t.cols[x->bc].pt == cm.pt &&
                        t.cols[x->bc].scale == cm.scale && cm.lt != LType::VARCHAR ? x->bc : -1;
       };
-      if (e->kind == Expr::LIT && !e->lit.isNull() && cm.lt != LType::VARCHAR) {
-        int64_t i0 = 0;
+      if (e->kind == Expr::LIT && !e->lit.isNull() && (cm.lt != LType::VARCHAR || e->lit.kind == Value::STR)) {
+        int64_t i0 = 0;  // (a string constant: coded once)
         double d0 = 0;
         t.rawOf(c, e->lit, i0, d0);
         if (f64) od.assign(n, d0);
