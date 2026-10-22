@@ -2,6 +2,7 @@
 // dictionary (PLAIN_DICTIONARY / RLE_DICTIONARY) and DELTA_BINARY_PACKED encodings, optional
 // columns, data pages v1 and v2, UNCOMPRESSED / SNAPPY / GZIP / ZSTD. The file becomes tab-separated
 // text in the order of the requested columns (matched by name), which the normal LOAD DATA path loads.
+#include <future>
 #include <snappy.h>
 #include <zlib.h>
 #include <zstd.h>
@@ -937,6 +938,9 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
   std::vector<int64_t> delta;
   const int dbw = bitWidth(col.maxDef);
   int64_t seen = 0;
+  int dictPages = 0;
+  bool onlyDict = true;     // every string data page dictionary-encoded (against one dictionary)
+  std::vector<uint32_t> vc;  // their indices, per present value
   while (p < end && seen < rows) {
     Thrift t{p, end};
     TVal ph = t.structure();
@@ -953,6 +957,7 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
       const uint8_t* q = (const uint8_t*)raw.data();
       di.clear(), dd.clear(), ds.clear();
       plain(q, q + raw.size(), dh ? (size_t)dh->fi(1) : 0, di, dd, ds);
+      ++dictPages;
       continue;
     }
     if (ptype != 0 && ptype != 3) continue;
@@ -999,6 +1004,7 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
     }
     if (enc == 0) {
       plain(q, qe, present, vi, vd, vs);
+      onlyDict = false;
     } else if (enc == 2 || enc == 8) {
       const int bw = q < qe ? *q : 0;
       rleHybrid(q + 1, qe, bw, present, idx);
@@ -1012,6 +1018,7 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
         } else {
           if (i >= ds.size()) bad("dictionary index out of range");
           vs.push_back(ds[i]);
+          vc.push_back(i);
         }
       }
     } else if (enc == 5 && out.kind == 1 && !col.isDecimal) {
@@ -1042,9 +1049,15 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
       }
   } else {
     out.s.assign(rows, std::string_view());
+    const bool dict = onlyDict && dictPages == 1 && vc.size() == vs.size();
+    if (dict) {
+      out.dict = ds;
+      out.code.assign(rows, 0);
+    }
     for (int64_t r = 0; r < rows; ++r)
       if (out.valid[r]) {
         if (k >= vs.size()) bad("fewer values than rows");
+        if (dict) out.code[r] = vc[k];
         out.s[r] = vs[k++];
       }
   }
@@ -1068,34 +1081,51 @@ bool parquetScan(const std::string& file, const std::vector<std::string>& wanted
   }
   const TVal* rgs = sc.md.f(4);
   if (!rgs) return true;
-  bool first = true;
-  for (const TVal& rg : rgs->list) {
-    const int64_t rows = rg.fi(3);
+  std::vector<const TVal*> groups;
+  for (const TVal& rg : rgs->list)
+    if (rg.f(1) && rg.fi(3) > 0) groups.push_back(&rg);
+  struct Decoded {
+    int64_t rows = 0;
+    std::vector<PqChunk> cols;
+    std::vector<std::exception_ptr> errs;
+    bool text = false;
+  };
+  auto decode = [&](size_t g) {
+    Decoded d;
+    const TVal& rg = *groups[g];
+    d.rows = rg.fi(3);
     const TVal* chunks = rg.f(1);
-    if (!chunks || rows <= 0) continue;
-    std::vector<PqChunk> cols(wanted.size());
-    std::vector<std::exception_ptr> errs(wanted.size());
+    d.cols.resize(wanted.size());
+    d.errs.resize(wanted.size());
     std::atomic<bool> text{false};
     ioParallel(wanted.size(), [&](size_t k) {
       if (leafOf[k] < 0) return;  // absent: kind 0 (all NULL)
       try {
         const size_t l = (size_t)leafOf[k];
         if (l >= chunks->list.size() || !chunks->list[l].f(3)) bad("row group without column chunk " + sc.leaves[l].name);
-        readLeafTyped(file, sc.leaves[l], *chunks->list[l].f(3), rows, cols[k]);
+        readLeafTyped(file, sc.leaves[l], *chunks->list[l].f(3), d.rows, d.cols[k]);
       } catch (const NeedsText&) {
         text = true;
       } catch (...) {
-        errs[k] = std::current_exception();
+        d.errs[k] = std::current_exception();
       }
     });
-    if (text) {
-      if (first) return false;  // (nothing loaded yet: the caller goes through text instead)
+    d.text = text;
+    return d;
+  };
+  // The next row group is decoded while the caller takes in the current one.
+  Decoded cur = groups.empty() ? Decoded{} : decode(0);
+  for (size_t g = 0; g < groups.size(); ++g) {
+    std::future<Decoded> next;
+    if (g + 1 < groups.size() && !cur.text) next = std::async(std::launch::async, decode, g + 1);
+    if (cur.text) {
+      if (g == 0) return false;  // (nothing loaded yet: the caller goes through text instead)
       bad("a column chunk needs an encoding the direct path doesn't read");
     }
-    for (auto& e : errs)
+    for (auto& e : cur.errs)
       if (e) std::rethrow_exception(e);
-    first = false;
-    fn(rows, cols);
+    fn(cur.rows, cur.cols);
+    if (next.valid()) cur = next.get();
   }
   return true;
 }

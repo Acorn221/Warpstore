@@ -244,11 +244,57 @@ struct Dict {
     std::unique_lock<std::shared_mutex> lk(mapMu);
     return add(s, hash32(s));
   }
-  // getOrAdd for n strings under one lock; a view with no data (NULL) gets nullCode.
+  // getOrAdd for n strings (codes in order of first appearance); a view with no data (NULL) gets
+  // nullCode. Big batches: hashes, lookups of known strings and copies of new ones on all cores, then
+  // only the new strings are added under the exclusive lock.
   void getOrAddMany(const std::string_view* s, size_t n, int64_t* out, int64_t nullCode) {
     index();
+    if (n < 8192) {
+      std::unique_lock<std::shared_mutex> lk(mapMu);
+      for (size_t i = 0; i < n; ++i) out[i] = s[i].data() ? add(s[i], hash32(s[i])) : nullCode;
+      return;
+    }
+    auto par = [](size_t m, const std::function<void(size_t, size_t)>& f) {
+      const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), m / 16384 + 1);
+      std::vector<std::thread> th;
+      for (size_t t = 1; t < nth; ++t) th.emplace_back([&, t] { f(m * t / nth, m * (t + 1) / nth); });
+      f(0, m / nth);
+      for (auto& x : th) x.join();
+    };
+    std::vector<uint32_t> hs(n);
+    {
+      std::shared_lock<std::shared_mutex> lk(mapMu);
+      par(n, [&](size_t b, size_t e) {
+        for (size_t i = b; i < e; ++i) {
+          if (!s[i].data()) { out[i] = nullCode; continue; }
+          hs[i] = hash32(s[i]);
+          out[i] = lookup(s[i], hs[i]);
+        }
+      });
+    }
+    std::vector<size_t> miss;
+    for (size_t i = 0; i < n; ++i)
+      if (out[i] == -1) miss.push_back(i);
+    if (miss.empty()) return;
+    std::vector<std::string> made(miss.size());
+    par(miss.size(), [&](size_t b, size_t e) {
+      for (size_t j = b; j < e; ++j) made[j].assign(s[miss[j]].data(), s[miss[j]].size());
+    });
     std::unique_lock<std::shared_mutex> lk(mapMu);
-    for (size_t i = 0; i < n; ++i) out[i] = s[i].data() ? add(s[i], hash32(s[i])) : nullCode;
+    grow(strs.size() + miss.size());
+    const size_t mask = slots_.size() - 1;
+    for (size_t j = 0; j < miss.size(); ++j) {
+      if (j + 8 < miss.size()) __builtin_prefetch(&slots_[hs[miss[j + 8]] & mask]);
+      const size_t i = miss[j];
+      int32_t f = lookup(s[i], hs[i]);  // (an earlier repeat in this batch, or another writer)
+      if (f < 0) {
+        f = (int32_t)strs.size();
+        strs.push_back(std::move(made[j]));
+        place(hs[i], (uint32_t)f);
+      }
+      out[i] = f;
+    }
+    indexed_ = strs.size();
   }
   // Codes of n strings that are in the dictionary (-1 for the others; nullCode for NULL views).
   void findMany(const std::string_view* s, size_t n, int64_t* out, int64_t nullCode) const {

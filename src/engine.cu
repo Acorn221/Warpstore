@@ -7582,6 +7582,26 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
           return;
         }
         const double pw = pow10i(p.scale);
+        if (p.kind == 3 && cm.lt == LType::VARCHAR && !p.dict.empty() && p.dict.size() * 4 <= (size_t)rows) {
+          // dictionary-encoded: its entries coded once, rows mapped by index (first-appearance order
+          // of the entries, so codes follow the rows as the per-row path would)
+          std::vector<uint8_t> used(p.dict.size(), 0);
+          std::vector<std::string_view> order;
+          for (int64_t r = 0; r < rows; ++r)
+            if (p.valid[r] && !used[p.code[r]]) used[p.code[r]] = 1, order.push_back(p.dict[p.code[r]]);
+          std::vector<int64_t> oc(order.size());
+          t->dicts[c]->getOrAddMany(order.data(), order.size(), oc.data(), kNullI32);
+          std::vector<int64_t> map(p.dict.size(), kNullI32);
+          size_t o = 0;
+          std::fill(used.begin(), used.end(), 0);
+          for (int64_t r = 0; r < rows; ++r)
+            if (p.valid[r] && !used[p.code[r]]) used[p.code[r]] = 1, map[p.code[r]] = oc[o++];
+          for (int64_t r = 0; r < rows; ++r) {
+            if (p.valid[r]) iv[c][r] = map[p.code[r]];
+            else null(r);
+          }
+          return;
+        }
         if (p.kind == 3 && cm.lt == LType::VARCHAR) {  // strings: coded in row order, one lock
           std::vector<std::string_view> sv(p.s);
           for (int64_t r = 0; r < rows; ++r)

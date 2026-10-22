@@ -56,6 +56,9 @@ struct PqChunk {
   std::vector<std::string_view> s;
   std::vector<uint8_t> valid;  // per row
   std::deque<std::string> keep;  // (a deque: its strings never move, short ones included)
+  // Strings from dictionary-encoded pages only (one dictionary): s[r] == dict[code[r]] for valid rows.
+  std::vector<std::string_view> dict;
+  std::vector<uint32_t> code;
 };
 // Calls fn(rows, columns) per row group (decoded in parallel). False, before any call, when a wanted
 // column needs the text path (nested, TIME, decimals over 18 digits, unusual encodings).
