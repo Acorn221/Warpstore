@@ -33,7 +33,14 @@ if not all(os.path.exists(os.path.join(work, f"{t}.parquet")) for t in tables):
     d.close()
     d = duckdb.connect()
     d.execute("LOAD tpch")
+if args.sf >= 5:  # big: DuckDB tables in a database file (bounded memory), reused when present
+    d.close()
+    d = duckdb.connect(f"{work}/duck.db")
+    d.execute("SET memory_limit = '6GB'")
+    d.execute("LOAD tpch")
 for t in tables:
+    if args.sf >= 5 and d.execute(f"SELECT COUNT(*) FROM information_schema.tables WHERE table_name = '{t}'").fetchone()[0]:
+        continue
     d.execute(f"CREATE OR REPLACE TABLE {t} AS SELECT * FROM '{work}/{t}.parquet'")
 d.execute("SET default_null_order = 'nulls_first_on_asc_last_on_desc'")
 

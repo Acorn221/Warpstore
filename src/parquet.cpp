@@ -346,7 +346,7 @@ std::string jsonQuote(const char* s, size_t n) {
 
 // One column chunk: its repetition / definition levels (empty when the max level is 0) and the
 // values of the entries whose definition level is the maximum (formatted).
-void readLeaf(const std::string& file, const Col& col, const TVal& meta, std::vector<uint32_t>& repsOut, std::vector<uint32_t>& defsOut,
+void readLeaf(std::string_view file, const Col& col, const TVal& meta, std::vector<uint32_t>& repsOut, std::vector<uint32_t>& defsOut,
               std::vector<std::string>& valsOut) {
   const int codec = (int)meta.fi(4);
   int64_t off = meta.fi(9);
@@ -516,7 +516,7 @@ void readLeaf(const std::string& file, const Col& col, const TVal& meta, std::ve
 }
 
 // A flat column chunk as cells (formatted); NULL -> "\N".
-void readChunk(const std::string& file, const Col& col, const TVal& meta, int64_t rows, std::vector<std::string>& cells) {
+void readChunk(std::string_view file, const Col& col, const TVal& meta, int64_t rows, std::vector<std::string>& cells) {
   std::vector<uint32_t> reps, defs;
   std::vector<std::string> vals;
   readLeaf(file, col, meta, reps, defs, vals);
@@ -531,7 +531,7 @@ void readChunk(const std::string& file, const Col& col, const TVal& meta, int64_
 
 }  // namespace
 
-std::vector<std::string> parquetColumns(const std::string& file) {
+std::vector<std::string> parquetColumns(std::string_view file) {
   if (file.size() < 12 || file.compare(file.size() - 4, 4, "PAR1") != 0) bad("not a Parquet file");
   uint32_t flen;
   memcpy(&flen, file.data() + file.size() - 8, 4);
@@ -671,7 +671,7 @@ struct PqSchema {
   std::vector<int> top;  // the top-level fields
 };
 // The footer and the schema tree (leaves get their maximum definition / repetition levels).
-static PqSchema parquetSchema(const std::string& file) {
+static PqSchema parquetSchema(std::string_view file) {
   PqSchema sc;
   auto& nodes = sc.nodes;
   auto& leaves = sc.leaves;
@@ -725,7 +725,7 @@ static PqSchema parquetSchema(const std::string& file) {
   return sc;
 }
 
-std::string parquetToTsv(const std::string& file, const std::vector<std::string>& wanted) {
+std::string parquetToTsv(std::string_view file, const std::vector<std::string>& wanted) {
   PqSchema sc = parquetSchema(file);
   const TVal& md = sc.md;
   const std::vector<PNode>& nodes = sc.nodes;
@@ -858,7 +858,7 @@ namespace {
 struct NeedsText {};  // a column this path doesn't decode: the caller loads the file through text
 
 // One flat column chunk, decoded: values at their rows (NULL rows: valid = 0).
-void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, int64_t rows, PqChunk& out) {
+void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int64_t rows, PqChunk& out) {
   const int codec = (int)meta.fi(4);
   int64_t off = meta.fi(9);
   if (const TVal* dp = meta.f(11)) off = std::min(off, dp->i ? dp->i : off);
@@ -1064,7 +1064,7 @@ void readLeafTyped(const std::string& file, const Col& col, const TVal& meta, in
 }
 }  // namespace
 
-bool parquetScan(const std::string& file, const std::vector<std::string>& wanted,
+bool parquetScan(std::string_view file, const std::vector<std::string>& wanted,
                  const std::function<void(int64_t, std::vector<PqChunk>&)>& fn) {
   PqSchema sc = parquetSchema(file);
   std::vector<int> leafOf(wanted.size(), -1);  // wanted column -> its leaf (-1: absent)

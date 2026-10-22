@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <sys/mman.h>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -7535,8 +7536,26 @@ static bool isParquetFile(const std::string& path) {
 // WAL names a copy of the file (it is compressed already), which replays the same way.
 ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const std::vector<int>& srcOf) {
   const auto t0 = Clock::now();
-  std::string data;
-  if (!readFile(s.path, data)) throw SqlError("File '" + s.path + "' not found", 29);
+  // Mapped, not read: the file stays in the page cache (no heap copy of a multi-GB file).
+  struct Map {
+    void* p = MAP_FAILED;
+    size_t n = 0;
+    ~Map() { if (p != MAP_FAILED && n) munmap(p, n); }
+  } map;
+  {
+    const int fd = ::open(s.path.c_str(), O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0) {
+      if (fd >= 0) ::close(fd);
+      throw SqlError("File '" + s.path + "' not found", 29);
+    }
+    map.n = (size_t)st.st_size;
+    if (map.n) map.p = mmap(nullptr, map.n, PROT_READ, MAP_PRIVATE, fd, 0);
+    ::close(fd);
+    if (map.n && map.p == MAP_FAILED) throw SqlError("cannot map '" + s.path + "'", 29);
+    if (map.n) madvise(map.p, map.n, MADV_SEQUENTIAL);
+  }
+  const std::string_view data(map.n ? (const char*)map.p : "", map.n);
   std::vector<std::string> wanted;  // per table column: the Parquet column it comes from ("": none)
   for (size_t c = 0; c < t->cols.size(); ++c)
     wanted.push_back(srcOf.empty() ? t->cols[c].name : srcOf[c] >= 0 ? s.insertCols[srcOf[c]] : std::string());
@@ -7668,6 +7687,9 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     n += rows;
     checkKilled();
     lk.unlock();  // (readers get in between row groups)
+    // Over --memory-limit: evict cold column data to the segment files now (the maintenance thread
+    // can't get the table lock while a long load holds it).
+    if (tierEnabled() && tierHostBytes() - tierPendingBytes() > tierMemLimit() / 10 * 9) tierBalance();
     std::this_thread::yield();
     lk.lock();
   });

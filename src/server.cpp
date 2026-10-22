@@ -1,5 +1,6 @@
 // MySQL client/server protocol (v10 handshake, text protocol) so any MySQL client, driver or
 // BI tool can talk to warpstore, the same way SingleStore is MySQL wire compatible.
+#include <fstream>
 #include <arpa/inet.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
@@ -1383,6 +1384,28 @@ void serve(int fd, Engine* engine) {
 namespace gdb { extern int g_redundancy; }
 using gdb::g_redundancy;
 
+// The tightest memory.max (cgroup v2) of this process's cgroup and its ancestors; -1 if none.
+static int64_t cgroupMemoryMax() {
+  std::ifstream cg("/proc/self/cgroup");
+  std::string line, path;
+  while (std::getline(cg, line))
+    if (line.rfind("0::", 0) == 0) path = line.substr(3);
+  if (path.empty()) return -1;
+  int64_t best = -1;
+  for (;;) {
+    std::ifstream f("/sys/fs/cgroup" + path + "/memory.max");
+    std::string v;
+    if (f >> v && v != "max") {
+      const int64_t x = atoll(v.c_str());
+      if (x > 0 && (best < 0 || x < best)) best = x;
+    }
+    if (path.empty() || path == "/") break;
+    const size_t k = path.rfind('/');
+    path = k == 0 || k == std::string::npos ? "" : path.substr(0, k);
+  }
+  return best;
+}
+
 int main(int argc, char** argv) {
   int port = 3307;
   std::string dataDir = "./warpstore-data";
@@ -1472,7 +1495,16 @@ int main(int argc, char** argv) {
   {
     int64_t lim = -1;  // (no limit without a data dir: nothing to evict to)
     if (memLimitGb > 0) lim = (int64_t)(memLimitGb * (1ll << 30));
-    else if (memLimitGb < 0) lim = (int64_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 2;
+    else if (memLimitGb < 0) {
+      // Default: half the RAM, or 40% of a cgroup (container / systemd) memory cap when that is smaller
+      // (dictionaries, write buffers and queries need the rest).
+      lim = (int64_t)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE) / 2;
+      const int64_t cap = cgroupMemoryMax();
+      if (cap > 0 && cap / 5 * 2 < lim) {
+        lim = cap / 5 * 2;
+        fprintf(stderr, "[warpstore] memory cap of %.1f GB (cgroup): table data in host memory up to 40%% of it\n", cap / 1073741824.0);
+      }
+    }
     tierInit(dataDir, lim);
     if (!dataDir.empty() && lim > 0)
       fprintf(stderr, "[warpstore] table data in host memory up to %.1f GB, the rest in %s/segments (--memory-limit)\n", lim / 1073741824.0, dataDir.c_str());

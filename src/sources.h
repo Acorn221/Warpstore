@@ -45,7 +45,7 @@ std::string decompressByName(const std::string& name, std::string data);
 
 // Parquet file -> tab-separated rows of the named columns (by name; absent: \N). parquetColumns:
 // the file's column names.
-std::string parquetToTsv(const std::string& file, const std::vector<std::string>& cols);
+std::string parquetToTsv(std::string_view file, const std::vector<std::string>& cols);
 // Flat Parquet columns decoded for a direct load: per row group, the wanted columns (by name) at
 // their rows. kind 0: absent (all NULL), 1: integers (unit 0 number, 1 DATE days, 2 TIMESTAMP
 // microseconds, 3 DECIMAL unscaled with `scale`, 4 BOOLEAN), 2: doubles, 3: strings (views into keep).
@@ -62,9 +62,9 @@ struct PqChunk {
 };
 // Calls fn(rows, columns) per row group (decoded in parallel). False, before any call, when a wanted
 // column needs the text path (nested, TIME, decimals over 18 digits, unusual encodings).
-bool parquetScan(const std::string& file, const std::vector<std::string>& wanted,
+bool parquetScan(std::string_view file, const std::vector<std::string>& wanted,
                  const std::function<void(int64_t, std::vector<PqChunk>&)>& fn);
-std::vector<std::string> parquetColumns(const std::string& file);
+std::vector<std::string> parquetColumns(std::string_view file);
 // Avro object container file -> tab-separated rows of the named fields.
 std::string avroToTsv(const std::string& file, const std::vector<std::string>& cols);
 // ORC file -> tab-separated rows of the named columns.
