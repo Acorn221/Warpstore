@@ -1,5 +1,6 @@
 #include "engine.h"
 
+#include <future>
 #include <sys/mman.h>
 #include <algorithm>
 #include <chrono>
@@ -7643,21 +7644,28 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
   const std::vector<Value> defs = defaultRow(*t);
   // Rows loaded before an error stay (as with text files): the statement is logged anyway, with a
   // copy of the file, so a restart replays to the same rows and the same error.
+  // The WAL's copy is made (and checked) while the file loads; waited for before the statement is done.
+  std::future<uint32_t> copying;
+  if (!copyTo.empty()) copying = std::async(std::launch::async, [path = s.path, copyTo] { return copyFile(path, copyTo); });
   struct FailLog {
-    const std::string& path;
     const std::string& copyTo;
+    std::future<uint32_t>& copying;
     const int64_t& n;
     bool armed = true;
     ~FailLog() {
-      if (!armed || n <= 0 || copyTo.empty()) return;
+      if (!armed || copyTo.empty()) return;
       try {  // (unwinding: never throw from here)
-        const uint32_t crc = copyFile(path, copyTo);
+        const uint32_t crc = copying.get();
+        if (n <= 0) {  // nothing loaded: no WAL record, no copy
+          unlink(copyTo.c_str());
+          return;
+        }
         const std::string named = crcName(copyTo, crc, true);
         if (rename(copyTo.c_str(), named.c_str()) == 0) tLoadLogPath = named;
       } catch (...) {
       }
     }
-  } failLog{s.path, copyTo, n};
+  } failLog{copyTo, copying, n};
   std::vector<double> colMs(t->cols.size());
   double cbMs = 0, appMs = 0;
   const bool direct = !vec && parquetScan(data, wanted, [&](int64_t rows, std::vector<PqChunk>& in) {
@@ -7851,7 +7859,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
   lk.unlock();
   const auto cp0 = Clock::now();
   if (!copyTo.empty()) {
-    const uint32_t crc = copyFile(s.path, copyTo);
+    const uint32_t crc = copying.get();
     const std::string named = crcName(copyTo, crc, false);
     if (rename(copyTo.c_str(), named.c_str()) != 0) throw SqlError("cannot rename " + copyTo, 1105);
     tLoadLogPath = named;
