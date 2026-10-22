@@ -171,6 +171,35 @@ std::string decompress(int codec, const uint8_t* src, size_t n, size_t outSize) 
     bad("damaged page: " + std::to_string(out.size()) + " bytes uncompressed, the page header says " + std::to_string(outSize));
   return out;
 }
+// A page's bytes for the direct path: decompressed into a buffer that isn't zero-filled first, or
+// (uncompressed) the file's own bytes.
+PqChunk::Page decompressPage(int codec, const uint8_t* src, size_t n, size_t outSize) {
+  PqChunk::Page pg;
+  if (codec == 0) {
+    pg.p = (const char*)src, pg.n = n;
+  } else if (codec == 1 || codec == 6) {
+    pg.own.reset(new char[std::max<size_t>(outSize, 1)]);
+    size_t got = 0;
+    if (codec == 1) {
+      size_t len = 0;
+      if (!snappy::GetUncompressedLength((const char*)src, n, &len) || len != outSize || !snappy::RawUncompress((const char*)src, n, pg.own.get()))
+        bad("bad snappy page");
+      got = len;
+    } else {
+      got = ZSTD_decompress(pg.own.get(), outSize, src, n);
+      if (ZSTD_isError(got)) bad("bad zstd page");
+    }
+    pg.p = pg.own.get(), pg.n = got;
+  } else {  // (gzip: through the string path)
+    std::string s = decompress(codec, src, n, outSize);
+    pg.own.reset(new char[std::max<size_t>(s.size(), 1)]);
+    memcpy(pg.own.get(), s.data(), s.size());
+    pg.p = pg.own.get(), pg.n = s.size();
+  }
+  if (pg.n != outSize)
+    bad("damaged page: " + std::to_string(pg.n) + " bytes uncompressed, the page header says " + std::to_string(outSize));
+  return pg;
+}
 // The page CRC (PageHeader field 4: CRC32 of the page bytes after the header), when the writer set one.
 void checkPageCrc(const TVal& ph, const uint8_t* body, size_t csize) {
   const TVal* c = ph.f(4);
@@ -993,11 +1022,11 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
     p += csize;
     if (ptype == 2) {  // dictionary page
       const TVal* dh = ph.f(7);
-      out.keep.push_back(decompress(codec, body, csize, usize));
-      const std::string& raw = out.keep.back();
-      const uint8_t* q = (const uint8_t*)raw.data();
+      out.keep.push_back(decompressPage(codec, body, csize, usize));
+      const PqChunk::Page& raw = out.keep.back();
+      const uint8_t* q = (const uint8_t*)raw.p;
       di.clear(), dd.clear(), ds.clear();
-      plain(q, q + raw.size(), dh ? (size_t)dh->fi(1) : 0, di, dd, ds);
+      plain(q, q + raw.n, dh ? (size_t)dh->fi(1) : 0, di, dd, ds);
       ++dictPages;
       continue;
     }
@@ -1010,9 +1039,9 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
       if (!dh) bad("data page without header");
       n = (size_t)dh->fi(1);
       enc = (int)dh->fi(2);
-      out.keep.push_back(decompress(codec, body, csize, usize));
-      q = (const uint8_t*)out.keep.back().data();
-      qe = q + out.keep.back().size();
+      out.keep.push_back(decompressPage(codec, body, csize, usize));
+      q = (const uint8_t*)out.keep.back().p;
+      qe = q + out.keep.back().n;
       if (col.maxDef) {
         uint32_t len;
         memcpy(&len, q, 4);
@@ -1028,9 +1057,9 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
       if (col.maxDef) rleHybrid(body + repLen, body + repLen + defLen, dbw, n, defs);
       const int64_t lv = repLen + defLen;
       const bool compressed = dh->f(7) ? dh->fi(7) != 0 : true;
-      out.keep.push_back(compressed ? decompress(codec, body + lv, csize - lv, usize - lv) : std::string((const char*)body + lv, csize - lv));
-      q = (const uint8_t*)out.keep.back().data();
-      qe = q + out.keep.back().size();
+      out.keep.push_back(decompressPage(compressed ? codec : 0, body + lv, csize - lv, compressed ? usize - lv : csize - lv));
+      q = (const uint8_t*)out.keep.back().p;
+      qe = q + out.keep.back().n;
     }
     size_t present = n;
     if (col.maxDef) {

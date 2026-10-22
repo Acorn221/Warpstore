@@ -3,6 +3,7 @@
 #pragma once
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <map>
 #include <functional>
 #include <string>
@@ -55,10 +56,19 @@ struct PqChunk {
   std::vector<double> d;
   std::vector<std::string_view> s;
   std::vector<uint8_t> valid;  // per row
-  std::deque<std::string> keep;  // (a deque: its strings never move, short ones included)
+  // Decompressed pages the views point into (uncompressed pages: the file's mapping itself).
+  struct Page {
+    std::unique_ptr<char[]> own;  // (not zero-filled: written by the decompressor)
+    const char* p = nullptr;
+    size_t n = 0;
+  };
+  std::deque<Page> keep;
   // Strings from dictionary-encoded pages only (one dictionary): s[r] == dict[code[r]] for valid rows.
   std::vector<std::string_view> dict;
   std::vector<uint32_t> code;
+  PqChunk() = default;
+  PqChunk(PqChunk&&) noexcept = default;  // (moved, never copied: vectors of chunks resize by moving)
+  PqChunk& operator=(PqChunk&&) noexcept = default;
 };
 // Calls fn(rows, columns) per row group (decoded in parallel). False, before any call, when a wanted
 // column needs the text path (nested, TIME, decimals over 18 digits, unusual encodings).
