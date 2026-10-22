@@ -119,6 +119,16 @@ for sql in ("SELECT DISTINCT a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2,
             "GROUP BY a % 3, b % 3, id % 2, id % 3, id % 5, a % 2, b % 2, s, d, m > 0 ORDER BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"):
     g.execute(sql)
     MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
+# GROUP BY keys determined by a primary key (directly or through a join equality): dropped from the
+# grouping and read as MIN(); results must not change.
+for sql in ("SELECT t1.id, t1.s, t1.a, SUM(t2.x), COUNT(*) FROM t1 JOIN t2 ON t2.t1_id = t1.id GROUP BY t1.id, t1.s, t1.a ORDER BY t1.s, t1.id",
+            "SELECT t2.t1_id, t1.s, t1.d, COUNT(*) FROM t2 JOIN t1 ON t1.id = t2.t1_id GROUP BY t2.t1_id, t1.s, t1.d ORDER BY t1.d DESC, t2.t1_id LIMIT 30",
+            "SELECT t1.s, t1.id, MAX(t2.s2) FROM t1, t2 WHERE t1.id = t2.t1_id AND t2.x > 0 GROUP BY t1.s, t1.id HAVING t1.s IS NOT NULL AND COUNT(*) > 1 ORDER BY 1, 2",
+            "SELECT t1.id, t1.s, t1.m, COUNT(t2.id) FROM t1 LEFT JOIN t2 ON t2.t1_id = t1.id GROUP BY t1.id, t1.s, t1.m ORDER BY 4 DESC, 1 LIMIT 25",
+            "SELECT t1.id, UPPER(t1.s) AS sa, t1.a * 2, SUM(t2.x) FROM t1 JOIN t2 ON t2.t1_id = t1.id GROUP BY t1.id, sa, t1.a * 2, t1.a ORDER BY t1.id LIMIT 40",
+            "SELECT t2.id, t2.s2, t1.s, t1.id FROM t2 JOIN t1 ON t1.id = t2.t1_id GROUP BY t2.id, t2.s2, t1.s, t1.id ORDER BY t2.id LIMIT 30"):
+    g.execute(sql)
+    MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 
 INT_COLS = {"t1": ["a", "b", "id"], "t2": ["x", "t1_id", "id"]}
 NUM_COLS = {"t1": ["c", "m"], "t2": []}

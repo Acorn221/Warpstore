@@ -9395,6 +9395,12 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
               pc.emit(OP_CONST, pc.constant(pow10i(r.decScale)), 1);
               pc.emit(OP_DIV, 0, -1);
             }
+            // No non-NULL value in the group: NULL (the slot holds the accumulator's start value):
+            // + 0 / count, NaN when the count is 0.
+            pc.emit(OP_CONST, pc.constant(0.0), 1);
+            pc.emit(OP_COL, nk + r.cntSlot, 1);
+            pc.emit(OP_DIV, 0, -1);
+            pc.emit(OP_ADD, 0, -1);
           }
           return true;
         }
@@ -11801,6 +11807,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
   s.where = factorOr(s.where);
   for (auto& j : s.joinConds) j = factorOr(j);
   rewriteSumOffsets(s);
+  dropDependentKeys(s);
   auto savedCtes = q.ctes;
   struct Restore {
     QueryCtx& q;
@@ -13270,6 +13277,157 @@ ResultSet Engine::showPipelines() {
 // ranges are known are packed into one BIGINT key (each value's offset from its minimum, NULL as one
 // more value, times the product of the ranges before it); select list, HAVING and ORDER BY read them
 // back from it. False if that doesn't bring the keys down to kMaxKeys.
+// GROUP BY keys determined by other keys (functional dependencies): a table's columns by its primary
+// key, and a column by one it equals in WHERE / inner-join conditions. They are dropped from GROUP BY
+// and read as MIN(col) (one value per group): GROUP BY c_custkey, c_name, n_name .. groups on the key
+// alone (fewer keys: cheaper hashing, a dense key range, no compile-only plans).
+void Engine::dropDependentKeys(Stmt& s) {
+  if (s.groupBy.size() < 2 || !s.groupingSets.empty() || s.from.empty()) return;
+  for (auto& it : s.items)
+    if (it.e->kind == Expr::STAR || it.e->window) return;
+  struct T {
+    std::shared_ptr<Table> t;
+    std::string alias;
+  };
+  std::vector<T> tabs;
+  for (auto& f : s.from) {
+    T x;
+    if (!f.sub && !f.tvf) x.t = cat_.find(f.name.find('.') == std::string::npos ? currentDb() + "." + f.name : f.name);
+    x.alias = f.alias.empty() ? f.name : f.alias;
+    tabs.push_back(x);
+  }
+  using TC = std::pair<int, int>;
+  auto colOf = [&](const ExprP& e) -> TC {  // a plain column of a FROM table, or (-1, -1)
+    if (!e || e->kind != Expr::COL) return {-1, -1};
+    TC r{-1, -1};
+    for (size_t i = 0; i < tabs.size(); ++i) {
+      if (!e->table.empty() && strcasecmp(e->table.c_str(), tabs[i].alias.c_str()) != 0) continue;
+      if (!tabs[i].t) {
+        if (e->table.empty()) return {-1, -1};  // (a derived table might have it: ambiguous)
+        continue;
+      }
+      const int c = tabs[i].t->colIndex(e->name);
+      if (c < 0) continue;
+      if (r.first >= 0) return {-1, -1};  // ambiguous
+      r = {(int)i, c};
+    }
+    return r;
+  };
+  auto resolve = [&](const ExprP& g) -> ExprP {  // GROUP BY 2 / GROUP BY alias
+    if (g->kind == Expr::LIT && g->lit.kind == Value::INT && g->lit.i >= 1 && g->lit.i <= (int64_t)s.items.size()) return s.items[g->lit.i - 1].e;
+    if (g->kind == Expr::COL && g->table.empty())
+      for (auto& it : s.items)
+        if (!it.alias.empty() && strcasecmp(it.alias.c_str(), g->name.c_str()) == 0) return it.e;
+    return g;
+  };
+  std::vector<TC> key(s.groupBy.size());
+  bool anyPk = false;
+  for (size_t i = 0; i < s.groupBy.size(); ++i) key[i] = colOf(resolve(s.groupBy[i]));
+  for (auto& x : tabs) anyPk = anyPk || (x.t && !x.t->pkCols.empty());
+  if (!anyPk) return;
+  // Equalities between columns: WHERE and inner-join conditions (top-level AND).
+  std::vector<std::pair<TC, TC>> eqs;
+  std::function<void(const ExprP&)> conj = [&](const ExprP& x) {
+    if (!x) return;
+    if (x->kind == Expr::BIN && x->op == "AND") { conj(x->args[0]); conj(x->args[1]); return; }
+    if (x->kind == Expr::BIN && x->op == "=") {
+      const TC a = colOf(x->args[0]), b = colOf(x->args[1]);
+      if (a.first >= 0 && b.first >= 0) eqs.push_back({a, b});
+    }
+  };
+  conj(s.where);
+  for (auto& j : s.joinConds) conj(j);
+  for (size_t i = 0; i < s.from.size(); ++i)
+    if (s.from[i].join == 0) conj(s.from[i].on);
+  auto closure = [&](const std::vector<bool>& use) {
+    std::set<TC> d;
+    std::vector<bool> full(tabs.size());
+    for (size_t i = 0; i < key.size(); ++i)
+      if (use[i] && key[i].first >= 0) d.insert(key[i]);
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto& [a, b] : eqs) {
+        if (d.count(a) && d.insert(b).second) changed = true;
+        if (d.count(b) && d.insert(a).second) changed = true;
+      }
+      for (size_t t = 0; t < tabs.size(); ++t) {
+        if (full[t] || !tabs[t].t || tabs[t].t->pkCols.empty()) continue;
+        bool all = true;
+        for (int c : tabs[t].t->pkCols) all = all && d.count({(int)t, c});
+        if (!all) continue;
+        full[t] = true;
+        changed = true;
+        for (int c = 0; c < (int)tabs[t].t->cols.size(); ++c) d.insert({(int)t, c});
+      }
+    }
+    return d;
+  };
+  std::vector<bool> use(key.size(), true);
+  int dropped = 0;
+  for (size_t i = key.size(); i-- > 0;) {
+    if (key[i].first < 0) continue;
+    use[i] = false;
+    if (closure(use).count(key[i])) ++dropped;
+    else use[i] = true;
+  }
+  if (!dropped) return;
+  int aggs = dropped;
+  std::function<void(const ExprP&)> countAggs = [&](const ExprP& x) {
+    if (!x) return;
+    if (x->kind == Expr::FUNC && (isAggName(x->op) || isHostAggName(x->op))) { aggs += 1 + (x->op == "AVG"); return; }
+    for (auto& a : x->args) countAggs(a);
+  };
+  for (auto& it : s.items) countAggs(it.e);
+  countAggs(s.having);
+  if (aggs > kInterpAggs - 2) return;
+  std::set<TC> gone;
+  for (size_t i = 0; i < key.size(); ++i)
+    if (!use[i]) gone.insert(key[i]);
+  for (size_t i = 0; i < key.size(); ++i)
+    if (use[i]) gone.erase(key[i]);  // (a repeated key: still grouped on)
+  bool mixed = false;  // a kept expression key over a dropped column: left alone
+  std::function<void(const ExprP&)> refs = [&](const ExprP& x) {
+    if (!x || mixed) return;
+    if (x->kind == Expr::COL && gone.count(colOf(x))) mixed = true;
+    for (auto& a : x->args) refs(a);
+  };
+  for (size_t i = 0; i < key.size(); ++i)
+    if (use[i] && key[i].first < 0) refs(resolve(s.groupBy[i]));
+  if (mixed) return;
+  for (size_t i = 0; i < key.size(); ++i)
+    if (use[i]) s.groupBy[i] = cloneExpr(resolve(s.groupBy[i]));  // (an alias / ordinal: its item is rewritten below)
+  std::function<void(ExprP&)> wrap = [&](ExprP& x) {
+    if (!x || x->kind == Expr::SUBQUERY || x->sub) return;
+    if (x->kind == Expr::FUNC && (isAggName(x->op) || isHostAggName(x->op))) return;
+    if (x->kind == Expr::COL && gone.count(colOf(x))) {
+      auto m = std::make_shared<Expr>();
+      m->kind = Expr::FUNC;
+      m->op = "MIN";
+      m->args = {x};
+      x = m;
+      return;
+    }
+    for (auto& a : x->args) wrap(a);
+  };
+  for (auto& it : s.items) {
+    const std::string before = it.e->str(), name = it.e->kind == Expr::COL ? it.e->name : before;
+    wrap(it.e);
+    if (it.alias.empty() && it.e->str() != before) it.alias = name;  // (the output column keeps its name)
+  }
+  wrap(s.having);
+  for (auto& o : s.orderBy) {
+    if (o.e->kind == Expr::LIT) continue;  // ORDER BY 2
+    bool alias = false;
+    if (o.e->kind == Expr::COL && o.e->table.empty())
+      for (auto& it : s.items) alias = alias || strcasecmp(it.alias.c_str(), o.e->name.c_str()) == 0;
+    if (!alias) wrap(o.e);
+  }
+  std::vector<ExprP> keep;
+  for (size_t i = 0; i < key.size(); ++i)
+    if (use[i]) keep.push_back(s.groupBy[i]);
+  s.groupBy = keep;
+}
+
 bool Engine::packGroupKeys(Stmt& s) {
   if (s.from.size() != 1 || s.from[0].sub || !s.joinConds.empty() || s.unionNext) return false;
   auto t = cat_.find(s.from[0].name.find('.') == std::string::npos ? currentDb() + "." + s.from[0].name : s.from[0].name);
