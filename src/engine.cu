@@ -4797,10 +4797,12 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
         std::lock_guard<std::mutex> g(walMu_);
         w = walOff_;
       }
-      if (w < gSnapshotTriggerBytes) continue;
+      const int64_t loaded = loadedBytes_.load();
+      if (w + loaded < gSnapshotTriggerBytes) continue;  // (a big LOAD would replay from its file copy)
       const auto t0 = Clock::now();
       try {
         writeSnapshot("", "");
+        loadedBytes_ -= loaded;
         fprintf(stderr, "[warpstore] automatic snapshot (WAL at %.0f MB) in %.0f ms, writes paused %.0f ms\n", w / 1048576.0, msSince(t0),
                 lastSnapPauseMs_.load());
       } catch (std::exception& e) {
@@ -5156,7 +5158,15 @@ int64_t Engine::replayWal(const std::string& path, bool repairTail) {
     try {
       execute(sql);
     } catch (std::exception& e) {
-      fprintf(stderr, "WAL replay error: %s\n", e.what());
+      // A statement that failed when it ran is only in the WAL if it changed rows before failing (a
+      // partial load, marked so): its replay ends in the same error. Any other error means the
+      // replay would lose data: recovery stops (WARPSTORE_REPLAY_IGNORE_ERRORS=1: go on anyway).
+      static const bool ignore = envSetting("REPLAY_IGNORE_ERRORS") != nullptr;
+      const bool expected = sql.find("-partial.") != std::string::npos;
+      fprintf(stderr, "WAL replay error%s: %s\n  in: %.300s\n", expected ? " (as when it ran)" : "", e.what(), sql.c_str());
+      if (!expected && !ignore)
+        throw std::runtime_error(std::string("WAL replay failed (") + e.what() +
+                                 "); the data dir is left untouched. WARPSTORE_REPLAY_IGNORE_ERRORS=1 starts without that statement");
     }
   };
   for (;;) {
@@ -5768,7 +5778,8 @@ static bool keyLookup(const Table& t, const ExprP& w) {
 }
 
 thread_local std::string tLoadLogPath;  // doLoad loaded a copy of the file: the WAL names the copy
-static void copyFile(const std::string& from, const std::string& to);
+static uint32_t copyFile(const std::string& from, const std::string& to);
+static uint32_t fileCrc(const std::string& path);
 static bool readFile(const std::string& path, std::string& out);
 // The statement as logged: LOAD DATA INFILE of a copy (doLoad) names the copy's path.
 static std::string loggedSql(const std::string& sql, const Stmt& s) {
@@ -5899,6 +5910,11 @@ ResultSet Engine::execute(const std::string& sql) {
     gpuTrimPool();
     // Still out of memory alone: table columns cached in VRAM make room (read over PCIe from host
     // memory meanwhile; the VRAM cache brings the hot ones back later), more each time.
+    struct Release {  // once the query is done the VRAM cache may refill (no need to wait for the hold)
+      std::atomic<int64_t>& hold;
+      bool shed = false;
+      ~Release() { if (shed) hold = 0; }
+    } release{vramHoldUntilUs_};
     for (int round = 0;; ++round) {
       try {
         return executeStmt(sql);
@@ -5908,8 +5924,9 @@ ResultSet Engine::execute(const std::string& sql) {
           throw;
         }
       }
-      vramHoldUntilUs_ = nowUs() + 30000000;  // (no promotions for a while)
-      vramBalance(std::max<int64_t>(1ll << 30, gpuVramUsed() / 2 * (round + 1)));
+      vramHoldUntilUs_ = nowUs() + 5000000;  // (no promotions meanwhile)
+      release.shed = true;
+      vramBalance((768ll << 20) << round);  // as little as needed: 768 MB, then 1.5 GB, 3 GB, 6 GB
       gpuTrimPool();
     }
   oom:
@@ -7558,8 +7575,22 @@ static bool isParquetFile(const std::string& path) {
 // LOAD DATA INFILE of a Parquet file: flat columns are decoded to typed arrays (parquetScan) and
 // appended a column at a time; nested ones go through text (parquetToTsv + the text loader). The
 // WAL names a copy of the file (it is compressed already), which replays the same way.
+// A load copy's name carries its CRC32C (checked when the WAL replays it) and "-partial" when the load
+// failed after loading rows (its replay ends in the same error): <base>-c<crc>[-partial].parquet.
+static std::string crcName(const std::string& copy, uint32_t crc, bool partial) {
+  char b[24];
+  snprintf(b, sizeof b, "-c%08x", crc);
+  const size_t dot = copy.rfind('.');
+  return copy.substr(0, dot) + b + (partial ? "-partial" : "") + copy.substr(dot);
+}
 ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const std::vector<int>& srcOf) {
   const auto t0 = Clock::now();
+  if (replaying_) {  // a copy in the data dir: unchanged since it was written?
+    static const std::regex named(R"(-c([0-9a-f]{8})(-partial)?\.parquet$)");
+    std::smatch m;
+    if (std::regex_search(s.path, m, named) && fileCrc(s.path) != (uint32_t)std::stoul(m[1].str(), nullptr, 16))
+      throw SqlError("the load copy " + s.path + " is damaged (CRC mismatch)", 1105);
+  }
   // Mapped, not read: the file stays in the page cache (no heap copy of a multi-GB file).
   struct Map {
     void* p = MAP_FAILED;
@@ -7610,8 +7641,9 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     ~FailLog() {
       if (!armed || n <= 0 || copyTo.empty()) return;
       try {  // (unwinding: never throw from here)
-        copyFile(path, copyTo);
-        tLoadLogPath = copyTo;
+        const uint32_t crc = copyFile(path, copyTo);
+        const std::string named = crcName(copyTo, crc, true);
+        if (rename(copyTo.c_str(), named.c_str()) == 0) tLoadLogPath = named;
       } catch (...) {
       }
     }
@@ -7755,8 +7787,11 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
   failLog.armed = false;
   lk.unlock();
   if (!copyTo.empty()) {
-    copyFile(s.path, copyTo);
-    tLoadLogPath = copyTo;
+    const uint32_t crc = copyFile(s.path, copyTo);
+    const std::string named = crcName(copyTo, crc, false);
+    if (rename(copyTo.c_str(), named.c_str()) != 0) throw SqlError("cannot rename " + copyTo, 1105);
+    tLoadLogPath = named;
+    loadedBytes_ += (int64_t)map.n;
   }
   warmDicts(t);
   char info[128];
@@ -7818,10 +7853,17 @@ ResultSet Engine::doLoad(Stmt& s) {
   } catch (...) {
     // Rows were loaded before the error: the statement is logged anyway (with the copy, it replays
     // to the same rows and the same error), or a restart would lose them.
-    if (loaded > 0 && !copyTo.empty() && access(copyTo.c_str(), F_OK) == 0) tLoadLogPath = copyTo;
+    if (loaded > 0 && !copyTo.empty() && access(copyTo.c_str(), F_OK) == 0) {
+      const std::string partial = copyTo.substr(0, copyTo.size() - 4) + "-partial.zst";  // (its replay fails the same way)
+      tLoadLogPath = rename(copyTo.c_str(), partial.c_str()) == 0 ? partial : copyTo;
+    }
     throw;
   }
   if (!copyTo.empty()) tLoadLogPath = copyTo;
+  {
+    struct stat st;
+    if (stat(path.c_str(), &st) == 0) loadedBytes_ += (int64_t)st.st_size;
+  }
   lk.unlock();
   warmDicts(t);
   char info[128];
@@ -14046,7 +14088,9 @@ ResultSet Engine::doSnapshot() {
   if (dir_.empty()) throw SqlError("SNAPSHOT needs a data directory (the server runs with --no-wal)", 1235);
   if (tTxn.active) commitTxn();
   const auto t0 = Clock::now();
+  const int64_t loaded = loadedBytes_.load();
   writeSnapshot("", "");
+  loadedBytes_ -= loaded;
   return okResult(0, "snapshot written in " + fmtMs(msSince(t0)) + " ms (writes paused " + fmtMs(lastSnapPauseMs_) + " ms)");
 }
 
@@ -14757,7 +14801,32 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
 std::string gWalArchive;
 int64_t gSnapshotTriggerBytes = (int64_t)256 << 20;  // (replay runs ~150K records/s: a crash costs ~20 s at most)
 
-static void copyFile(const std::string& from, const std::string& to) {
+static uint32_t fileCrc(const std::string& path) {  // CRC32C of a file's bytes (0xFFFFFFFF: unreadable)
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return 0xFFFFFFFFu;
+  std::vector<char> buf(8 << 20);
+  uint32_t c = 0;
+  for (ssize_t k; (k = ::read(fd, buf.data(), buf.size())) > 0;) c = crc32c(buf.data(), (size_t)k, c);
+  ::close(fd);
+  return c;
+}
+// Copies a file, checks the copy against the source (a damaged copy would replay to other rows) and
+// returns its CRC32C; one more attempt on a mismatch.
+static void copyFileOnce(const std::string& from, const std::string& to);
+static uint32_t copyFile(const std::string& from, const std::string& to) {
+  const uint32_t want = fileCrc(from);
+  for (int attempt = 0;; ++attempt) {
+    copyFileOnce(from, to);
+    const uint32_t got = fileCrc(to);
+    if (got == want) return got;
+    fprintf(stderr, "[warpstore] copy of %s differs from the file (CRC %08x, want %08x)%s\n", from.c_str(), got, want, attempt ? "" : ": copying again");
+    if (attempt) {
+      unlink(to.c_str());
+      throw SqlError("the copy of " + from + " kept differing from the file (memory or disk errors?)", 1105);
+    }
+  }
+}
+static void copyFileOnce(const std::string& from, const std::string& to) {
   int in = open(from.c_str(), O_RDONLY);
   if (in < 0) throw SqlError("cannot read " + from, 1105);
   int out = open((to + ".tmp").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);

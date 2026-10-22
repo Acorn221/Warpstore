@@ -1614,9 +1614,14 @@ int64_t Table::loadFile(const std::string& path, char delim, int64_t skip, std::
       LoadPiece& pc = ch.pieces[i];
       parse(pc);
       if (out) {
-        thread_local ZSTD_CCtx* cc = ZSTD_createCCtx();
+        thread_local ZSTD_CCtx* cc = [] {  // (frames with checksums: a damaged copy fails at replay, not loads other rows)
+          ZSTD_CCtx* c = ZSTD_createCCtx();
+          ZSTD_CCtx_setParameter(c, ZSTD_c_compressionLevel, 1);
+          ZSTD_CCtx_setParameter(c, ZSTD_c_checksumFlag, 1);
+          return c;
+        }();
         pc.z.resize(ZSTD_compressBound(pc.e - pc.zb));
-        const size_t k = ZSTD_compressCCtx(cc, pc.z.data(), pc.z.size(), pc.zb, pc.e - pc.zb, 1);
+        const size_t k = ZSTD_compress2(cc, pc.z.data(), pc.z.size(), pc.zb, pc.e - pc.zb);
         pc.z.resize(ZSTD_isError(k) ? 0 : k);
         if (ZSTD_isError(k)) pc.failed = true, pc.msg = "cannot compress the load copy", pc.code = 1105;
       }

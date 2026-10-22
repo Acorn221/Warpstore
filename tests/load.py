@@ -248,4 +248,26 @@ c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big",
 c.eq("Parquet tables after replay", pq_got(), pq_before)
 c.eq("pk table after replay", q("SELECT COUNT(*), MAX(id), SUM(score) FROM pk"), [(50000, 50000, 3 * 49999 * 50000 // 2)])
 srv.stop()
+
+# 9) A damaged load copy (one flipped byte) is refused at replay, not loaded as other rows; the
+# escape hatch starts without it.
+copies = sorted(f for f in os.listdir(loads) if f.endswith(".parquet") and "-partial" not in f)
+c.check("load copies carry their CRC", copies and all("-c" in f for f in copies), copies)
+victim = os.path.join(loads, copies[0])
+with open(victim, "r+b") as fh:
+    fh.seek(os.path.getsize(victim) // 2)
+    b = fh.read(1)
+    fh.seek(-1, 1)
+    fh.write(bytes([b[0] ^ 0x20]))
+try:
+    srv.start(timeout=120)
+    c.check("damaged load copy refused", False, "server started")
+    srv.stop()
+except RuntimeError as e:
+    c.check("damaged load copy refused", "CRC mismatch" in str(e) or "replay failed" in str(e), str(e)[-300:])
+os.environ["WARPSTORE_REPLAY_IGNORE_ERRORS"] = "1"
+srv.start()
+del os.environ["WARPSTORE_REPLAY_IGNORE_ERRORS"]
+c.check("starts with WARPSTORE_REPLAY_IGNORE_ERRORS=1", True)
+srv.stop()
 c.done()

@@ -136,6 +136,7 @@ class Engine {
   std::atomic<bool> recovered_{false};
   std::mutex snapMu_;  // one snapshot at a time
   std::atomic<double> lastSnapPauseMs_{0};  // how long the last snapshot held the tables
+  std::atomic<int64_t> loadedBytes_{0};     // file bytes LOADed since the last snapshot (counted with the WAL for the trigger)
   std::string dir_;
   FILE* wal_ = nullptr;
   std::mutex walMu_;
