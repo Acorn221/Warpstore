@@ -10,6 +10,7 @@
 //     on the shard keys of two tables run partition by partition (co-located joins).
 #pragma once
 #include <memory>
+#include <cstring>
 #include <map>
 #include <thread>
 #include <functional>
@@ -50,6 +51,55 @@ struct ColumnMeta {
 bool parseVector(const std::string& s, std::vector<float>& out);
 bool parseDecimal(const char* b, const char* e, int scale, int64_t& out);
 std::string formatVector(const float* v, int dim);
+
+// wyhash (final version 4, public domain): a fast 64-bit string hash for in-memory tables (nothing
+// stored on disk depends on it).
+inline uint64_t wyMix(uint64_t a, uint64_t b) {
+  const __uint128_t r = (__uint128_t)a * b;
+  return (uint64_t)r ^ (uint64_t)(r >> 64);
+}
+inline uint64_t wyHash(const void* key, size_t len) {
+  auto r8 = [](const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v; };
+  auto r4 = [](const uint8_t* p) { uint32_t v; memcpy(&v, p, 4); return (uint64_t)v; };
+  const uint8_t* p = (const uint8_t*)key;
+  const uint64_t s0 = 0xa0761d6478bd642full, s1 = 0xe7037ed1a0b428dbull, s2 = 0x8ebc6af09c88c6e3ull, s3 = 0x589965cc75374cc3ull;
+  uint64_t seed = wyMix(s0, s1), a, b;
+  if (len <= 16) {
+    if (len >= 4) {
+      a = (r4(p) << 32) | r4(p + ((len >> 3) << 2));
+      b = (r4(p + len - 4) << 32) | r4(p + len - 4 - ((len >> 3) << 2));
+    } else if (len > 0) {
+      a = ((uint64_t)p[0] << 16) | ((uint64_t)p[len >> 1] << 8) | p[len - 1];
+      b = 0;
+    } else {
+      a = b = 0;
+    }
+  } else {
+    size_t i = len;
+    if (i > 48) {
+      uint64_t see1 = seed, see2 = seed;
+      do {
+        seed = wyMix(r8(p) ^ s1, r8(p + 8) ^ seed);
+        see1 = wyMix(r8(p + 16) ^ s2, r8(p + 24) ^ see1);
+        see2 = wyMix(r8(p + 32) ^ s3, r8(p + 40) ^ see2);
+        p += 48;
+        i -= 48;
+      } while (i > 48);
+      seed ^= see1 ^ see2;
+    }
+    while (i > 16) {
+      seed = wyMix(r8(p) ^ s1, r8(p + 8) ^ seed);
+      i -= 16;
+      p += 16;
+    }
+    a = r8(p + i - 16);
+    b = r8(p + i - 8);
+  }
+  a ^= s1;
+  b ^= seed;
+  const __uint128_t r = (__uint128_t)a * b;
+  return wyMix((uint64_t)r ^ s0 ^ len, (uint64_t)(r >> 64) ^ s1);
+}
 
 struct SvHash {
   using is_transparent = void;
@@ -250,7 +300,7 @@ struct Dict {
     return ++n;
   }
   static uint32_t hash32(std::string_view s) {
-    const uint64_t h = std::hash<std::string_view>{}(s);
+    const uint64_t h = wyHash(s.data(), s.size());
     return (uint32_t)(h ^ (h >> 32));
   }
   int32_t lookup(std::string_view s, uint32_t h) const {  // (mapMu held)
