@@ -7344,8 +7344,18 @@ static int64_t insertColumns(Table& t, const std::vector<int>& map, const Result
       };
       if (st == LType::VARCHAR && cm.lt == LType::VARCHAR && r.colDicts[i]) {
         const Dict& sd = *r.colDicts[i];
-        std::vector<int32_t> code(sd.strs.size(), -1);
         Dict& td = *t.dicts[c];
+        // the distinct source strings in order of first appearance, coded in one batch
+        std::vector<int32_t> code(sd.strs.size(), -1);
+        std::vector<std::string_view> firsts;
+        for (int64_t k = 0; k < n; ++k) {
+          const double x = r.numCols[i][k];
+          if (x != x) continue;
+          int32_t& m = code.at((size_t)x);
+          if (m == -1) m = -2 - (int32_t)firsts.size(), firsts.push_back(sd.strs[(size_t)x]);
+        }
+        std::vector<int64_t> fc(firsts.size());
+        td.getOrAddMany(firsts.data(), firsts.size(), fc.data(), kNullI32);
         for (int64_t k = 0; k < n; ++k) {
           const double x = r.numCols[i][k];
           if (x != x) {
@@ -7353,10 +7363,7 @@ static int64_t insertColumns(Table& t, const std::vector<int>& map, const Result
             iv[c][k] = kNullI32;
             continue;
           }
-          const size_t sc = (size_t)x;
-          int32_t& m = code.at(sc);
-          if (m < 0) m = td.getOrAdd(sd.strs[sc]);
-          iv[c][k] = m;
+          iv[c][k] = fc[(size_t)(-2 - code[(size_t)x])];
         }
       } else if (!r.intCols[i].empty() && st == cm.lt && cm.pt == PType::I64) {  // BIGINT / DATETIME as is
         for (int64_t k = 0; k < n; ++k) {
