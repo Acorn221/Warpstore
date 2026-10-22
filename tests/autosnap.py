@@ -1,0 +1,41 @@
+# Automatic snapshots (--snapshot-trigger-mb): the WAL is checkpointed while writes go on, it stays
+# small, and a kill -9 afterwards recovers every committed row.
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib import Checker, Server
+
+c = Checker()
+srv = Server("--snapshot-trigger-mb", "2", name="autosnap", http=False).start()
+cur = srv.cursor()
+cur.execute("CREATE DATABASE a")
+cur.execute("USE a")
+cur.execute("CREATE TABLE t (id INT PRIMARY KEY, s VARCHAR(40), v BIGINT)")
+cur.execute("CREATE TABLE u (k INT, s VARCHAR(40))")
+n = 0
+t0 = time.time()
+while time.time() - t0 < 8:
+    cur.execute("INSERT INTO t VALUES " + ",".join(f"({n + i}, 'row {n + i} {'x' * (i % 30)}', {(n + i) * 3})" for i in range(500)))
+    cur.execute("INSERT INTO u VALUES " + ",".join(f"({i}, 'u{(n + i) % 1000}')" for i in range(500)))
+    if n % 5000 == 0:
+        cur.execute(f"UPDATE t SET v = v + 1 WHERE id % 7 = 0 AND id >= {n - 5000}")
+        cur.execute(f"DELETE FROM u WHERE k % 9 = 0 AND k < 100")
+    n += 500
+log = open(srv.log).read()
+snaps = log.count("automatic snapshot (")
+c.check("automatic snapshots ran while writing", snaps >= 2, f"{snaps} snapshots, {n} rows")
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t")
+want = [tuple(r) for r in cur.fetchall()]
+cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u")
+want_u = [tuple(r) for r in cur.fetchall()]
+srv.kill()
+srv.start()
+cur = srv.cursor()
+replayed = [l for l in open(srv.log) if "replayed" in l]
+c.check("restart replays only the WAL since the last snapshot", replayed and int(replayed[-1].split()[2]) < n // 500, replayed)
+cur.execute("USE a")
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t")
+c.eq("rows after kill -9", [tuple(r) for r in cur.fetchall()], want)
+cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u")
+c.eq("second table after kill -9", [tuple(r) for r in cur.fetchall()], want_u)
+srv.stop()
+c.done()

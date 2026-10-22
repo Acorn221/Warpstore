@@ -4047,6 +4047,27 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
       try { vramBalance(); } catch (...) {}
     }
   });
+  maintTh_ = std::thread([this] {
+    while (!vramStop_) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (!recovered_ || dir_.empty() || isReplica_ || gSnapshotTriggerBytes <= 0) continue;
+      int64_t w;
+      {
+        std::lock_guard<std::mutex> g(walMu_);
+        w = walOff_;
+      }
+      if (w < gSnapshotTriggerBytes) continue;
+      const auto t0 = Clock::now();
+      try {
+        writeSnapshot("", "");
+        fprintf(stderr, "[warpstore] automatic snapshot (WAL at %.0f MB) in %.0f ms, writes paused %.0f ms\n", w / 1048576.0, msSince(t0),
+                lastSnapPauseMs_.load());
+      } catch (std::exception& e) {
+        fprintf(stderr, "[warpstore] automatic snapshot failed: %s\n", e.what());
+        for (int i = 0; i < 60 && !vramStop_; ++i) std::this_thread::sleep_for(std::chrono::seconds(1));  // (retry in a minute)
+      }
+    }
+  });
   flushTh_ = std::thread([this] {  // async durability: everything committed is on disk within ~interval
     const int ms = envSetting("FLUSH_MS") ? std::max(1, atoi(envSetting("FLUSH_MS"))) : 10;
     while (!vramStop_) {
@@ -4309,6 +4330,7 @@ void Engine::vramBalance() {
 Engine::~Engine() {
   vramStop_ = true;
   if (vramTh_.joinable()) vramTh_.join();
+  if (maintTh_.joinable()) maintTh_.join();
   if (flushTh_.joinable()) flushTh_.join();
   if (wal_) {
     fflush(wal_);
@@ -4632,6 +4654,7 @@ void Engine::recover() {
   }
   for (auto& p : resume) startPipeline(p);
   if (!wal_) fprintf(stderr, "[warpstore] warning: cannot open WAL %s\n", path.c_str());
+  recovered_ = true;
 }
 
 // Per-connection transaction: writes are visible immediately (read uncommitted), WAL records are
@@ -11750,8 +11773,9 @@ bool getVal(FILE* f, Value& v) {
 ResultSet Engine::doSnapshot() {
   if (dir_.empty()) throw SqlError("SNAPSHOT needs a data directory (the server runs with --no-wal)", 1235);
   if (tTxn.active) commitTxn();
+  const auto t0 = Clock::now();
   writeSnapshot("", "");
-  return okResult(0, "snapshot written");
+  return okResult(0, "snapshot written in " + fmtMs(msSince(t0)) + " ms (writes paused " + fmtMs(lastSnapPauseMs_) + " ms)");
 }
 
 // Columnar table image: dictionaries, NULL flags, then per partition the live rows' physical column
@@ -12037,7 +12061,9 @@ FILE* zstdWriter(FILE* raw) {
   ZSTD_CCtx_setParameter(z->c, ZSTD_c_compressionLevel, 3);
   ZSTD_CCtx_setParameter(z->c, ZSTD_c_nbWorkers, 4);
   cookie_io_functions_t io{nullptr, zwWrite, nullptr, zwClose};
-  return fopencookie(z, "w", io);
+  FILE* f = fopencookie(z, "w", io);
+  if (f) setvbuf(f, nullptr, _IOFBF, 1 << 20);
+  return f;
 }
 struct ZR {
   FILE* raw;
@@ -12088,7 +12114,14 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     for (auto& [k, v] : cat_.views)
       if (onlyDb.empty() || k.rfind(lower(onlyDb) + ".", 0) == 0) views[k] = v;
   }
+  std::lock_guard<std::mutex> snapGuard(snapMu_);
   const bool v4 = outPath.empty() && tierEnabled();  // snapshot.bin: segments by reference (their files)
+  if (v4)  // big write buffers become segments first, so they too are written outside the pause below
+    for (auto& t : tabs) {
+      std::unique_lock<FairSharedMutex> lk(t->mu);
+      for (int p = 0; p < t->nparts; ++p)
+        if (t->bufs[p]->n - t->bufs[p]->ndel() >= 65536) t->flushPart(p);
+    }
   if (v4)  // write the files first, without quiescing anything (segment data is immutable)
     for (auto& t : tabs) {
       std::vector<std::shared_ptr<Segment>> segs;
@@ -12100,6 +12133,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n, t->sortKey));
     }
   std::vector<uint64_t> refs;
+  const auto pause0 = Clock::now();
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
   std::sort(tabs.begin(), tabs.end());
   for (auto& t : tabs) locks.emplace_back(t->mu);
@@ -12189,10 +12223,12 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     archiveWal(dir_ + "/wal.old");
     archiveLoads(walGen_);
   }
+  lastSnapPauseMs_ = msSince(pause0);
   (void)rows;
 }
 
 std::string gWalArchive;
+int64_t gSnapshotTriggerBytes = (int64_t)1 << 30;
 
 static void copyFile(const std::string& from, const std::string& to) {
   int in = open(from.c_str(), O_RDONLY);

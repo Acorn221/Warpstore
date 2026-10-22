@@ -1417,6 +1417,7 @@ int main(int argc, char** argv) {
     else if (a == "--plancache-dir" && i + 1 < argc) planCacheDir = argv[++i], planCacheDirSet = true;
     else if (a == "--vram-limit" && i + 1 < argc) gpuSetVramLimit((int64_t)(atof(argv[++i]) * (1ll << 30)));
     else if (a == "--memory-limit" && i + 1 < argc) memLimitGb = atof(argv[++i]);
+    else if (a == "--snapshot-trigger-mb" && i + 1 < argc) gSnapshotTriggerBytes = (int64_t)(atof(argv[++i]) * 1048576);
     else if (a == "--http-port" && i + 1 < argc) httpPort = atoi(argv[++i]);
     else if (a == "--data-port" && i + 1 < argc) gDataPort = atoi(argv[++i]);
     else if (a == "--replica-of" && i + 1 < argc) replicaOf = argv[++i];
@@ -1444,7 +1445,7 @@ int main(int argc, char** argv) {
     else if (a == "--max-connections" && i + 1 < argc) g_maxConns = atoi(argv[++i]);
     else if (a == "--insecure-no-root-password") insecure = true;
     else {
-      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--memory-limit GB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [--insecure-no-root-password] [--sync-replica-timeout-ms N] [-v]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--port N] [--data-dir DIR | --no-wal] [--sync-durability] [--wal-archive DIR] [--slow-query-ms N] [--slow-log FILE] [--partitions N] [--codegen on|sync|off] [--plancache-dir DIR|\"\"] [--vram-limit GB] [--memory-limit GB] [--snapshot-trigger-mb MB] [--compress | --no-compress] [--http-port N] [--data-port N] [--replica-of http://user:pw@primary:httpport [--failover-timeout S]] [--sync-replicas N] [--leaves http://leaf1:httpport,..] [--redundancy 2] [--bind ADDR] [--root-password PW] [--tls-cert F --tls-key F | --no-tls] [--require-secure-transport] [--max-connections N] [--insecure-no-root-password] [--sync-replica-timeout-ms N] [-v]\n", argv[0]);
       return 2;
     }
   }

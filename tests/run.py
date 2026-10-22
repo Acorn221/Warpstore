@@ -99,6 +99,7 @@ TESTS = [
     ("observability", "observability.py", None, True),
     ("crash", "crash.py", None, True),
     ("load", "load.py", None, True),
+    ("autosnap", "autosnap.py", None, True),
     ("tier", "tier.py", None, True),
     ("backup", "backup.py", None, True),
     ("replication", "replication.py", None, True),

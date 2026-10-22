@@ -74,6 +74,7 @@ extern thread_local bool tLocalInfile;
 // Set while the server describes a prepared statement: SELECTs return their columns without rows.
 extern thread_local bool tDescribeOnly;
 extern std::string gWalArchive;
+extern int64_t gSnapshotTriggerBytes;  // --snapshot-trigger-mb: automatic SNAPSHOT when the WAL is this big (0: never)
 extern int gSyncReplicas;             // --sync-replicas N: commits wait for N replicas
 extern int gSyncReplicaTimeoutMs;     // ... at most this long, then go on (logged)
 extern double gFailoverTimeoutS;      // replica: --failover-timeout S: promote itself after S s without the primary  // --wal-archive: rotated-out WALs (and loaded files) are kept here
@@ -128,6 +129,11 @@ class Engine {
   void tierBalance();  // host memory vs the segment files (--memory-limit)
   std::atomic<bool> vramStop_{false};
   std::thread vramTh_;
+  // Maintenance: an automatic SNAPSHOT once the WAL passes gSnapshotTriggerBytes (after recovery).
+  std::thread maintTh_;
+  std::atomic<bool> recovered_{false};
+  std::mutex snapMu_;  // one snapshot at a time
+  std::atomic<double> lastSnapPauseMs_{0};  // how long the last snapshot held the tables
   std::string dir_;
   FILE* wal_ = nullptr;
   std::mutex walMu_;

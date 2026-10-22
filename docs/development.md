@@ -22,6 +22,7 @@ with data dirs for the rest) and skips what the machine can't run:
 | mvcc | writers don't wait for a slow reader, consistent reads under concurrent transfers, flush / DROP / dictionary growth under a reader |
 | crash | `kill -9` during transfers, inserts and snapshots: every acknowledged write survives, sums stay exact |
 | load | parallel LOAD DATA over several chunks with a mid-chunk flush, primary key / AUTO_INCREMENT, shard keys, CSV quoting, ESCAPED BY, error lines, zstd input, crash replay of the compressed copies |
+| autosnap | automatic snapshots while writes run (`--snapshot-trigger-mb`), short replay and no lost rows after kill -9 |
 | backup | full restore, restore under another name, point-in-time restore over a WAL rotation, S3, deleted LOAD DATA files |
 | replication | WAL-tailing replica, primary restart, semi-sync read-your-writes, automatic failover, replica of the promoted primary |
 | observability | processlist, KILL, query stats, slow log, /metrics |
