@@ -19,7 +19,7 @@ queries; the other 8 differ only in the order of tied rows. SingleStore was meas
 
 | System | Version / setup | All 43 queries, hot | All 43, first run | Warpstore faster, hot (geomean) | Warpstore faster, first run (geomean) | Queries Warpstore wins (hot) |
 |---|---|---:|---:|---:|---:|---:|
-| **Warpstore** | RTX 3080 10 GB | **0.18 s** | **1.69 s** (1.3 s with a cold plan cache) | — | — | — |
+| **Warpstore** | RTX 3080 10 GB | **0.17 s** | **1.28 s** | — | — | — |
 | DuckDB | 1.5.6, 12 threads | 6.20 s | 6.90 s | 15.0x | 6.3x | 42 / 43 |
 | ClickHouse | 25.8, 12 threads, ClickBench schema, Docker | 9.54 s | 11.18 s | 26.7x | 10.4x | 43 / 43 |
 | SingleStore | 9.1 free dev image, 8 threads, Docker | 30.07 s | 49.61 s | 96.8x | 84.6x | 43 / 43 |
@@ -124,7 +124,7 @@ doesn't fit in VRAM](#when-the-data-doesnt-fit-in-vram)) and be slower than the 
 | System | Hardware | Rows | All 43 queries, hot | All 43, cold run (ClickBench: includes reading from disk) / first run | Per query vs Warpstore (scaled to 100M rows) |
 |---|---|---:|---:|---:|---:|
 | Sirius (2026-03-09) | NVIDIA H100 (AWS p5.4xlarge) | 100M | 1.50 s | 977.92 s | 0.49x Warpstore's time |
-| Warpstore | RTX 3080 10 GB | 10M | 0.18 s | 1.69 s | — (x10 rows: 1.8 s hot) |
+| Warpstore | RTX 3080 10 GB | 10M | 0.17 s | 1.28 s | — (x10 rows: 1.8 s hot) |
 
 **Caveats.** 10M rows favour engines with low per-query overhead; at 100M rows on this GPU Warpstore
 would use its host-memory tier and lose some of its lead. DuckDB, ClickHouse and MySQL ran with their

@@ -10,7 +10,7 @@ with point-in-time restore, MVCC.
 
 | ClickBench, all 43 queries (10M rows, hot) | Total time | Warpstore is faster by |
 |---|---:|---:|
-| **Warpstore** (one RTX 3080) | **0.18 s** | — |
+| **Warpstore** (one RTX 3080) | **0.17 s** | — |
 | DuckDB 1.5.6 | 6.2 s | **15x** |
 | ClickHouse 25.8 | 9.5 s | **27x** |
 | SingleStore 9.1 | 30.1 s | **97x** |
