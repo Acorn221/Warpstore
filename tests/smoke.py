@@ -55,4 +55,6 @@ want = sorted(want.items()) + [(None, 1)]
 got = q("SELECT DATE_FORMAT(t, '%Y/%m/%d %H:%i') k, COUNT(*) FROM smoke2.ts GROUP BY k ORDER BY k IS NULL, k")
 c.eq("GROUP BY DATE_FORMAT", got, want)
 cur.execute("DROP DATABASE smoke2")
+c.eq("NULL-safe equality", q("SELECT 1 <=> 1, NULL <=> NULL, 1 <=> NULL, 1 IS NOT DISTINCT FROM 1, NULL IS DISTINCT FROM NULL, 2 IS DISTINCT FROM NULL"),
+     [(1, 1, 0, 1, 0, 1)])
 c.done()

@@ -216,7 +216,7 @@ std::vector<Tok> lex(const std::string& s) {
       out.push_back({q == '`' ? Tok::QID : Tok::STR, v});
       continue;
     }
-    static const char* three[] = {"<*>", "<->", "->>"};
+    static const char* three[] = {"<*>", "<->", "->>", "<=>"};
     bool matched = false;
     for (auto t : three)
       if (s.compare(i, 3, t) == 0) { out.push_back({Tok::SYM, t}); i += 3; matched = true; break; }
@@ -292,9 +292,34 @@ struct Parser {
     }
     return cmpExpr();
   }
+  static ExprP copyExpr(const ExprP& e) {  // (a deep copy: binding changes nodes in place)
+    if (!e) return e;
+    auto y = std::make_shared<Expr>(*e);
+    for (auto& a : y->args) a = copyExpr(a);
+    return y;
+  }
+  // a <=> b (NULL-safe equality): COALESCE(a = b, a IS NULL AND b IS NULL)
+  static ExprP nullSafeEq(const ExprP& a, const ExprP& b) {
+    auto isnull = [](ExprP x) {
+      auto e = std::make_shared<Expr>();
+      e->kind = Expr::FUNC;
+      e->op = "ISNULL";
+      e->args = {x};
+      return e;
+    };
+    auto co = std::make_shared<Expr>();
+    co->kind = Expr::FUNC;
+    co->op = "COALESCE";
+    co->args = {mkBin("=", a, b), mkBin("AND", isnull(copyExpr(a)), isnull(copyExpr(b)))};
+    return co;
+  }
   ExprP cmpExpr() {
     ExprP l = addExpr();
     for (;;) {
+      if (acceptSym("<=>")) {
+        l = nullSafeEq(l, addExpr());
+        continue;
+      }
       static const char* ops[] = {"=", "<>", "!=", "<=", ">=", "<", ">"};
       bool done = true;
       for (auto o : ops)
@@ -304,8 +329,22 @@ struct Parser {
           break;
         }
       if (!done) continue;
-      if (acceptKw("IS")) {  // IS [NOT] NULL / TRUE / FALSE
+      if (acceptKw("IS")) {  // IS [NOT] NULL / TRUE / FALSE / DISTINCT FROM
         bool n = acceptKw("NOT");
+        if (acceptKw("DISTINCT")) {
+          expectKw("FROM");
+          ExprP eq = nullSafeEq(l, addExpr());
+          if (n) {
+            l = eq;
+          } else {
+            auto nt = std::make_shared<Expr>();
+            nt->kind = Expr::UNARY;
+            nt->op = "NOT";
+            nt->args = {eq};
+            l = nt;
+          }
+          continue;
+        }
         auto e = std::make_shared<Expr>();
         e->kind = Expr::FUNC;
         if (acceptKw("NULL")) {
