@@ -266,13 +266,14 @@ inline std::pair<std::shared_ptr<const std::vector<int32_t>>, std::shared_ptr<st
   std::vector<uint64_t> key(n);
   auto chunk = [&](int32_t i, size_t off) {
     const std::string_view s = d.strs[i];
-    uint64_t p = 0;
-    for (size_t k = off; k < off + 8; ++k) {
-      unsigned char ch = k < s.size() ? (unsigned char)s[k] : 0;
-      if (fold && ch - 'A' < 26u) ch |= 0x20;  // (tolower in the C locale, inline)
-      p = (p << 8) | ch;
-    }
-    return p;
+    unsigned char b[8] = {0, 0, 0, 0, 0, 0, 0, 0};  // bytes off..off+7, zero-padded, big-endian
+    if (off < s.size()) memcpy(b, s.data() + off, std::min<size_t>(8, s.size() - off));
+    if (fold)
+      for (unsigned char& ch : b)
+        if (ch - 'A' < 26u) ch |= 0x20;  // (tolower in the C locale, inline)
+    uint64_t p;
+    memcpy(&p, b, 8);
+    return __builtin_bswap64(p);
   };
   auto byKey = [&](int32_t a, int32_t b) { return key[a] != key[b] ? key[a] < key[b] : a < b; };
   struct Run {

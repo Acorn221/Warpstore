@@ -1166,7 +1166,13 @@ std::shared_ptr<Segment> Table::makeSegment(int part, size_t n, const std::funct
     auto& h = seg->d->host[c];
     h.resize(n * sz);
     const uint8_t* from = src((int)c);
-    for (size_t i = 0; i < n; ++i) memcpy(&h[i * sz], from + (size_t)idx[i] * sz, sz);
+    if (sz == 8) {  // (fixed sizes: the copies inline)
+      for (size_t i = 0; i < n; ++i) memcpy(&h[i * 8], from + (size_t)idx[i] * 8, 8);
+    } else if (sz == 4) {
+      for (size_t i = 0; i < n; ++i) memcpy(&h[i * 4], from + (size_t)idx[i] * 4, 4);
+    } else {
+      for (size_t i = 0; i < n; ++i) memcpy(&h[i * sz], from + (size_t)idx[i] * sz, sz);
+    }
     colStats((int)c, h, (int64_t)n, seg->d->mn[c], seg->d->mx[c]);
     seg->d->enc[c] = encodeColumn((int)c, h, (int64_t)n, seg->d->encHost[c]);
   }, true);
