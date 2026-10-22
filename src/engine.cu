@@ -8309,13 +8309,28 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     tg += msSince(ph), ph = Clock::now();
     // The SET values, row by row: on all cores unless a string column is set (new strings are coded in
     // row order, as a replay of the statement codes them).
+    // MySQL evaluates single-table SETs left to right: a SET that reads a column an earlier one assigns
+    // sees the new value (then everything goes row by row, in order).
+    bool chained = false;
+    {
+      std::set<int> assigned;
+      for (auto& [c, e] : sets) {
+        std::set<std::pair<int, int>> used;
+        colsOf(e, used);
+        for (auto& [bt, bc] : used) chained = chained || (bt == 0 && assigned.count(bc));
+        assigned.insert(c);
+      }
+    }
     std::vector<std::pair<int, ExprP>> rs = sets;  // the SETs evaluated row by row
     auto setRows = [&](size_t b, size_t e, std::vector<Value>& cur, std::vector<Value>& vals, PostCtx& pc) {
       int64_t i0;
       double d0;
       for (size_t i = b; i < e; ++i) {
         for (int c : reads) cur[c] = cellValue(t, ls[i], c);
-        for (size_t j = 0; j < rs.size(); ++j) vals[j] = evalPost(rs[j].second, pc);  // (all against the old row)
+        for (size_t j = 0; j < rs.size(); ++j) {  // (left to right: a later SET reads the new values)
+          vals[j] = evalPost(rs[j].second, pc);
+          if (chained) cur[rs[j].first] = vals[j];
+        }
         for (size_t j = 0; j < rs.size(); ++j) {
           const int c = rs[j].first;
           Value& v = vals[j];
@@ -8333,6 +8348,10 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
     std::vector<std::vector<double>> fd;
     rs.clear();
     for (auto& [c, e] : sets) {
+      if (chained) {
+        rs.push_back({c, e});
+        continue;
+      }
       const ColumnMeta& cm = t.cols[c];
       std::vector<int64_t> oi;
       std::vector<double> od;
@@ -8413,6 +8432,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
           for (size_t j = 0; j < R; ++j) {
             Value v = evalPost(rs[j].second, lpc);
             if (!v.isNull() && t.cols[rs[j].first].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
+            if (chained) lcur[rs[j].first] = v;
             vb[i * R + j] = std::move(v);
           }
         }
@@ -8584,7 +8604,7 @@ ResultSet Engine::doModify(Stmt& s) {
         for (size_t ch = cb; ch < ce; ++ch)
           for (int64_t r = (int64_t)(b.n * ch / nch); r < (int64_t)(b.n * (ch + 1) / nch); ++r) {
             if (b.del->test(r)) continue;
-            if (s.where && evalProg(henv, wp, r) == 0) continue;
+            if (s.where && !truthy(evalProg(henv, wp, r))) continue;  // (NULL: not a match)
             part[ch].push_back(bufLoc(p, r));
           }
       }, 1);
@@ -8648,7 +8668,7 @@ ResultSet Engine::doModify(Stmt& s) {
       std::vector<std::string> ignored;
       embedCached(texts, ignored);
     }
-    for (const Loc& l : matched) {  // SET expressions are evaluated on the host against the old row
+    for (const Loc& l : matched) {  // SET expressions on the host, left to right (MySQL: a later one sees the new values)
       std::vector<Value> cur;
       for (size_t c = 0; c < t->cols.size(); ++c) cur.push_back(cellValue(*t, l, (int)c));
       PostCtx pc;
@@ -8659,6 +8679,7 @@ ResultSet Engine::doModify(Stmt& s) {
         Value v = evalPost(e, pc);
         if (!v.isNull() && t->cols[c].lt == LType::VARCHAR && v.kind != Value::STR) v = Value::S(v.toString());
         row[c] = v;
+        cur[c] = v;
       }
       newRows.push_back(std::move(row));
     }
@@ -10002,7 +10023,11 @@ ResultSet Engine::doSelect(Stmt& s, bool explain) {
         for (size_t k = 0; k < orderBy.size(); ++k) {
           bufs.emplace_back(m);
           gpuEvalAt(pc.env, ops[k], having ? sel.p : nullptr, m, bufs.back().p);
-          if (orderBy[k].e->ty == LType::VARCHAR) {
+          const ExprP& oe = orderBy[k].e;
+          bool rankAlready = false;  // string MIN / MAX: the slot holds a rank already (not a code)
+          if (oe->kind == Expr::FUNC && isAggName(oe->op))
+            if (auto it = aggs.find(canon(oe)); it != aggs.end() && it->second.unrank) rankAlready = true;
+          if (oe->ty == LType::VARCHAR && !rankAlready) {
             ranks.push_back(dictRankDev(*ctx.dict(*orderBy[k].e)));
             gpuMapRank(bufs.back().p, ranks.back()->p, m);
           }

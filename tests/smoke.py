@@ -82,4 +82,9 @@ c.eq("ROLLUP keeps the key type", q("SELECT x, COUNT(*) FROM (SELECT 1 x UNION A
 cur.execute("CREATE TABLE longs (id INT, s LONGTEXT)")
 cur.execute("INSERT INTO longs VALUES (1, %s), (2, %s), (3, %s)", ("x" * 70000 + "end", "y" * 65535, "z" * 65534))
 c.eq("strings of 64 KB and more", q("SELECT id, LENGTH(s), RIGHT(s, 3) FROM longs ORDER BY id"), [(1, 70003, "end"), (2, 65535, "yyy"), (3, 65534, "zzz")])
+cur.execute("CREATE TABLE upd (id INT, a INT, b INT, s VARCHAR(10))")
+cur.execute("INSERT INTO upd VALUES (1, 1, 10, 'bob'), (2, 2, 20, NULL), (3, 3, 30, 'ann')")
+cur.execute("UPDATE upd SET a = a + 1, b = a WHERE id <= 2")  # MySQL: left to right, b gets the new a
+cur.execute("UPDATE upd SET b = 0 WHERE s LIKE 'b__'")         # NULL s: not a match
+c.eq("UPDATE: SETs left to right, NULL predicates don't match", q("SELECT id, a, b FROM upd ORDER BY id"), [(1, 2, 0), (2, 3, 3), (3, 3, 30)])
 c.done()

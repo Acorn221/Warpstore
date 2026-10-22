@@ -64,7 +64,7 @@ for sql in ("DELETE FROM t1 WHERE id % 17 = 3", "UPDATE t1 SET a = a + 1 WHERE i
             "UPDATE t2 SET x = x * 3, s2 = NULL WHERE id % 7 = 2",
             # vectorized SET forms: constants, column copies (NULLs included), +/- constants on INT /
             # BIGINT / DECIMAL / DOUBLE, all against the old row
-            "UPDATE t1 SET m = m - 1.25, c = c + 0.5, b = a, a = b WHERE id % 37 = 3",
+            "UPDATE t1 SET m = m - 1.25, c = c + 0.5, b = a WHERE id % 37 = 3",
             "UPDATE t1 SET a = 7, m = 2.5, b = b - 10 WHERE id % 41 = 6",
             "UPDATE t2 SET x = x + 1000, t1_id = t1_id WHERE id % 5 = 1"):
     g.execute(sql)
@@ -135,7 +135,10 @@ for sql in ("SELECT t1.id, t1.s, t1.a, SUM(t2.x), COUNT(*) FROM t1 JOIN t2 ON t2
             # COUNT(DISTINCT) (two-phase aggregation) with ORDER BY an exact integer aggregate + LIMIT
             "SELECT a % 7 AS k, MIN(b) AS mb, MAX(b), COUNT(DISTINCT c) FROM t1 GROUP BY 1 ORDER BY mb, k LIMIT 5",
             "SELECT MIN(b) AS c0, id, COUNT(DISTINCT id) FROM t1 GROUP BY id ORDER BY c0, id DESC LIMIT 5",
-            "SELECT b, id, COUNT(DISTINCT id) FROM t1 GROUP BY b, id ORDER BY b, id DESC LIMIT 5"):
+            "SELECT b, id, COUNT(DISTINCT id) FROM t1 GROUP BY b, id ORDER BY b, id DESC LIMIT 5",
+            # ORDER BY a string MIN / MAX with LIMIT (GPU top-N over collation ranks)
+            "SELECT MAX(s) AS ms, a FROM t1 GROUP BY a ORDER BY ms DESC, a LIMIT 5",
+            "SELECT MIN(s) AS ms, a % 5 FROM t1 GROUP BY 2 ORDER BY ms, 2 LIMIT 5"):
     g.execute(sql)
     MANY_KEYS.append((sql, [tuple(r) for r in g.fetchall()], [tuple(r) for r in d.execute(sql).fetchall()]))
 
@@ -420,6 +423,85 @@ for i in range(max(N // 10, 10)):
         continue
     c.check(f"correlated {i}", norm_rows(got, ordered=False) == norm_rows(want, ordered=False),
             f"\n  {my}\n  warpstore {norm_rows(got, ordered=False)[:5]}\n  duckdb {norm_rows(want, ordered=False)[:5]}")
+# Random DML: the same UPDATE / DELETE / INSERT .. SELECT statements on two copies of t1 (with a
+# primary key: rows rewritten one by one; without: copied by column) and in DuckDB; full contents
+# compared every 25 statements.
+for name, keys in (("d1", ", PRIMARY KEY(id)"), ("d2", "")):
+    g.execute(f"CREATE TABLE {name} ({T1}{keys})")
+    d.execute(f"CREATE TABLE {name} ({T1.replace('VARCHAR(20)', 'VARCHAR')})")
+    g.execute(f"INSERT INTO {name} SELECT * FROM t1")
+    d.execute(f"INSERT INTO {name} SELECT * FROM t1")
+INT_COLS["d1"] = INT_COLS["d2"] = ["a", "b"]
+NUM_COLS["d1"] = NUM_COLS["d2"] = ["c", "m"]
+STR_COLS["d1"] = STR_COLS["d2"] = ["s"]
+nextId = {"d1": 100000, "d2": 100000}
+
+
+def dml(name):
+    tabs = [(name, name)]
+    w = pred(tabs)
+    r = R.random()
+    if r < 0.6:
+        sets = []
+        chosen = R.sample(["a", "b", "c", "m", "s", "d"], R.randint(1, 3))
+        for col in chosen:
+            # (no SET reading a column another SET of the statement assigns: MySQL evaluates them left to
+            # right, DuckDB against the old row; CONCAT(NULL, ..) is NULL in MySQL, '' in DuckDB)
+            if col == "s":
+                f = R.choice([f"CASE WHEN s IS NULL THEN NULL ELSE CONCAT(s, '{R.choice(WORDS)}') END", f"'{R.choice(WORDS)}'", "NULL", "LOWER(s)"])  # (no upper case: MySQL compares strings case-insensitively)
+                sets.append((f"s = {f}", f"s = {f}"))
+            elif col == "d":
+                sets.append(("d = d + INTERVAL 1 DAY", "d = d + INTERVAL 1 DAY"))
+            else:
+                k = R.randint(-5, 5)
+                pool = [x for x in (["a", "b"] if col in ("a", "b") else ["c", "m"] if col == "c" else ["m"]) if x == col or x not in chosen]
+                other = R.choice(pool)
+                f = R.choice([f"{col} + {k}", f"{col} - {k}", f"{other}", "NULL", f"{k}",
+                              f"CASE WHEN {col} > 0 THEN {col} ELSE {k} END"])
+                if col == "m" and "+" in f:
+                    f = f"{col} + 0.25"
+                sets.append((f"{col} = {f}", f"{col} = {f}"))
+        return (f"UPDATE {name} SET {', '.join(x for x, _ in sets)} WHERE {w.my}",
+                f"UPDATE {name} SET {', '.join(y for _, y in sets)} WHERE {w.dk}")
+    if r < 0.85:
+        return f"DELETE FROM {name} WHERE {w.my}", f"DELETE FROM {name} WHERE {w.dk}"
+    off = nextId[name]
+    nextId[name] += 10000
+    w1 = pred([("t1", "t1")])
+    return (f"INSERT INTO {name} SELECT id + {off}, a, b, c, s, d, m FROM t1 WHERE {w1.my}",
+            f"INSERT INTO {name} SELECT id + {off}, a, b, c, s, d, m FROM t1 WHERE {w1.dk}")
+
+
+last = {}
+for i in range(150):
+    for name in ("d1", "d2"):
+        my, dk = dml(name)
+        last[name] = my
+        try:
+            d.execute(dk)
+        except duckdb.Error:
+            continue  # (DuckDB rejects it: skipped on both)
+        try:
+            g.execute(my)
+        except pymysql.MySQLError as e:
+            c.check(f"dml {i} {name}", False, f"ERROR {e.args}\n  {my}")
+            d.execute(f"DELETE FROM {name}")  # (resync both copies)
+            g.execute(f"DELETE FROM {name}")
+    if os.environ.get("WARPSTORE_DML_DEBUG"):
+        for name in ("d1", "d2"):
+            sql = f"SELECT id, a, b, c, s, d, m FROM {name} ORDER BY id"
+            g.execute(sql)
+            a, b = norm_rows(g.fetchall(), places=4), norm_rows(d.execute(sql).fetchall(), places=4)
+            if a != b:
+                print("DIVERGED after", i, name, last[name], len(a), len(b), [(x, y) for x, y in zip(a, b) if x != y][:2])
+                sys.exit(1)
+    if i % 25 == 24:
+        for name in ("d1", "d2"):
+            sql = f"SELECT id, a, b, c, s, d, m FROM {name} ORDER BY id"
+            g.execute(sql)
+            a, b = norm_rows(g.fetchall(), places=4), norm_rows(d.execute(sql).fetchall(), places=4)
+            c.check(f"dml contents {name} after {i + 1} statements", a == b,
+                    f"{len(a)} vs {len(b)} rows; first difference: {[(x, y) for x, y in zip(a, b) if x != y][:2]}")
 errors = {}
 t0 = time.time()
 for i in range(N):
