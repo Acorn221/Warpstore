@@ -5186,7 +5186,8 @@ ResultSet Engine::executeStmt(const std::string& sql) {
   {
     static const std::regex replStatusRe(R"(^\s*SHOW\s+(REPLICATION|REPLICA|SLAVE)\s+STATUS\s*;?\s*$)", std::regex::icase);
     static const std::regex promoteRe(R"(^\s*PROMOTE(\s+\w+)?\s*;?\s*$)", std::regex::icase);
-    if (std::regex_match(sql, replStatusRe)) return replicationStatus();
+    const std::string fw = firstWord(sql);
+    if (fw == "SHOW" && std::regex_match(sql, replStatusRe)) return replicationStatus();
     static const std::regex killRe(R"(^\s*KILL\s+(QUERY\s+|CONNECTION\s+)?(\d+)\s*;?\s*$)", std::regex::icase);
     std::smatch km;
     if (firstWord(sql) == "KILL" && std::regex_match(sql, km, killRe)) {
@@ -5219,7 +5220,7 @@ ResultSet Engine::executeStmt(const std::string& sql) {
       monitor::resetQueryStats();
       return okResult(0);
     }
-    if (std::regex_match(sql, promoteRe)) {
+    if (fw == "PROMOTE" && std::regex_match(sql, promoteRe)) {
       if (!isSuper(tUserName())) throw SqlError("Access denied; you need the SUPER privilege for this operation", 1227);
       promote();
       return okResult(0, "promoted to primary");

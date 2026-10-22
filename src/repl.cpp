@@ -39,7 +39,7 @@ void Engine::replAppend(const std::string& rec) {  // walMu_ held
   }
   static const std::regex loadRe(R"(^[^\x1f]*\x1f\s*LOAD\s+DATA\s+INFILE\s+'([^']*)')", std::regex::icase);
   std::smatch m;
-  if (rec.size() < 4096 && std::regex_search(rec, m, loadRe)) {
+  if (rec.size() < 4096 && strcasestr(rec.c_str(), "INFILE") && std::regex_search(rec, m, loadRe)) {
     std::lock_guard<std::mutex> g(replMu_);
     replFiles_.insert(m[1].str());
   }
