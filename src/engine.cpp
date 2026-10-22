@@ -2873,6 +2873,43 @@ ResultSet Engine::doInsert(Stmt& s) {
   auto t = cat_.get(s.table);
   std::unique_lock<FairSharedMutex> lk(t->mu);
   if (hasUniqueKey(*t)) waitTxnFree(*t, lk);  // another open transaction may hold a row with the same key
+  // A failed INSERT outside a transaction (a duplicate key, a NULL into NOT NULL, ...) leaves nothing
+  // behind, as in MySQL: the rows it appended to the write buffers (not flushed meanwhile) go again.
+  struct StmtUndo {
+    Table& t;
+    bool on, prevDefer;
+    int ex = std::uncaught_exceptions();
+    std::vector<int64_t> mark;
+    StmtUndo(Table& tt, bool o) : t(tt), on(o), prevDefer(tt.deferFlush) {
+      if (!on) return;
+      t.deferFlush = true;
+      for (auto& b : t.bufs) mark.push_back(b->n);
+    }
+    ~StmtUndo() {
+      if (!on) return;
+      t.deferFlush = prevDefer;
+      try {
+        if (std::uncaught_exceptions() > ex) {
+          for (int p = 0; p < t.nparts; ++p)
+            for (int64_t r = mark[p]; r < t.bufs[p]->n; ++r) {
+              if (t.bufs[p]->del->test(r)) continue;
+              const Loc l = bufLoc(p, r);
+              if (t.pk >= 0)
+                if (auto it = t.pkIndex.find(t.pkValue(l)); it != t.pkIndex.end() && it->second == l) t.pkIndex.erase(it);
+              if (!t.indexes.empty()) t.indexRemove(l);
+              WriteBuffer& buf = *t.bufs[p];
+              delSet(delForWrite(buf.del), r);
+              ++buf.version;
+            }
+        }
+        if (!prevDefer)
+          for (int p = 0; p < t.nparts; ++p)
+            if (t.bufs[p]->n >= kSegRows) t.flushPart(p);
+      } catch (std::exception& e) {
+        fprintf(stderr, "[warpstore] after INSERT: %s\n", e.what());
+      }
+    }
+  } stmtUndo{*t, !undoLog() && t->db != "__tmp"};
   std::vector<int> map;
   if (s.insertCols.empty()) {
     for (size_t i = 0; i < t->cols.size(); ++i) map.push_back((int)i);

@@ -1,8 +1,9 @@
 # Column-level UPDATE: rows in segments keep their places and only the SET columns get new versions
-# (Segment::ov). Random UPDATEs / INSERTs / DELETEs against a Python model, with rows both in segments
-# and in write buffers; keys, indexes and the sort key (which go through delete + re-insert) mixed in.
-# Then: a slow reader keeps its snapshot, segment elimination after values leave the old range, NULLs,
-# SNAPSHOT (format 6) + kill -9 + replay, clean restart, OPTIMIZE, and cold columns (disk tier).
+# (Segment::ov); refused UPDATEs / INSERTs change nothing. Random UPDATEs / INSERTs / DELETEs against
+# a Python model, with rows both in segments and in write buffers; keys, indexes and the sort key
+# (which go through delete + re-insert) mixed in. Then: a slow reader keeps its snapshot, segment
+# elimination after values leave the old range, NULLs, SNAPSHOT (format 6) + kill -9 + replay, clean
+# restart, OPTIMIZE, and cold columns (disk tier).
 import datetime, os, random, sys, threading, time
 from decimal import Decimal
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -189,6 +190,17 @@ for sql in ["UPDATE uk SET id = 5 WHERE id IN (1, 2)", "UPDATE uk SET v = 3 WHER
 cur.execute("UPDATE uk SET id = id + 100")
 cur.execute("UPDATE uk SET v = NULL WHERE id < 103")
 c.eq("key shift and NULLs in a UNIQUE column", q("SELECT COUNT(*), SUM(id), SUM(v), COUNT(v) FROM uk"), [(10, Decimal(1045), Decimal(42), 7)])
+
+# a refused INSERT leaves nothing behind either (MySQL: the statement is atomic)
+cur.execute("CREATE TABLE ins (id INT PRIMARY KEY, v INT NOT NULL)")
+cur.execute("CREATE TABLE src (id INT, v INT)")
+cur.execute("INSERT INTO src VALUES " + ",".join(f"({i}, {'NULL' if i == 50000 else i})" for i in range(60000)))
+for sql, code in [("INSERT INTO ins VALUES (1, 1), (2, 2), (1, 3)", 1062), ("INSERT INTO ins VALUES (10, 1), (11, NULL)", 1048),
+                  ("INSERT INTO ins SELECT * FROM src", 1048), ("INSERT INTO ins SELECT id, 1 FROM src UNION ALL SELECT 5, 5", 1062)]:
+    c.raises(f"refused: {sql}", lambda: cur.execute(sql), code)
+    c.eq(f"nothing inserted: {sql}", q("SELECT COUNT(*) FROM ins"), [(0,)])
+cur.execute("INSERT INTO ins VALUES (1, 1), (2, 2)")
+c.eq("the keys of a refused INSERT are free again", q("SELECT COUNT(*), SUM(id) FROM ins"), [(2, Decimal(3))])
 
 # a slow reader keeps the version it started with
 before = q("SELECT SUM(v) FROM t")
