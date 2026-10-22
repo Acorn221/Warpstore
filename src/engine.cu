@@ -12379,6 +12379,7 @@ FILE* zstdWriter(FILE* raw) {
   auto* z = new ZW{raw, ZSTD_createCCtx(), std::vector<char>(ZSTD_CStreamOutSize())};
   ZSTD_CCtx_setParameter(z->c, ZSTD_c_compressionLevel, 3);
   ZSTD_CCtx_setParameter(z->c, ZSTD_c_nbWorkers, 4);
+  ZSTD_CCtx_setParameter(z->c, ZSTD_c_checksumFlag, 1);  // (a damaged snapshot / backup fails to load instead of loading garbage)
   cookie_io_functions_t io{nullptr, zwWrite, nullptr, zwClose};
   FILE* f = fopencookie(z, "w", io);
   if (f) setvbuf(f, nullptr, _IOFBF, 1 << 20);
@@ -13170,6 +13171,14 @@ void Engine::loadSnapshot(const std::string& path, const std::string& fromDb, co
       }
       pipes_[lower(p->name)] = p;
     }
+  if (magic[7] >= '2') {  // the end of the zstd stream: its checksum is verified there
+    char extra;
+    const size_t k = fread(&extra, 1, 1, f);
+    if (k != 0 || ferror(f)) {
+      fclose(f);
+      throw SqlError("corrupt snapshot " + path + " (checksum mismatch or trailing data)", 1105);
+    }
+  }
   fclose(f);
   if (FILE* uf = withUsers ? fopen((path + ".users").c_str(), "rb") : nullptr) {
     uint64_t nu;

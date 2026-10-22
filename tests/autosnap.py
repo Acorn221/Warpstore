@@ -83,5 +83,30 @@ cur.execute("SELECT COUNT(*), COUNT(DISTINCT s) FROM u WHERE s LIKE 'tail%'")
 c.eq("strings after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], [(300, 300)])
 cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM t WHERE id >= 0")
 c.eq("rows after a torn dictionary tail", [tuple(r) for r in cur.fetchall()], want)
+
+# A damaged snapshot.bin is refused at startup (zstd checksum), not loaded with garbage.
+cur.execute("SNAPSHOT")
+srv.stop()
+snap = os.path.join(srv.data_dir, "snapshot.bin")
+with open(snap, "r+b") as fh:
+    data = bytearray(fh.read())
+    at = len(data) // 2
+    data[at] ^= 0x41
+    fh.seek(0)
+    fh.write(data)
+try:
+    srv.start(timeout=60)
+    c.check("damaged snapshot refused", False, "server started")
+    srv.stop()
+except RuntimeError as e:
+    c.check("damaged snapshot refused", "corrupt snapshot" in str(e) or "cannot recover" in str(e), str(e)[-300:])
+with open(snap, "r+b") as fh:
+    data[at] ^= 0x41
+    fh.seek(0)
+    fh.write(data)
+srv.start()
+cur = srv.cursor()
+cur.execute("SELECT COUNT(*), SUM(v), COUNT(DISTINCT s) FROM a.t WHERE id >= 0")
+c.eq("restored snapshot loads", [tuple(r) for r in cur.fetchall()], want)
 srv.stop()
 c.done()
