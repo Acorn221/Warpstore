@@ -221,7 +221,7 @@ def pred(tabs, depth=0):
         a = pred(tabs, depth + 1)
         return Q(f"NOT ({a.my})", f"NOT ({a.dk})")
     if r < 0.55:
-        a = num_expr(tabs, depth + 1)
+        a = num_nodiv(tabs, depth + 1)
         op = R.choice(["=", "<>", "<", "<=", ">", ">="])
         return _cmp(a, op)
     if r < 0.63:
@@ -260,7 +260,17 @@ def pred(tabs, depth=0):
         day = f"20{R.randint(20, 25)}-{R.randint(1, 12):02d}-01"
         op = R.choice(["<", ">=", "="])
         return Q(f"{dc.my} {op} DATE '{day}'", f"{dc.dk} {op} DATE '{day}'")
-    return _cmp(num_expr(tabs, depth + 1), ">")
+    return _cmp(num_nodiv(tabs, depth + 1), ">")
+
+
+def num_nodiv(tabs, depth):
+    """num_expr without division (for predicates: MySQL rounds exact-number division to 4 more decimals,
+    DuckDB doesn't, so x + 10 / b > 0 can legitimately differ; in select lists the tolerance covers it)."""
+    for _ in range(8):
+        e = num_expr(tabs, depth)
+        if "/" not in e.my:
+            return e
+    return col(tabs, "num")
 
 
 def _cmp(a, op):
