@@ -14370,11 +14370,23 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
   };
   std::vector<std::vector<int32_t>> live(t.segs.size());
   std::vector<bool> byRef(t.segs.size(), false);
+  // (inside the snapshot's write pause: no per-row work for segments written by reference when no
+  // transaction is open, their deleted-row bitmap is the answer)
+  const bool plain = hidden.empty() && ghosts.empty();
+  std::vector<int64_t> nlive(t.segs.size());
   for (size_t si = 0; si < t.segs.size(); ++si) {
     const auto& sg = t.segs[si];
-    for (int64_t r = 0; r < sg->n; ++r)
-      if (keep((int32_t)si, r, sg->del->test(r))) live[si].push_back((int32_t)r);
-    byRef[si] = refs && tierEnabled() && sg->uses.size() == sg->dev.size() && sg->n > 0 && (int64_t)live[si].size() * 2 >= sg->n;
+    if (plain) {
+      nlive[si] = sg->n - sg->del->ndel;
+    } else {
+      for (int64_t r = 0; r < sg->n; ++r)
+        if (keep((int32_t)si, r, sg->del->test(r))) live[si].push_back((int32_t)r);
+      nlive[si] = (int64_t)live[si].size();
+    }
+    byRef[si] = refs && tierEnabled() && sg->uses.size() == sg->dev.size() && sg->n > 0 && nlive[si] * 2 >= sg->n;
+    if (plain && !byRef[si])
+      for (int64_t r = 0; r < sg->n; ++r)
+        if (!sg->del->test(r)) live[si].push_back((int32_t)r);
   }
   if (refs) {
     std::vector<size_t> rs;
@@ -14394,7 +14406,12 @@ void writeColumnar(FILE* f, const Table& t, std::vector<uint64_t>* refs = nullpt
         putDbl(f, sg.mx[c]);
       }
       std::vector<uint32_t> bits((size_t)(sg.n + 31) / 32, ~0u);  // deleted unless live
-      for (int32_t r : live[si]) bits[r >> 5] &= ~(1u << (r & 31));
+      if (plain) {
+        const auto& h = sg.del->host;
+        for (size_t w = 0; w < bits.size(); ++w) bits[w] = w < h.size() ? h[w] : 0u;
+      } else {
+        for (int32_t r : live[si]) bits[r >> 5] &= ~(1u << (r & 31));
+      }
       if (sg.n % 32) bits.back() &= (1u << (sg.n % 32)) - 1;
       fwrite(bits.data(), 4, bits.size(), f);
     }
@@ -14674,6 +14691,12 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
   }
   std::lock_guard<std::mutex> snapGuard(snapMu_);
   const bool v4 = outPath.empty() && tierEnabled();  // snapshot.bin: segments by reference (their files)
+  std::vector<uint64_t> refs;
+  const std::string dictDir = dir_ + "/dicts";
+  std::set<std::string> dictRefs;
+  // The pre-pass runs twice: what a concurrent load added during the first one (segments, strings)
+  // is written by the second, so little is left for the pause.
+  for (int pass = 0; pass < (v4 ? 2 : 0); ++pass) {
   if (v4)  // big write buffers become segments first, so they too are written outside the pause below
     for (auto& t : tabs) {
       std::unique_lock<FairSharedMutex> lk(t->mu);
@@ -14690,9 +14713,6 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       }
       for (auto& sp : segs) segFileSync(*segFileEnsure(*sp->d, sp->n, t->sortKey));
     }
-  std::vector<uint64_t> refs;
-  const std::string dictDir = dir_ + "/dicts";
-  std::set<std::string> dictRefs;
   if (v4)  // dictionaries: the strings added since the last snapshot go to their files (no pause)
     for (auto& t : tabs) {
       std::vector<std::shared_ptr<Dict>> ds;
@@ -14703,6 +14723,7 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
       for (auto& d : ds)
         if (d && d->strs.size()) dictPersist(*d, d->strs.size(), dictDir);
     }
+  }
   const auto pause0 = Clock::now();
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
   std::sort(tabs.begin(), tabs.end());
