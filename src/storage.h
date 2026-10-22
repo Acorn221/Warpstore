@@ -174,6 +174,41 @@ class StrVec {
     n_.store(i + 1, std::memory_order_release);
   }
   void emplace_back(std::string_view s) { push_back(s); }
+  // Appends k strings get(0..k-1) at once: one arena chunk, the copies on several threads, size()
+  // published at the end (readers see all of them or none).
+  template <class Get>
+  void pushMany(size_t k, const Get& get) {
+    if (k < 65536) {
+      for (size_t j = 0; j < k; ++j) push_back(get(j));
+      return;
+    }
+    const size_t base = n_.load(std::memory_order_relaxed);
+    std::vector<uint64_t> off(k + 1, 0);
+    for (size_t j = 0; j < k; ++j) off[j + 1] = off[j] + get(j).size();
+    const size_t total = off[k];
+    char* p = nullptr;
+    if (total) {
+      chunks_.emplace_back(new char[total]);
+      p = chunks_.back().get();
+      bytes_ += total;
+    }
+    while (nblocks_ * kBlock < base + k) slot(nblocks_ * kBlock);  // (blocks and directory for the whole range, in order)
+    std::string_view** dir = dir_.load(std::memory_order_relaxed);
+    const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 16);
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < nth; ++t)
+      th.emplace_back([&, t] {
+        for (size_t j = k * t / nth; j < k * (t + 1) / nth; ++j) {
+          const std::string_view v = get(j);
+          char* d = p + off[j];
+          if (!v.empty()) memcpy(d, v.data(), v.size());
+          const size_t i = base + j;
+          dir[i >> kShift][i & kMask] = std::string_view(v.empty() ? "" : d, v.size());
+        }
+      });
+    for (auto& x : th) x.join();
+    n_.store(base + k, std::memory_order_release);
+  }
   void reserve(size_t) {}
   void clear() {  // (only on dictionaries nobody else reads)
     dir_.store(nullptr);
@@ -296,19 +331,72 @@ struct Dict {
       if (out[i] == -1) miss.push_back(i);
     if (miss.empty()) return;
     std::unique_lock<std::shared_mutex> lk(mapMu);
-    grow(strs.size() + miss.size());
-    const size_t mask = slots_.size() - 1;
-    for (size_t j = 0; j < miss.size(); ++j) {
-      if (j + 8 < miss.size()) __builtin_prefetch(&slots_[hs[miss[j + 8]] & mask]);
-      const size_t i = miss[j];
-      int32_t f = lookup(s[i], hs[i]);  // (an earlier repeat in this batch, or another writer)
-      if (f < 0) {
-        f = (int32_t)strs.size();
-        strs.push_back(s[i]);
-        place(hs[i], (uint32_t)f);
+    const size_t m = miss.size();
+    if (m < 16384) {
+      grow(strs.size() + m);
+      const size_t mask = slots_.size() - 1;
+      for (size_t j = 0; j < m; ++j) {
+        if (j + 8 < m) __builtin_prefetch(&slots_[hs[miss[j + 8]] & mask]);
+        const size_t i = miss[j];
+        int32_t f = lookup(s[i], hs[i]);  // (an earlier repeat in this batch, or another writer)
+        if (f < 0) {
+          f = (int32_t)strs.size();
+          strs.push_back(s[i]);
+          place(hs[i], (uint32_t)f);
+        }
+        out[i] = f;
       }
-      out[i] = f;
+      indexed_ = strs.size();
+      return;
     }
+    // Many new strings: (1) those another writer added meanwhile, (2) the first occurrence of each
+    // new one, deduplicated per hash shard on all cores, (3) codes in order of first appearance (as
+    // the serial path assigns them), (4) the table entries placed on all cores.
+    std::vector<int32_t> found(m);
+    par(m, [&](size_t b, size_t e) {
+      for (size_t j = b; j < e; ++j) found[j] = lookup(s[miss[j]], hs[miss[j]]);
+    });
+    constexpr int kShards = 64;
+    std::vector<std::vector<uint32_t>> shard(kShards);
+    for (size_t j = 0; j < m; ++j)
+      if (found[j] < 0) shard[hs[miss[j]] >> 26].push_back((uint32_t)j);
+    std::vector<uint32_t> first(m, UINT32_MAX);
+    std::atomic<int> nextShard{0};
+    par((size_t)kShards * 16384, [&](size_t, size_t) {  // (one worker per core; shards taken in turn)
+      std::vector<uint32_t> tab;
+      for (int sh; (sh = nextShard++) < kShards;) {
+        const auto& list = shard[sh];
+        size_t cap = 16;
+        while (cap < list.size() * 2) cap <<= 1;
+        tab.assign(cap, 0);
+        for (uint32_t j : list) {
+          const uint32_t h = hs[miss[j]];
+          size_t at = (h * 0x9E3779B1u) & (cap - 1);
+          for (;; at = (at + 1) & (cap - 1)) {
+            if (!tab[at]) { tab[at] = j + 1; first[j] = j; break; }
+            const uint32_t k = tab[at] - 1;
+            if (hs[miss[k]] == h && s[miss[k]] == s[miss[j]]) { first[j] = k; break; }
+          }
+        }
+      }
+    });
+    size_t fresh = 0;
+    for (size_t j = 0; j < m; ++j) fresh += found[j] < 0 && first[j] == j;
+    grow(strs.size() + fresh);
+    std::vector<int32_t> codeOf(m, -1);
+    std::vector<uint32_t> added;
+    added.reserve(fresh);
+    const size_t base = strs.size();
+    for (size_t j = 0; j < m; ++j)
+      if (found[j] < 0 && first[j] == j) {
+        codeOf[j] = (int32_t)(base + added.size());
+        added.push_back((uint32_t)j);
+      }
+    strs.pushMany(added.size(), [&](size_t k) { return s[miss[added[k]]]; });
+    par(added.size(), [&](size_t b, size_t e) {
+      for (size_t k = b; k < e; ++k) placeAtomic(hs[miss[added[k]]], (uint32_t)codeOf[added[k]]);
+    });
+    for (size_t j = 0; j < m; ++j) out[miss[j]] = found[j] >= 0 ? found[j] : codeOf[first[j]];
     indexed_ = strs.size();
   }
   // Codes of n strings that are in the dictionary (-1 for the others; nullCode for NULL views).
@@ -382,14 +470,33 @@ struct Dict {
     while (slots_[i]) i = (i + 1) & mask;
     slots_[i] = (uint64_t)h << 32 | (code + 1);
   }
+  void placeAtomic(uint32_t h, uint32_t code) const {  // place() from several threads (distinct strings)
+    const size_t mask = slots_.size() - 1;
+    const uint64_t v = (uint64_t)h << 32 | (code + 1);
+    for (size_t i = h & mask;; i = (i + 1) & mask) {
+      uint64_t expect = 0;
+      if (__atomic_compare_exchange_n(&slots_[i], &expect, v, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+    }
+  }
   void grow(size_t n) const {  // room for n strings at most half full
     if (n * 2 <= slots_.size()) return;
     size_t cap = std::max<size_t>(64, slots_.size());
     while (cap < n * 2) cap *= 2;
     std::vector<uint64_t> old(cap, 0);
     old.swap(slots_);
-    for (uint64_t v : old)
-      if (v) place((uint32_t)(v >> 32), (uint32_t)v - 1);
+    if (old.size() < (1u << 20)) {
+      for (uint64_t v : old)
+        if (v) place((uint32_t)(v >> 32), (uint32_t)v - 1);
+      return;
+    }
+    const size_t nth = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), 16);  // big tables: rehash on all cores
+    std::vector<std::thread> th;
+    for (size_t t = 0; t < nth; ++t)
+      th.emplace_back([&, t] {
+        for (size_t i = old.size() * t / nth; i < old.size() * (t + 1) / nth; ++i)
+          if (old[i]) placeAtomic((uint32_t)(old[i] >> 32), (uint32_t)old[i] - 1);
+      });
+    for (auto& x : th) x.join();
   }
   int32_t add(std::string_view s, uint32_t h) {  // (mapMu held exclusively; everything indexed)
     const int32_t f = lookup(s, h);
