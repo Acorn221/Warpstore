@@ -2,6 +2,7 @@
 # chunk), the row-at-a-time path (primary key, AUTO_INCREMENT), shard keys, CSV quoting, ESCAPED BY,
 # NULLs, CRLF, IGNORE n LINES, error rows, zstd input, and replay of the WAL's compressed copy after
 # the source file is deleted and the server killed.
+import pymysql
 import os, random, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from decimal import Decimal
@@ -210,21 +211,40 @@ pq.write_table(pa.table({"k": pa.array([1, 2, 3]), "tags": pa.array([["a", "b"],
 cur.execute("CREATE TABLE pqn (k INT, tags VARCHAR(40))")
 cur.execute(f"LOAD DATA INFILE '{nested}' INTO TABLE pqn")
 c.eq("Parquet: nested column as JSON", q("SELECT k, tags FROM pqn ORDER BY k"), [(1, '["a","b"]'), (2, "[]"), (3, None)])
+# a damaged page (page checksums on) in the last row group: an error naming it after the earlier row
+# groups loaded, which stay and replay (below)
+dmg = path("damaged.parquet")
+pq.write_table(pa.table({"a": pa.array(range(30000)), "s": pa.array([f"v{i}" for i in range(30000)])}), dmg,
+               row_group_size=10000, compression="snappy", write_page_checksum=True, use_dictionary=False)
+meta = pq.ParquetFile(dmg).metadata
+off = meta.row_group(2).column(0).data_page_offset + meta.row_group(2).column(0).total_compressed_size // 2
+with open(dmg, "r+b") as fh:
+    fh.seek(off)
+    b = fh.read(1)
+    fh.seek(off)
+    fh.write(bytes([b[0] ^ 0x5A]))
+cur.execute("CREATE TABLE dmg (a INT, s VARCHAR(10))")
+try:
+    cur.execute(f"LOAD DATA INFILE '{dmg}' INTO TABLE dmg")
+    c.check("Parquet: damaged page detected", False, "loaded")
+except pymysql.MySQLError as e:
+    c.check("Parquet: damaged page detected", "damaged" in str(e) or "bad snappy" in str(e), str(e))
+c.eq("Parquet: rows before the damaged row group", q("SELECT COUNT(*), SUM(a) FROM dmg"), [(20000, sum(range(20000)))])
 
 # 8) The WAL's copies are compressed; they replay after the sources are gone and the server is killed.
 loads = os.path.join(srv.data_dir, "loads")
 copies = sum(os.path.getsize(os.path.join(loads, f)) for f in os.listdir(loads))
 c.check("compressed copies are much smaller than the big file", copies < os.path.getsize(big) / 2, (copies, os.path.getsize(big)))
-for p in [big, pk, sk, csv, esc, bad, zin + ".zst", empty, nested] + pqfiles:
+for p in [big, pk, sk, csv, esc, bad, zin + ".zst", empty, nested, dmg] + pqfiles:
     os.unlink(p)
 pq_before = pq_got()
-before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn")]
+before = [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn", "dmg")]
 srv.kill()
 srv.start()
 cur = srv.cursor()
 cur.execute("USE l")
 check_big("after crash replay")
-c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn")], before)
+c.eq("all tables after replay", [q(f"SELECT COUNT(*) FROM {t}") for t in ("big", "pk", "sk", "qt", "et", "bad", "zt", "ai", "pq", "pq2", "pqn", "dmg")], before)
 c.eq("Parquet tables after replay", pq_got(), pq_before)
 c.eq("pk table after replay", q("SELECT COUNT(*), MAX(id), SUM(score) FROM pk"), [(50000, 50000, 3 * 49999 * 50000 // 2)])
 srv.stop()

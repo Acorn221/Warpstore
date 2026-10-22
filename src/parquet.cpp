@@ -167,7 +167,16 @@ std::string decompress(int codec, const uint8_t* src, size_t n, size_t outSize) 
     }
     default: bad("unsupported compression codec " + std::to_string(codec) + " (supported: none, snappy, gzip, zstd)");
   }
+  if (out.size() != outSize)  // (the page header's uncompressed size: a damaged page decodes to another length)
+    bad("damaged page: " + std::to_string(out.size()) + " bytes uncompressed, the page header says " + std::to_string(outSize));
   return out;
+}
+// The page CRC (PageHeader field 4: CRC32 of the page bytes after the header), when the writer set one.
+void checkPageCrc(const TVal& ph, const uint8_t* body, size_t csize) {
+  const TVal* c = ph.f(4);
+  if (!c) return;
+  const uint32_t want = (uint32_t)c->i, got = (uint32_t)crc32(0, (const Bytef*)body, (uInt)csize);
+  if (want != got) bad("damaged page: CRC mismatch");
 }
 
 // RLE / bit-packed hybrid of `count` values of `bw` bits.
@@ -439,6 +448,7 @@ void readLeaf(std::string_view file, const Col& col, const TVal& meta, std::vect
     const int64_t usize = ph.fi(2), csize = ph.fi(3);
     if (p + csize > end) bad("page past the column chunk");
     const uint8_t* body = p;
+    checkPageCrc(ph, body, (size_t)csize);
     p += csize;
     if (ptype == 2) {  // dictionary page
       const TVal* dh = ph.f(7);
@@ -949,6 +959,7 @@ void readLeafTyped(std::string_view file, const Col& col, const TVal& meta, int6
     const int64_t usize = ph.fi(2), csize = ph.fi(3);
     if (p + csize > end) bad("page past the column chunk");
     const uint8_t* body = p;
+    checkPageCrc(ph, body, (size_t)csize);
     p += csize;
     if (ptype == 2) {  // dictionary page
       const TVal* dh = ph.f(7);

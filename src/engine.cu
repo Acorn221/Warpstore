@@ -7576,6 +7576,22 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
   for (auto& cm : t->cols) vec = vec || cm.pt == PType::VEC;
   int64_t n = 0;
   const std::vector<Value> defs = defaultRow(*t);
+  // Rows loaded before an error stay (as with text files): the statement is logged anyway, with a
+  // copy of the file, so a restart replays to the same rows and the same error.
+  struct FailLog {
+    const std::string& path;
+    const std::string& copyTo;
+    const int64_t& n;
+    bool armed = true;
+    ~FailLog() {
+      if (!armed || n <= 0 || copyTo.empty()) return;
+      try {  // (unwinding: never throw from here)
+        copyFile(path, copyTo);
+        tLoadLogPath = copyTo;
+      } catch (...) {
+      }
+    }
+  } failLog{s.path, copyTo, n};
   const bool direct = !vec && parquetScan(data, wanted, [&](int64_t rows, std::vector<PqChunk>& in) {
     const size_t nc = t->cols.size();
     std::vector<std::vector<int64_t>> iv(nc);
@@ -7712,6 +7728,7 @@ ResultSet Engine::loadParquet(Stmt& s, const std::shared_ptr<Table>& t, const st
     }
     unlink(staged.c_str());
   }
+  failLog.armed = false;
   lk.unlock();
   if (!copyTo.empty()) {
     copyFile(s.path, copyTo);
