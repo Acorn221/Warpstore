@@ -118,7 +118,7 @@ std::function<bool(std::string_view)> likeMatcher(const std::string& pat) {
       return [lit](std::string_view s) { return s == lit; };
     }
   }
-  return [pat](std::string_view s) { return likeMatch(std::string(s), pat); };
+  return [pat](std::string_view s) { return likeMatch(s, pat); };
 }
 
 int collCmp(const std::string& a, const std::string& b);
@@ -567,6 +567,7 @@ int64_t addInterval(int64_t days, int64_t n, const std::string& unit) {
 }
 
 thread_local int64_t tLastInsertId = 0;  // per connection, like MySQL
+thread_local int64_t tFoundRows = 0;     // FOUND_ROWS(): rows of the last SELECT (without its LIMIT if SQL_CALC_FOUND_ROWS)
 thread_local std::vector<std::string> tTempTables;  // CREATE TEMPORARY TABLE: dropped when the connection ends
 std::string dbOf(const std::string& name) {
   size_t d = name.find('.');
@@ -712,6 +713,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
   if (f == "CURDATE" || f == "CURRENT_DATE" || f == "UTC_DATE") { e = boundLit(Value::Dt(floorDiv(stmtNowUs(), kUsPerDay))); return; }
   if (f == "PI") { e = boundLit(Value::D(3.141592653589793)); return; }
   if (f == "LAST_INSERT_ID") { e = boundLit(Value::I(tLastInsertId)); return; }
+  if (f == "FOUND_ROWS") { e = boundLit(Value::I(tFoundRows)); return; }
   if (f == "UNIX_TIMESTAMP" && e->args.empty()) { e = boundLit(Value::I(stmtNowUs() / 1000000)); return; }
   for (auto& a : e->args) bind(a, c);
   auto& A = e->args;
@@ -953,7 +955,7 @@ void bindFunc(ExprP& e, BindCtx& c) {
     const std::string t = e->castType;
     if (t == "SIGNED" || t == "UNSIGNED" || t == "INTEGER" || t == "INT" || t == "BIGINT") {
       if (A[0]->ty == LType::VARCHAR) { finish(strToNum(A[0], c, true)); return; }
-      finish(A[0]->ty == LType::DOUBLE ? mkCall(FN_ROUND, {A[0]}, LType::BIGINT) : A[0]);
+      finish(A[0]->ty == LType::DOUBLE || A[0]->ty == LType::DECIMAL ? mkCall(FN_ROUND, {A[0]}, LType::BIGINT) : A[0]);
       if (e->ty != LType::DOUBLE && e->kind != Expr::LIT) e->ty = LType::BIGINT;
       return;
     }
@@ -1036,7 +1038,11 @@ void bindFunc(ExprP& e, BindCtx& c) {
       {"GEOGRAPHY_LONGITUDE", LType::DOUBLE}, {"GEOGRAPHY_LATITUDE", LType::DOUBLE},
       {"FIND_IN_SET", LType::BIGINT}, {"UNHEX", LType::VARCHAR}, {"INSERT", LType::VARCHAR},
       {"BITAND", LType::BIGINT}, {"BITOR", LType::BIGINT}, {"BITXOR", LType::BIGINT}, {"SHL", LType::BIGINT}, {"SHR", LType::BIGINT},
-      {"BITNOT", LType::BIGINT}};
+      {"BITNOT", LType::BIGINT}, {"TIMEDIFF", LType::VARCHAR}, {"SEC_TO_TIME", LType::VARCHAR}, {"TIME", LType::VARCHAR},
+      {"TIME_TO_SEC", LType::BIGINT}, {"MAKETIME", LType::VARCHAR}, {"MAKEDATE", LType::DATE}, {"CHAR", LType::VARCHAR},
+      {"BIT_LENGTH", LType::BIGINT}, {"INET_ATON", LType::BIGINT}, {"INET_NTOA", LType::VARCHAR}, {"IS_IPV4", LType::INT},
+      {"JSON_SET", LType::VARCHAR}, {"JSON_INSERT", LType::VARCHAR}, {"JSON_REPLACE", LType::VARCHAR}, {"JSON_REMOVE", LType::VARCHAR},
+      {"ORD", LType::BIGINT}, {"BIN", LType::VARCHAR}, {"OCT", LType::VARCHAR}, {"CONV", LType::VARCHAR}, {"JSON_TYPE", LType::VARCHAR}, {"JSON_CONTAINS_PATH", LType::INT}, {"JSON_KEYS", LType::VARCHAR}, {"JSON_VALID", LType::INT}};
   if (f == "#UDF") {  // stored function with a procedural body over columns (proc.cpp inlineUdf)
     const std::string t = A[1]->lit.s.substr(0, A[1]->lit.s.find('#'));
     e->ty = t == "BIGINT" ? LType::BIGINT : t == "DOUBLE" || t == "DECIMAL" ? LType::DOUBLE : t == "DATE" ? LType::DATE
@@ -1063,12 +1069,17 @@ void bindFunc(ExprP& e, BindCtx& c) {
   if (strFns.count(f)) {
     e->ty = strFns.at(f);
     e->bound = true;
-    if (f == "JSON_ARRAY" || f == "JSON_OBJECT") {  // which arguments already are JSON (embedded, not quoted)
+    if (f == "JSON_ARRAY" || f == "JSON_OBJECT" || f == "JSON_SET" || f == "JSON_INSERT" || f == "JSON_REPLACE") {  // which arguments already are JSON (embedded, not quoted)
       e->name.clear();
       for (auto& x : A) e->name += isJsonExpr(x, &c) ? '1' : '0';
     }
     const bool volatileFn = f == "UUID" || f == "RAND";
-    if (!volatileFn && allLits(e)) { e = boundLit(evalConst(e)); return; }
+    if (!volatileFn && allLits(e)) {
+      const bool js = isJsonExpr(e, &c);
+      e = boundLit(evalConst(e));
+      if (js) e->castType = "JSON";
+      return;
+    }
     if (!volatileFn) encodeStrings(e, c);
     return;
   }
@@ -2073,6 +2084,60 @@ std::vector<std::string> jsonPathOf(const std::string& p) {  // '$.a.b[2]' -> {a
   return r;
 }
 
+std::string jsonQuoteStr(const std::string& x);
+// JSON_SET / JSON_INSERT / JSON_REPLACE / JSON_REMOVE on one path (mode 0..3): the edited JSON text.
+static std::string jsonEdit(const std::string& v, const std::vector<std::string>& path, size_t k, const std::string& val, int mode) {
+  const size_t b = jsonWs(v, 0);
+  if (k >= path.size() || b >= v.size() || (v[b] != '{' && v[b] != '[')) return v;
+  const bool obj = v[b] == '{', last = k + 1 == path.size();
+  struct Member { size_t from, vb, ve; std::string key; };  // from: start of the member (key or value)
+  std::vector<Member> ms;
+  size_t i = b + 1, endPos = v.size();
+  for (;;) {
+    i = jsonWs(v, i);
+    if (i >= v.size()) break;
+    if (v[i] == ']' || v[i] == '}') { endPos = i; break; }
+    if (v[i] == ',') { ++i; continue; }
+    Member m{i, i, i, ""};
+    if (obj) {
+      const size_t ke = jsonSkip(v, i);
+      m.key = jsonUnquote(v.substr(i, ke - i));
+      i = jsonWs(v, ke);
+      if (i < v.size() && v[i] == ':') ++i;
+      i = jsonWs(v, i);
+    }
+    m.vb = i;
+    m.ve = i = jsonSkip(v, i);
+    ms.push_back(m);
+  }
+  int at = -1;
+  if (obj) {
+    for (size_t j = 0; j < ms.size() && at < 0; ++j)
+      if (ms[j].key == path[k]) at = (int)j;
+  } else {
+    const std::string& ix = path[k];
+    if (ix == "last") at = ms.empty() ? -1 : (int)ms.size() - 1;
+    else if (!ix.empty() && std::all_of(ix.begin(), ix.end(), ::isdigit) && std::stoull(ix) < ms.size()) at = (int)std::stoull(ix);
+    else if (ix.empty() || !std::all_of(ix.begin(), ix.end(), ::isdigit)) return v;
+  }
+  if (at >= 0) {
+    const Member& m = ms[at];
+    if (!last) return v.substr(0, m.vb) + jsonEdit(v.substr(m.vb, m.ve - m.vb), path, k + 1, val, mode) + v.substr(m.ve);
+    if (mode == 1) return v;
+    if (mode == 3) {  // remove the member and one adjacent comma
+      size_t from = m.from, to = m.ve;
+      if (at + 1 < (int)ms.size()) to = ms[at + 1].from;
+      else if (at > 0) from = ms[at - 1].ve;
+      return v.substr(0, from) + v.substr(to);
+    }
+    return v.substr(0, m.vb) + val + v.substr(m.ve);
+  }
+  if (!last || mode == 2 || mode == 3) return v;
+  const std::string add = (ms.empty() ? "" : ", ") + (obj ? jsonQuoteStr(path[k]) + ": " : std::string()) + val;
+  const size_t ins = ms.empty() ? endPos : ms.back().ve;
+  return v.substr(0, ins) + add + v.substr(ins);
+}
+
 std::string dateFormat(const Value& v, const std::string& fmt) {
   int64_t us = v.kind == Value::DATETIME ? v.i : v.kind == Value::DATE ? v.i * kUsPerDay : 0;
   if (v.kind == Value::STR && !parseDateTime(v.s, us)) return "";
@@ -2265,13 +2330,15 @@ bool isJsonExpr(const ExprP& x, const BindCtx* c) {
   if (!x) return false;
   if (x->kind == Expr::FUNC) {
     static const std::set<std::string> fns = {"JSON_ARRAY", "JSON_OBJECT", "JSON_ARRAYAGG", "JSON_OBJECTAGG", "JSON_AGG",
-                                              "JSON_EXTRACT", "JSON_EXTRACT_JSON", "JSON_SET", "JSON_MERGE_PATCH"};
+                                              "JSON_EXTRACT", "JSON_EXTRACT_JSON", "JSON_SET", "JSON_MERGE_PATCH",
+                                              "JSON_INSERT", "JSON_REPLACE", "JSON_REMOVE", "JSON_KEYS"};
     if (fns.count(upper(x->op))) return true;
     if (x->op.rfind("#ENC:", 0) == 0 && x->args.size() == 2) return isJsonExpr(x->args[1], c);
     if ((upper(x->op) == "COALESCE" || upper(x->op) == "IFNULL") && !x->args.empty()) return isJsonExpr(x->args[0], c);
     if (upper(x->op) == "CAST" && x->castType == "JSON") return true;
     return false;
   }
+  if (x->kind == Expr::LIT) return x->castType == "JSON";  // (a folded JSON-building call)
   if (x->kind == Expr::COL && c && x->bt >= 0 && x->bt < (int)c->tabs.size() && x->bc >= 0 && x->bc < (int)c->tabs[x->bt]->cols.size())
     return lower(c->tabs[x->bt]->cols[x->bc].typeText).rfind("json", 0) == 0;
   return false;
@@ -2525,6 +2592,54 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
       }
     }
     return Value::S(o + (obj ? "}" : "]"));
+  }
+  if (f == "JSON_SET" || f == "JSON_INSERT" || f == "JSON_REPLACE" || f == "JSON_REMOVE") {
+    if (a[0].isNull()) return Value::Null();
+    const int mode = f == "JSON_SET" ? 0 : f == "JSON_INSERT" ? 1 : f == "JSON_REPLACE" ? 2 : 3;
+    std::string js = a[0].toString();
+    for (size_t i = 1; i < a.size(); i += mode == 3 ? 1 : 2) {
+      if (a[i].isNull()) return Value::Null();
+      const std::string path = a[i].toString();
+      if (path.rfind("$", 0) != 0) throw SqlError("Invalid JSON path expression", 3143);
+      const std::string val = mode == 3 || i + 1 >= a.size() ? "" : jsonOfValue(a[i + 1], i + 1 < e->name.size() && e->name[i + 1] == '1');
+      js = jsonEdit(js, jsonPathOf(path), 0, val, mode);
+    }
+    return Value::S(js);
+  }
+  if (f == "BIN" || f == "OCT" || f == "CONV") {  // CONV(n, from_base, to_base); negative to_base: signed
+    for (auto& x : a)
+      if (x.isNull()) return Value::Null();
+    int from = 10, to = f == "BIN" ? 2 : 8;
+    if (f == "CONV") from = (int)num(1), to = (int)num(2);
+    const bool signedOut = to < 0;
+    from = std::abs(from), to = std::abs(to);
+    if (from < 2 || from > 36 || to < 2 || to > 36) return Value::Null();
+    std::string t = a[0].kind == Value::DBL && f != "CONV" ? std::to_string((int64_t)num(0)) : a[0].toString();
+    size_t i = 0;
+    while (i < t.size() && isspace((unsigned char)t[i])) ++i;
+    bool neg = i < t.size() && t[i] == '-';
+    i += neg;
+    uint64_t v = 0;
+    for (; i < t.size(); ++i) {
+      const char ch = (char)tolower(t[i]);
+      const int dg = isdigit((unsigned char)ch) ? ch - '0' : ch >= 'a' && ch <= 'z' ? ch - 'a' + 10 : 99;
+      if (dg >= from) break;
+      v = v * from + dg;
+    }
+    if (neg && !signedOut) v = (uint64_t)(-(int64_t)v);
+    std::string r;
+    do r.insert(r.begin(), "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[v % to]), v /= to; while (v);
+    return Value::S((neg && signedOut ? "-" : "") + r);
+  }
+  if (f == "ORD") {  // the first character's bytes, as a number
+    if (a[0].isNull()) return Value::Null();
+    const std::string t = a[0].toString();
+    if (t.empty()) return Value::I(0);
+    const unsigned char c0 = t[0];
+    const size_t n = c0 < 0x80 ? 1 : c0 < 0xE0 ? 2 : c0 < 0xF0 ? 3 : 4;
+    int64_t r = 0;
+    for (size_t i = 0; i < n && i < t.size(); ++i) r = r * 256 + (unsigned char)t[i];
+    return Value::I(r);
   }
   if (f == "JSON_QUOTE") return a[0].isNull() ? Value::Null() : Value::S(jsonQuoteStr(a[0].toString()));
   if (f == "EMBED_TOKENS") {
@@ -2800,6 +2915,158 @@ Value evalHostFunc(const ExprP& e, const PostCtx& c) {
     if (e->ty == LType::DATE) return Value::Dt(days);
     (void)hasTime;
     return Value::Ts(days * kUsPerDay + ((h * 60 + mi) * 60 + sec) * 1000000 + us);
+  }
+  if (f == "TIMEDIFF" || f == "SEC_TO_TIME" || f == "TIME" || f == "TIME_TO_SEC" || f == "MAKETIME") {
+    for (auto& x : a)
+      if (x.isNull()) return Value::Null();
+    // Times as signed microseconds: a DATETIME/DATE, 'YYYY-MM-DD ..' or '[-]H:MM[:SS[.f]]'.
+    auto us = [&](const Value& v, bool timeOfDay, int64_t& out) {
+      if (v.kind == Value::DATETIME) { out = v.i; }
+      else if (v.kind == Value::DATE) { out = v.i * kUsPerDay; }
+      else {
+        const std::string t = v.toString();
+        if (parseDateTime(t, out)) {
+        } else {
+          size_t i = 0;
+          bool neg = i < t.size() && t[i] == '-';
+          i += neg;
+          int64_t part[3] = {0, 0, 0}, frac = 0;
+          int k = 0;
+          bool any = false;
+          for (; i < t.size() && k < 3; ++i) {
+            if (isdigit((unsigned char)t[i])) part[k] = part[k] * 10 + (t[i] - '0'), any = true;
+            else if (t[i] == ':') ++k;
+            else break;
+          }
+          if (!any) return false;
+          if (i < t.size() && t[i] == '.') {
+            int dg = 0;
+            for (++i; i < t.size() && isdigit((unsigned char)t[i]) && dg < 6; ++i, ++dg) frac = frac * 10 + (t[i] - '0');
+            for (; dg < 6; ++dg) frac *= 10;
+          }
+          out = ((part[0] * 60 + part[1]) * 60 + part[2]) * 1000000 + frac;
+          if (neg) out = -out;
+          return true;
+        }
+      }
+      if (timeOfDay) out = ((out % kUsPerDay) + kUsPerDay) % kUsPerDay;
+      return true;
+    };
+    auto fmt = [](int64_t u) {
+      std::string r = u < 0 ? "-" : "";
+      u = std::llabs(u);
+      char b[48];
+      snprintf(b, sizeof b, "%02lld:%02lld:%02lld", (long long)(u / 3600000000LL), (long long)(u / 60000000 % 60), (long long)(u / 1000000 % 60));
+      r += b;
+      if (u % 1000000) {
+        snprintf(b, sizeof b, ".%06lld", (long long)(u % 1000000));
+        r += b;
+      }
+      return Value::S(r);
+    };
+    int64_t x = 0, y = 0;
+    if (f == "SEC_TO_TIME") return fmt((int64_t)std::llround(num(0) * 1e6));
+    if (f == "MAKETIME") return fmt((((int64_t)num(0) * 60 + (int64_t)num(1)) * 60) * 1000000 + (int64_t)std::llround(num(2) * 1e6));
+    const bool dt0 = a[0].kind == Value::DATETIME || a[0].kind == Value::DATE;
+    if (!us(a[0], f != "TIMEDIFF" && (dt0 || a[0].toString().find('-', 1) != std::string::npos), x)) return Value::Null();
+    if (f == "TIME") return fmt(x);
+    if (f == "TIME_TO_SEC") return Value::I(x / 1000000);
+    if (!us(a[1], false, y)) return Value::Null();
+    return fmt(x - y);
+  }
+  if (f == "MAKEDATE") {
+    if (a[0].isNull() || a[1].isNull() || num(1) < 1) return Value::Null();
+    return Value::Dt(daysFromCivil((int64_t)num(0), 1, 1) + (int64_t)num(1) - 1);
+  }
+  if (f == "CHAR") {
+    std::string r;
+    for (auto& x : a) {
+      if (x.isNull()) continue;
+      uint64_t v = (uint64_t)(int64_t)x.num();
+      std::string bytes;
+      do bytes.insert(bytes.begin(), (char)(v & 0xff)), v >>= 8; while (v);
+      r += bytes;
+    }
+    return Value::S(r);
+  }
+  if (f == "BIT_LENGTH") return a[0].isNull() ? Value::Null() : Value::I((int64_t)a[0].toString().size() * 8);
+  if (f == "INET_ATON" || f == "IS_IPV4") {
+    if (a[0].isNull()) return f == "IS_IPV4" ? Value::I(0) : Value::Null();
+    const std::string t = a[0].toString();
+    uint64_t r = 0, part = 0;
+    int dots = 0, digits = 0;
+    bool ok = !t.empty();
+    for (char ch : t) {
+      if (isdigit((unsigned char)ch)) { part = part * 10 + (ch - '0'); ++digits; ok = ok && part < 256 && digits <= 3; }
+      else if (ch == '.' && digits) { r = r * 256 + part; part = 0; digits = 0; ++dots; }
+      else ok = false;
+    }
+    ok = ok && digits && dots <= 3;
+    if (f == "IS_IPV4") return Value::I(ok && dots == 3);
+    if (!ok) return Value::Null();
+    r = r * 256 + part;
+    if (dots < 3) {  // MySQL: '127.1' = 127.0.0.1
+      const uint64_t last = part, head = r / 256;
+      r = (head << (8 * (4 - dots))) | last;
+    }
+    return Value::I((int64_t)r);
+  }
+  if (f == "INET_NTOA") {
+    if (a[0].isNull() || num(0) < 0 || num(0) > 4294967295.0) return Value::Null();
+    const uint64_t v = (uint64_t)num(0);
+    char b[20];
+    snprintf(b, sizeof b, "%u.%u.%u.%u", (unsigned)(v >> 24), (unsigned)(v >> 16 & 255), (unsigned)(v >> 8 & 255), (unsigned)(v & 255));
+    return Value::S(b);
+  }
+  if (f == "JSON_VALID" || f == "JSON_TYPE" || f == "JSON_KEYS" || f == "JSON_CONTAINS_PATH") {
+    if (a[0].isNull()) return Value::Null();
+    const std::string js = a[0].toString();
+    const size_t b = jsonWs(js, 0);
+    const size_t end = b < js.size() ? jsonSkip(js, b) : b;
+    const bool valid = b < js.size() && end > b && jsonWs(js, end) == js.size();
+    if (f == "JSON_VALID") return Value::I(valid);
+    if (!valid) throw SqlError("Invalid JSON text in argument 1 to function " + lower(f), 3141);
+    if (f == "JSON_CONTAINS_PATH") {
+      if (a.size() < 3) throw SqlError("Incorrect parameter count in the call to native function 'JSON_CONTAINS_PATH'", 1582);
+      const std::string mode = lower(a[1].toString());
+      const bool all = mode == "all";
+      if (!all && mode != "one") throw SqlError("The oneOrAll argument to json_contains_path may take these values: 'one' or 'all'.", 3154);
+      for (size_t i = 2; i < a.size(); ++i) {
+        std::string out;
+        const bool has = jsonFind(js, jsonPathOf(a[i].toString()), out);
+        if (has && !all) return Value::I(1);
+        if (!has && all) return Value::I(0);
+      }
+      return Value::I(all);
+    }
+    std::string v = js;
+    if (a.size() > 1 && !jsonFind(js, jsonPathOf(a[1].toString()), v)) return Value::Null();
+    const size_t vb = jsonWs(v, 0);
+    const char c0 = vb < v.size() ? v[vb] : 0;
+    if (f == "JSON_TYPE") {
+      if (c0 == '{') return Value::S("OBJECT");
+      if (c0 == '[') return Value::S("ARRAY");
+      if (c0 == '"') return Value::S("STRING");
+      if (c0 == 't' || c0 == 'f') return Value::S("BOOLEAN");
+      if (c0 == 'n') return Value::S("NULL");
+      const std::string num = v.substr(vb, jsonSkip(v, vb) - vb);
+      return Value::S(num.find_first_of(".eE") == std::string::npos ? "INTEGER" : "DOUBLE");
+    }
+    if (c0 != '{') return Value::Null();  // JSON_KEYS: the keys of an object
+    std::string r = "[";
+    size_t i = vb + 1;
+    for (;;) {
+      i = jsonWs(v, i);
+      if (i >= v.size() || v[i] == '}') break;
+      if (v[i] == ',') { ++i; continue; }
+      const size_t ke = jsonSkip(v, i);
+      if (r.size() > 1) r += ", ";
+      r += v.substr(i, ke - i);
+      i = jsonWs(v, ke);
+      if (i < v.size() && v[i] == ':') ++i;
+      i = jsonSkip(v, jsonWs(v, i));
+    }
+    return Value::S(r + "]");
   }
   if (f == "HEX") {
     std::string r;
@@ -5520,6 +5787,7 @@ ResultSet runSelect(Engine* e, const std::function<ResultSet()>& fn, const std::
 }
 
 }  // namespace
+Stmt cloneStmt(const Stmt& s);
 
 thread_local int tExecDepth = 0;
 // Concurrent queries share the GPU's memory: their temporary buffers (hash tables, gathered columns)
@@ -5705,7 +5973,35 @@ ResultSet Engine::executeStmt(const std::string& sqlIn) {
     case Stmt::SELECT: {
       SnapGuard snap;  // MVCC: the statement reads snapshots of its tables
       snapshotStatement(s);
-      if (s.outfile.empty()) return runSelect(this, [&] { return runStatementQuery(s, false); }, sql, false);
+      if (s.outfile.empty()) {
+        const bool usesFound = s.items.size() == 1 && s.items[0].e->kind == Expr::FUNC && upper(s.items[0].e->op) == "FOUND_ROWS";
+        std::optional<int64_t> total;
+        if (s.calcFoundRows && (s.limit >= 0 || s.offset > 0)) {  // the rows without LIMIT: COUNT(*) over the query
+          Stmt c;
+          c.type = Stmt::SELECT;
+          auto cnt = std::make_shared<Expr>();
+          cnt->kind = Expr::FUNC;
+          cnt->op = "COUNT";
+          auto star = std::make_shared<Expr>();
+          star->kind = Expr::STAR;
+          cnt->args = {star};
+          c.items = {SelectItem{cnt, ""}};
+          TableRef ref;
+          ref.alias = "__found";
+          ref.sub = std::make_shared<Stmt>(cloneStmt(s));
+          ref.sub->limit = -1;
+          ref.sub->offset = 0;
+          ref.sub->orderBy.clear();
+          ref.sub->calcFoundRows = false;
+          c.from = {ref};
+          QueryCtx qc;
+          ResultSet n = query(c, qc, false, true);
+          total = n.vals.empty() ? 0 : (int64_t)n.vals[0][0].num();
+        }
+        ResultSet r = runSelect(this, [&] { return runStatementQuery(s, false); }, sql, false);
+        if (!usesFound) tFoundRows = total ? *total : (int64_t)std::max(r.rows.size(), r.vals.size());
+        return r;
+      }
       ResultSet q = runStatementQuery(s, false);  // SELECT .. INTO OUTFILE: tab-separated, \N for NULL
       FILE* f = fopen(s.outfile.c_str(), "wx");
       if (!f) throw SqlError("Can't create/write to file '" + s.outfile + "' (it may already exist)", 1086);
@@ -11426,6 +11722,7 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
     out.typed = true;
     bool allUnion = dedupe;  // UNION (no INTERSECT / EXCEPT): each part can drop its duplicates first, on the GPU
     for (size_t i = 0; i + 1 < parts.size(); ++i) allUnion = allUnion && parts[i]->setOp == 0 && !parts[i]->unionAll;
+    std::vector<bool> typeKnown;
     size_t dedupeRows = 0;  // rows from the parts the deduplication covers
     for (size_t i = 0; i < parts.size(); ++i) {
       Stmt ps = cloneStmt(*parts[i]);
@@ -11438,15 +11735,28 @@ ResultSet Engine::queryImpl(Stmt& s, QueryCtx& q, bool explain, bool typed) {
         ps.offset = 0;
       }
       ResultSet r = query(ps, q, false, true);
+      // A column that is NULL in every row of a part (a NULL literal, ROLLUP totals) takes the type of the others.
+      auto allNull = [&](size_t c) {
+        for (auto& v : r.vals)
+          if (!v[c].isNull()) return false;
+        return true;
+      };
       if (i == 0) {
         out.names = r.names;
         out.types = r.types;
+        typeKnown.assign(r.types.size(), false);
+        for (size_t c = 0; c < r.types.size(); ++c) typeKnown[c] = !allNull(c);
       } else {
         if (r.names.size() != out.names.size())
           throw SqlError("The used SELECT statements have a different number of columns", 1222);
         for (size_t c = 0; c < out.types.size(); ++c) {
           LType a = out.types[c], b = r.types[c];
-          if (a == b) continue;
+          if (a == b || allNull(c)) continue;
+          if (!typeKnown[c]) {
+            out.types[c] = b;
+            typeKnown[c] = true;
+            continue;
+          }
           bool na = a == LType::INT || a == LType::BIGINT || a == LType::DOUBLE, nb = b == LType::INT || b == LType::BIGINT || b == LType::DOUBLE;
           out.types[c] = na && nb ? (a == LType::DOUBLE || b == LType::DOUBLE ? LType::DOUBLE : LType::BIGINT) : LType::VARCHAR;
         }

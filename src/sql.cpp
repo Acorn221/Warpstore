@@ -1,3 +1,4 @@
+#include <functional>
 #include <map>
 #include <charconv>
 #include "sql.h"
@@ -89,19 +90,32 @@ std::string Value::toString() const {
   return "";
 }
 
-bool likeMatch(const std::string& s, const std::string& p) {
-  // Iterative wildcard match with backtracking on the last '%'.
+bool likeMatch(std::string_view s, std::string_view p) {
+  // Iterative wildcard match with backtracking on the last '%'; '_' is one UTF-8 character and
+  // backslash escapes the next pattern character.
+  auto clen = [&](size_t i) { const unsigned char c = s[i]; return std::min<size_t>(c < 0x80 ? 1 : c < 0xE0 ? 2 : c < 0xF0 ? 3 : 4, s.size() - i); };
   size_t si = 0, pi = 0, star = std::string::npos, mark = 0;
   while (si < s.size()) {
-    if (pi < p.size() && (p[pi] == '_' || p[pi] == s[si])) {
-      ++si, ++pi;
-    } else if (pi < p.size() && p[pi] == '%') {
-      star = pi++, mark = si;
-    } else if (star != std::string::npos) {
-      pi = star + 1, si = ++mark;
-    } else {
-      return false;
+    if (pi < p.size()) {
+      const char pc = p[pi];
+      if (pc == '%') {
+        star = pi++, mark = si;
+        continue;
+      }
+      if (pc == '_') {
+        si += clen(si), ++pi;
+        continue;
+      }
+      const bool esc = pc == '\\' && pi + 1 < p.size();
+      if (p[pi + esc] == s[si]) {
+        ++si, pi += 1 + esc;
+        continue;
+      }
     }
+    if (star == std::string::npos) return false;
+    pi = star + 1;
+    mark += clen(mark);
+    si = mark;
   }
   while (pi < p.size() && p[pi] == '%') ++pi;
   return pi == p.size();
@@ -385,6 +399,28 @@ struct Parser {
           do e->args.push_back(expr()); while (acceptSym(","));
         }
         expectSym(")");
+        if (l->kind == Expr::FUNC && l->op == "ROW" && !e->sub) {  // (a, b) IN ((1, 2), ..): OR of ANDs
+          ExprP any;
+          for (size_t i = 1; i < e->args.size(); ++i) {
+            const ExprP& r = e->args[i];
+            if (!(r->kind == Expr::FUNC && r->op == "ROW") || r->args.size() != l->args.size()) fail("row of " + std::to_string(l->args.size()) + " values");
+            ExprP all;
+            for (size_t k = 0; k < l->args.size(); ++k) {
+              ExprP eq = mkBin("=", copyExpr(l->args[k]), r->args[k]);
+              all = all ? mkBin("AND", all, eq) : eq;
+            }
+            any = any ? mkBin("OR", any, all) : all;
+          }
+          if (neg) {
+            auto nt = std::make_shared<Expr>();
+            nt->kind = Expr::UNARY;
+            nt->op = "NOT";
+            nt->args = {any};
+            any = nt;
+          }
+          l = any;
+          continue;
+        }
         l = e;
         continue;
       }
@@ -393,6 +429,21 @@ struct Parser {
         e->kind = Expr::LIKE;
         e->neg = neg;
         e->args = {l, bitOrExpr()};
+        if (acceptKw("ESCAPE")) {  // a literal pattern rewritten to the default escape (backslash)
+          if (cur().k != Tok::STR || t[p].v.size() != 1 || e->args[1]->kind != Expr::LIT || e->args[1]->lit.kind != Value::STR)
+            fail("one-character ESCAPE with a literal pattern");
+          const char esc = t[p++].v[0];
+          if (esc != '\\') {
+            const std::string& pat = e->args[1]->lit.s;
+            std::string out;
+            for (size_t i = 0; i < pat.size(); ++i) {
+              if (pat[i] == esc && i + 1 < pat.size()) out += '\\', out += pat[++i];
+              else if (pat[i] == '\\') out += "\\\\";
+              else out += pat[i];
+            }
+            e->args[1] = mkLit(Value::S(out));
+          }
+        }
         l = e;
         continue;
       }
@@ -415,6 +466,49 @@ struct Parser {
       p = save;
       return l;
     }
+  }
+  // PARTITION BY .. ORDER BY .. ROWS/RANGE .. inside OVER ( .. ) or WINDOW w AS ( .. )
+  void windowSpec(Expr& w) {
+    Expr* e = &w;
+      if (acceptKw("PARTITION")) {
+        expectKw("BY");
+        do e->partBy.push_back(expr()); while (acceptSym(","));
+      }
+      if (acceptKw("ORDER")) {
+        expectKw("BY");
+        do {
+          ExprP o = expr();
+          bool desc = acceptKw("DESC");
+          if (!desc) acceptKw("ASC");
+          e->winOrder.push_back({o, desc});
+        } while (acceptSym(","));
+      }
+      if (isKw("ROWS") || isKw("RANGE")) {
+        bool rows = acceptKw("ROWS");
+        if (!rows) expectKw("RANGE");
+        auto bound = [&](bool lo) -> int64_t {
+          if (acceptKw("UNBOUNDED")) {
+            if (acceptKw("PRECEDING")) return INT64_MIN;
+            expectKw("FOLLOWING");
+            return INT64_MAX;
+          }
+          if (acceptKw("CURRENT")) { expectKw("ROW"); return 0; }
+          int64_t n = intLit();
+          if (acceptKw("PRECEDING")) return -n;
+          expectKw("FOLLOWING");
+          (void)lo;
+          return n;
+        };
+        if (acceptKw("BETWEEN")) {
+          e->frameLo = bound(true);
+          expectKw("AND");
+          e->frameHi = bound(false);
+        } else {
+          e->frameLo = bound(true);
+          e->frameHi = 0;
+        }
+        e->rowsFrame = rows;
+      }
   }
   // Bitwise operators (MySQL precedence: | < & < << >> < + - < * / < ^ < unary ~), evaluated on the host.
   static ExprP bitFn(const char* op, ExprP a, ExprP b) {
@@ -497,6 +591,7 @@ struct Parser {
       return unary();
     }
     ExprP e = primary();
+    while (acceptKw("COLLATE")) ident();  // per-expression collation: accepted (comparisons follow the session collation)
     while (isSym("::")) {  // SingleStore JSON access: j::key (JSON), j::$key (string), j::%key (double)
       ++p;
       std::string fn = "JSON_EXTRACT_JSON";
@@ -546,6 +641,14 @@ struct Parser {
         return e;
       }
       ExprP e = expr();
+      if (isSym(",")) {  // (a, b, ..): a row value
+        auto r = std::make_shared<Expr>();
+        r->kind = Expr::FUNC;
+        r->op = "ROW";
+        r->args = {e};
+        while (acceptSym(",")) r->args.push_back(expr());
+        e = r;
+      }
       expectSym(")");
       return e;
     }
@@ -675,6 +778,24 @@ struct Parser {
           }
           return r;
         }
+        if (e->op == "POSITION") {  // POSITION(a IN b) -> LOCATE(a, b)
+          e->args.push_back(bitOrExpr());
+          if (acceptKw("IN")) e->args.push_back(expr());
+          else while (acceptSym(",")) e->args.push_back(expr());
+          e->op = "LOCATE";
+          expectSym(")");
+          return e;
+        }
+        if (e->op == "CONVERT" && !isSym(")")) {  // CONVERT(x USING charset): the string itself
+          size_t save = p;
+          ExprP x = expr();
+          if (acceptKw("USING")) {
+            ident();
+            expectSym(")");
+            return x;
+          }
+          p = save;
+        }
         if (e->op == "CAST" || e->op == "CONVERT") {  // CAST(x AS type), CONVERT(x, type)
           e->args.push_back(expr());
           if (e->op == "CAST") expectKw("AS");
@@ -710,6 +831,27 @@ struct Parser {
         if (acceptKw("DISTINCT")) e->distinct = true;
         if (e->op == "APPROX_COUNT_DISTINCT") e->op = "COUNT", e->distinct = true;  // exact here
         if (!isSym(")")) do e->args.push_back(expr()); while (acceptSym(","));
+        if (e->op == "COUNT" && e->distinct && e->args.size() > 1) {
+          // COUNT(DISTINCT a, b): distinct combinations without NULLs, as one combined string
+          ExprP anyNull;
+          auto cat = std::make_shared<Expr>();
+          cat->kind = Expr::FUNC;
+          cat->op = "CONCAT";
+          for (size_t i = 0; i < e->args.size(); ++i) {
+            auto n = std::make_shared<Expr>();
+            n->kind = Expr::FUNC;
+            n->op = "ISNULL";
+            n->args = {copyExpr(e->args[i])};
+            anyNull = anyNull ? mkBin("OR", anyNull, n) : ExprP(n);
+            if (i) cat->args.push_back(mkLit(Value::S("\x1f")));
+            cat->args.push_back(e->args[i]);
+          }
+          auto cs = std::make_shared<Expr>();
+          cs->kind = Expr::FUNC;
+          cs->op = "IF";
+          cs->args = {anyNull, mkLit(Value::Null()), cat};
+          e->args = {cs};
+        }
         if (acceptKw("ORDER")) {  // GROUP_CONCAT(x ORDER BY y [DESC] ..)
           expectKw("BY");
           do {
@@ -742,47 +884,13 @@ struct Parser {
         }
         if (acceptKw("OVER")) {
           e->window = true;
-          expectSym("(");
-          if (acceptKw("PARTITION")) {
-            expectKw("BY");
-            do e->partBy.push_back(expr()); while (acceptSym(","));
+          if (!isSym("(")) {
+            e->winName = upper(ident());
+          } else {
+            expectSym("(");
+            windowSpec(*e);
+            expectSym(")");
           }
-          if (acceptKw("ORDER")) {
-            expectKw("BY");
-            do {
-              ExprP o = expr();
-              bool desc = acceptKw("DESC");
-              if (!desc) acceptKw("ASC");
-              e->winOrder.push_back({o, desc});
-            } while (acceptSym(","));
-          }
-          if (isKw("ROWS") || isKw("RANGE")) {
-            bool rows = acceptKw("ROWS");
-            if (!rows) expectKw("RANGE");
-            auto bound = [&](bool lo) -> int64_t {
-              if (acceptKw("UNBOUNDED")) {
-                if (acceptKw("PRECEDING")) return INT64_MIN;
-                expectKw("FOLLOWING");
-                return INT64_MAX;
-              }
-              if (acceptKw("CURRENT")) { expectKw("ROW"); return 0; }
-              int64_t n = intLit();
-              if (acceptKw("PRECEDING")) return -n;
-              expectKw("FOLLOWING");
-              (void)lo;
-              return n;
-            };
-            if (acceptKw("BETWEEN")) {
-              e->frameLo = bound(true);
-              expectKw("AND");
-              e->frameHi = bound(false);
-            } else {
-              e->frameLo = bound(true);
-              e->frameHi = 0;
-            }
-            e->rowsFrame = rows;
-          }
-          expectSym(")");
         }
         if (e->op == "DATABASE" || e->op == "SCHEMA") return mkLit(currentDb().empty() ? Value::Null() : Value::S(currentDb()));
         if (e->op == "VERSION") return mkLit(Value::S("8.0.32-warpstore"));
@@ -963,8 +1071,13 @@ struct Parser {
     Stmt s;
     s.type = Stmt::SELECT;
     expectKw("SELECT");
-    if (acceptKw("DISTINCT")) s.distinct = true;
-    else acceptKw("ALL");
+    for (;;) {  // modifiers
+      if (acceptKw("DISTINCT") || acceptKw("DISTINCTROW")) s.distinct = true;
+      else if (acceptKw("SQL_CALC_FOUND_ROWS")) s.calcFoundRows = true;
+      else if (!(acceptKw("ALL") || acceptKw("SQL_NO_CACHE") || acceptKw("SQL_CACHE") || acceptKw("HIGH_PRIORITY") ||
+                 acceptKw("STRAIGHT_JOIN") || acceptKw("SQL_SMALL_RESULT") || acceptKw("SQL_BIG_RESULT") || acceptKw("SQL_BUFFER_RESULT")))
+        break;
+    }
     do {
       SelectItem it;
       it.e = expr();
@@ -1034,6 +1147,34 @@ struct Parser {
       }
     }
     if (acceptKw("HAVING")) s.having = expr();
+    if (acceptKw("WINDOW")) {  // WINDOW w AS (..), ..: filled into the OVER w references
+      std::map<std::string, Expr> named;
+      do {
+        std::string n = upper(ident());
+        expectKw("AS");
+        expectSym("(");
+        Expr w;
+        windowSpec(w);
+        expectSym(")");
+        named[n] = w;
+      } while (acceptSym(","));
+      std::function<void(const ExprP&)> fill = [&](const ExprP& x) {
+        if (!x) return;
+        if (x->window && !x->winName.empty()) {
+          auto it = named.find(x->winName);
+          if (it == named.end()) fail("window " + x->winName);
+          x->partBy = it->second.partBy;
+          x->winOrder = it->second.winOrder;
+          x->rowsFrame = it->second.rowsFrame;
+          x->frameLo = it->second.frameLo;
+          x->frameHi = it->second.frameHi;
+          x->winName.clear();
+        }
+        for (auto& a : x->args) fill(a);
+      };
+      for (auto& it : s.items) fill(it.e);
+      for (auto& o : s.orderBy) fill(o.e);
+    }
     orderLimit(s);
     intoOutfile(s);
     if (acceptKw("FOR")) {  // FOR UPDATE / FOR SHARE: locking reads (table locks already serialize)

@@ -2,6 +2,7 @@
 #pragma once
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 #include "common.h"
 
@@ -30,6 +31,7 @@ struct Expr {
   std::vector<std::pair<ExprP, bool>> winOrder;  // (expression, descending)
   bool rowsFrame = false;
   int64_t frameLo = INT64_MIN, frameHi = 0;     // row offsets relative to the current row
+  std::string winName;                          // OVER w: a window named in the WINDOW clause
   // Filled in by the binder.
   int bt = -1, bc = -1;     // COL: table index in FROM list, column index
   LType ty = LType::BIGINT;
@@ -96,6 +98,7 @@ struct Stmt {
     ALTER, TRUNCATE, RENAME, CREATE_DB, DROP_DB, CREATE_VIEW, DROP_VIEW, SHOW_MISC, PIPELINE, SNAPSHOT, USER, BACKUP
   } type = EMPTY;
   // SELECT
+  bool calcFoundRows = false;  // SELECT SQL_CALC_FOUND_ROWS: FOUND_ROWS() = rows without the LIMIT
   bool distinct = false;
   bool keepDerived = false;  // a derived table the query layer must not merge into its outer query
   std::vector<SelectItem> items;
@@ -191,6 +194,6 @@ inline std::string firstWord(const std::string& s) {
   for (auto& c : w) c = (char)toupper((unsigned char)c);
   return w;
 }
-bool likeMatch(const std::string& s, const std::string& pat);
+bool likeMatch(std::string_view s, std::string_view pat);
 
 }  // namespace gdb

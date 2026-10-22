@@ -66,4 +66,17 @@ c.eq("STR_TO_DATE", q("SELECT STR_TO_DATE('05/03/2024', '%d/%m/%Y'), STR_TO_DATE
 c.eq("FIND_IN_SET / UNHEX / INSERT", q("SELECT FIND_IN_SET('b', 'a,b,c'), UNHEX('4D7953514C'), INSERT('Quadratic', 3, 4, 'What')"), [(2, "MySQL", "QuWhattic")])
 c.eq("EXTRACT compound units", q("SELECT EXTRACT(YEAR_MONTH FROM '2024-03-05 10:20:30'), EXTRACT(DAY_SECOND FROM TIMESTAMP '2024-03-05 10:20:30')"),
      [(202403, 5102030)])
+c.eq("time functions", q("SELECT TIMEDIFF('2024-03-05 10:20:30', '2024-03-05 09:00:00'), SEC_TO_TIME(3661), TIME_TO_SEC('01:01:01'), MAKEDATE(2024, 60)"),
+     [("01:20:30", "01:01:01", 3661, datetime.date(2024, 2, 29))])
+c.eq("JSON edits and inspection", q("""SELECT JSON_SET('{"a":1}', '$.b', 2, '$.a', JSON_ARRAY(1)), JSON_REMOVE('{"a":1,"b":{"c":2,"d":3}}', '$.b.c'),
+     JSON_TYPE('[1]'), JSON_CONTAINS_PATH('{"o":{"z":1}}', 'one', '$.o.z'), JSON_KEYS('{"k":1,"o":2}')"""),
+     [('{"a":[1], "b": 2}', '{"a":1,"b":{"d":3}}', "ARRAY", 1, '["k", "o"]')])
+c.eq("BIN / CONV / CHAR / INET_ATON", q("SELECT BIN(10), CONV('ff', 16, 10), CHAR(72, 105), INET_ATON('10.0.0.1'), INET_NTOA(167772161)"),
+     [("1010", "255", "Hi", 167772161, "10.0.0.1")])
+c.eq("row values, LIKE ESCAPE, POSITION", q("SELECT (1, 'a') IN ((2, 'b'), (1, 'a')), 'a_c' LIKE 'a!_c' ESCAPE '!', 'abc' LIKE 'a!_c' ESCAPE '!', POSITION('c' IN 'abc')"),
+     [(1, 1, 0, 3)])
+c.eq("named window", q("SELECT x, ROW_NUMBER() OVER w, SUM(x) OVER w FROM (SELECT 1 x UNION ALL SELECT 2) t WINDOW w AS (ORDER BY x)"), [(1, 1, 1), (2, 2, 3)])
+q("SELECT SQL_CALC_FOUND_ROWS x FROM (SELECT 1 x UNION ALL SELECT 2 UNION ALL SELECT 3) t LIMIT 1")
+c.eq("SQL_CALC_FOUND_ROWS / FOUND_ROWS()", q("SELECT FOUND_ROWS()"), [(3,)])
+c.eq("ROLLUP keeps the key type", q("SELECT x, COUNT(*) FROM (SELECT 1 x UNION ALL SELECT 2) t GROUP BY x WITH ROLLUP"), [(1, 1), (2, 1), (None, 2)])
 c.done()
