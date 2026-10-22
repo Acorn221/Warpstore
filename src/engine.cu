@@ -7246,7 +7246,7 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
   for (size_t from = 0; from < matched.size(); from += kChunk) {
     const size_t n = std::min(kChunk, matched.size() - from);
     const Loc* ls = matched.data() + from;
-    ioParallel(nc, [&](size_t c) {
+    auto gather = [&](size_t c) {
       const PType pt = t.cols[c].pt;
       if (pt == PType::F64) dv[c].resize(n);
       else iv[c].resize(n);
@@ -7261,7 +7261,11 @@ static ResultSet updateRaw(Table& t, const std::vector<Loc>& matched, const std:
           default: dv[c][i] = ((const double*)base)[l.row]; break;
         }
       }
-    }, true);
+    };
+    if (n < 4096)  // (a few rows, e.g. by primary key: not worth a task per column)
+      for (size_t c = 0; c < nc; ++c) gather(c);
+    else
+      ioParallel(nc, gather, true);
     int64_t i0;
     double d0;
     for (size_t i = 0; i < n; ++i) {
