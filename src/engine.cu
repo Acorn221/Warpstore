@@ -619,7 +619,10 @@ struct DevBits {
     return k >= 0 && k < nbits && (host[(size_t)k >> 5] >> (k & 31) & 1u);
   }
 };
-thread_local int64_t tFoundRows = 0;     // FOUND_ROWS(): rows of the last SELECT (without its LIMIT if SQL_CALC_FOUND_ROWS)
+thread_local int64_t tFoundRows = 0;
+thread_local bool tSnapTryOnly = false;  // automatic snapshots: skip the round rather than wait for writers
+thread_local bool tWriteGateHeld = false;  // this thread's statement holds Engine::writeGate_ (shared)
+thread_local uint64_t tAckLsn = 0;          // semi-sync: the replica acknowledgement to wait for once the gate is let go     // FOUND_ROWS(): rows of the last SELECT (without its LIMIT if SQL_CALC_FOUND_ROWS)
 thread_local std::vector<std::string> tTempTables;  // CREATE TEMPORARY TABLE: dropped when the connection ends
 std::string dbOf(const std::string& name) {
   size_t d = name.find('.');
@@ -4805,7 +4808,12 @@ Engine::Engine(const std::string& dataDir, bool syncWal, int partitions)
       if (w + loaded < gSnapshotTriggerBytes) continue;  // (a big LOAD would replay from its file copy)
       const auto t0 = Clock::now();
       try {
+        tSnapTryOnly = true;
+        struct Off {
+          ~Off() { tSnapTryOnly = false; }
+        } off;
         writeSnapshot("", "");
+        if (lastSnapSkipped_) continue;
         loadedBytes_ -= loaded;
         fprintf(stderr, "[warpstore] automatic snapshot (WAL at %.0f MB) in %.0f ms, writes paused %.0f ms\n", w / 1048576.0, msSince(t0),
                 lastSnapPauseMs_.load());
@@ -5615,7 +5623,7 @@ void Engine::commitTxn() {
       throw;
     }
     walDurable(tTxn.needSync || needsSync(""));
-    replWaitAck(myLsn);  // semi-sync replication
+    replWaitAckAfterGate(myLsn);  // semi-sync replication
     static const int delayMs = envSetting("DEBUG_COMMIT_DELAY_MS") ? std::atoi(envSetting("DEBUG_COMMIT_DELAY_MS")) : 0;
     if (delayMs) std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));  // (tests: widens logged -> visible)
   }
@@ -5832,7 +5840,7 @@ void Engine::logWrite(const std::string& sql, const std::string& db) {
     myLsn = lsn_;
   }
   walDurable(sync);
-  replWaitAck(myLsn);  // semi-sync replication
+  replWaitAckAfterGate(myLsn);  // semi-sync replication
 }
 
 namespace {
@@ -5965,9 +5973,40 @@ ResultSet Engine::execute(const std::string& sql) {
   }
 }
 
+void Engine::replWaitAckAfterGate(uint64_t lsn) {
+  if (tWriteGateHeld) tAckLsn = std::max(tAckLsn, lsn);
+  else replWaitAck(lsn);
+}
 ResultSet Engine::executeStmt(const std::string& sqlIn) {
   const std::string sql = takeClockPrefix(sqlIn);  // (a logged statement: its clock)
   if (tExecDepth == 0) tTxnViews.clear();  // visibility bitmaps of the previous statement
+  struct AckAfterGate {  // (destroyed after writeGate below: waits for replicas without holding it)
+    Engine* e;
+    bool top;
+    ~AckAfterGate() {
+      if (!top || !tAckLsn) return;
+      const uint64_t l = tAckLsn;
+      tAckLsn = 0;
+      e->replWaitAck(l);
+    }
+  } ackAfter{this, tExecDepth == 0};
+  std::shared_lock<FairSharedMutex> writeGate;
+  if (tExecDepth == 0 && !replaying_) {
+    // (not: reads, and statements made durable by a snapshot of their own instead of the WAL)
+    static const std::set<std::string> reads = {"SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC", "WITH", "SET", "USE", "(",
+                                                "SNAPSHOT", "BACKUP", "RESTORE", "PROFILE", "KILL", "PROMOTE", "HELP"};
+    if (!reads.count(firstWord(sql))) writeGate = std::shared_lock<FairSharedMutex>(writeGate_);
+  }
+  struct GateHeld {
+    bool prev;
+    explicit GateHeld(bool now) : prev(tWriteGateHeld) { tWriteGateHeld = tWriteGateHeld || now; }
+    ~GateHeld() { tWriteGateHeld = prev; }
+  } gateHeld{writeGate.owns_lock()};
+  struct LoadCount {
+    std::atomic<int>* c = nullptr;
+    ~LoadCount() { if (c) --*c; }
+  } loadCount;
+  if (writeGate.owns_lock() && firstWord(sql) == "LOAD") loadCount.c = &loadsInFlight_, ++loadsInFlight_;
   ++tExecDepth;
   struct Depth {
     ~Depth() {
@@ -14931,6 +14970,14 @@ void Engine::writeSnapshot(const std::string& outPath, const std::string& onlyDb
     }
   }
   const auto pause0 = Clock::now();
+  std::unique_lock<FairSharedMutex> gate(writeGate_, std::defer_lock);  // (statements in flight log first)
+  lastSnapSkipped_ = false;
+  if (tSnapTryOnly && loadsInFlight_ > 0) {  // (automatic: not behind a long LOAD, writers would queue behind it)
+    lastSnapSkipped_ = true;
+    return;
+  }
+  if (tWriteGateHeld) throw SqlError("internal: a snapshot inside a statement that logs to the WAL (would wait for itself)", 1105);
+  gate.lock();  // (fair: statements in flight finish, new ones wait for the snapshot)
   std::vector<std::unique_lock<FairSharedMutex>> locks;  // quiesce every table
   std::sort(tabs.begin(), tabs.end());
   for (auto& t : tabs) locks.emplace_back(t->mu);

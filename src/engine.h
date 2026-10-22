@@ -136,7 +136,12 @@ class Engine {
   std::atomic<bool> recovered_{false};
   std::mutex snapMu_;  // one snapshot at a time
   std::atomic<double> lastSnapPauseMs_{0};  // how long the last snapshot held the tables
-  std::atomic<int64_t> loadedBytes_{0};     // file bytes LOADed since the last snapshot (counted with the WAL for the trigger)
+  std::atomic<int64_t> loadedBytes_{0};
+  // Write statements hold it shared from their start until their WAL record is written; a snapshot
+  // takes it exclusively, so no statement's rows are in a snapshot while its record comes after it.
+  FairSharedMutex writeGate_;
+  std::atomic<bool> lastSnapSkipped_{false};
+  std::atomic<int> loadsInFlight_{0};  // LOAD statements running (automatic snapshots wait for none)     // file bytes LOADed since the last snapshot (counted with the WAL for the trigger)
   std::string dir_;
   FILE* wal_ = nullptr;
   std::mutex walMu_;
@@ -204,6 +209,7 @@ class Engine {
   const uint64_t replEpoch_ = std::random_device{}() * 4294967296ull + std::random_device{}();  // this primary incarnation (lsns restart with it)
   std::condition_variable ackCv_;
   void replWaitAck(uint64_t lsn);
+  void replWaitAckAfterGate(uint64_t lsn);  // replWaitAck now, or once the statement lets go of writeGate_
   std::atomic<int64_t> replCaughtUpUs_{0}, replLastContactUs_{0};  // replica side: lag / failover
   std::thread replThread_;
   ResultSet doPipeline(Stmt& s);
